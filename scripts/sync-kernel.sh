@@ -6,7 +6,8 @@
 # 1. copies the MVP subset of `codegraph-kernel/` from the given upstream commit
 #    (read straight from the object database, the working tree is not touched);
 # 2. applies crates/cg-kernel/patches/*.patch in lexical order (P1 no napi + MVP
-#    language subset, P2 allow error trees, P4 parse hook with timeout/tree stash);
+#    language subset, P2 allow error trees, P4 parse hook with timeout/tree stash,
+#    P5 second-phase languages behind cargo features);
 # 3. replaces crates/cg-kernel/{src,grammars,build.rs,Cargo.toml} and records
 #    the commit in crates/cg-kernel/UPSTREAM_COMMIT.
 #
@@ -22,15 +23,19 @@ DEST="$ROOT/crates/cg-kernel"
 git -C "$UP" cat-file -e "${SHA}^{commit}"
 FULL="$(git -C "$UP" rev-parse "$SHA")"
 
-# The subset of codegraph-kernel/ that cgr vendors. Walkers for the second-phase
-# languages (C/C++, C#, PHP, Ruby, Swift, Dart, Scala, Lua, R) join in M5.
+# The subset of codegraph-kernel/ that cgr vendors: the MVP walkers (P1) plus the
+# second-phase C/C++, C#, PHP, Ruby and Swift walkers (P5). Dart, Scala, Lua and R
+# are not vendored yet.
 FILES=(
   Cargo.toml Cargo.lock build.rs
   src/buffers.rs src/ids.rs src/textutil.rs src/docstring.rs src/stack.rs src/langs.rs src/lib.rs
   src/java.rs src/python.rs src/go.rs src/rustlang.rs src/kotlin.rs
   src/tsjs/mod.rs src/tsjs/extractors.rs src/tsjs/fnref.rs
+  src/ccpp/mod.rs src/ccpp/brace_scopes.rs src/csharp.rs src/php.rs src/ruby.rs src/swift.rs
   grammars/kotlin/parser.c grammars/kotlin/scanner.c
   grammars/kotlin/tree_sitter/alloc.h grammars/kotlin/tree_sitter/array.h grammars/kotlin/tree_sitter/parser.h
+  grammars/swift/LICENSE grammars/swift/parser.c grammars/swift/scanner.c
+  grammars/swift/tree_sitter/alloc.h grammars/swift/tree_sitter/array.h grammars/swift/tree_sitter/parser.h
 )
 
 TMP="$(mktemp -d)"

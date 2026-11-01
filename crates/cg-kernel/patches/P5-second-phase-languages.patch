@@ -1,0 +1,277 @@
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	2026-11-01 14:14:01.152495451 +0000
++++ b/Cargo.toml	2026-11-01 14:14:27.059335777 +0000
+@@ -10,13 +10,22 @@
+ crate-type = ["rlib"]
+ 
+ [features]
+-default = ["lang-ts", "lang-python", "lang-go", "lang-java", "lang-rust", "lang-kotlin"]
++default = [
++    "lang-ts", "lang-python", "lang-go", "lang-java", "lang-rust", "lang-kotlin",
++    "lang-c", "lang-csharp", "lang-php", "lang-ruby", "lang-swift",
++]
+ lang-ts = ["dep:tree-sitter-typescript", "dep:tree-sitter-javascript"]
+ lang-python = ["dep:tree-sitter-python"]
+ lang-go = ["dep:tree-sitter-go"]
+ lang-java = ["dep:tree-sitter-java"]
+ lang-rust = ["dep:tree-sitter-rust"]
+ lang-kotlin = ["dep:tree-sitter-language"]
++# P5: second-phase languages. `lang-c` covers C and C++ (one walker, two grammars).
++lang-c = ["dep:tree-sitter-c", "dep:tree-sitter-cpp"]
++lang-csharp = ["dep:tree-sitter-c-sharp"]
++lang-php = ["dep:tree-sitter-php"]
++lang-ruby = ["dep:tree-sitter-ruby"]
++lang-swift = ["dep:tree-sitter-language"]
+ 
+ [dependencies]
+ tree-sitter = "0.25"
+@@ -31,7 +40,13 @@
+ tree-sitter-python = { version = "0.23", optional = true }
+ tree-sitter-go = { version = "0.23", optional = true }
+ tree-sitter-rust = { version = "=0.24.2", optional = true }
+-# Kotlin is vendored C (grammars/kotlin, compiled by build.rs): no usable crate exists.
++tree-sitter-c = { version = "=0.24.2", optional = true }
++tree-sitter-cpp = { version = "=0.23.4", optional = true }
++tree-sitter-c-sharp = { version = "=0.23.5", optional = true }
++tree-sitter-ruby = { version = "=0.23.1", optional = true }
++# php: the walker calls LANGUAGE_PHP (HTML-interleaving variant), never LANGUAGE_PHP_ONLY.
++tree-sitter-php = { version = "=0.24.2", optional = true }
++# Kotlin and Swift are vendored C (grammars/{kotlin,swift}, compiled by build.rs).
+ tree-sitter-language = { version = "0.1", optional = true }
+ 
+ [target.'cfg(unix)'.dependencies]
+diff -ruN a/build.rs b/build.rs
+--- a/build.rs	2026-11-01 14:14:01.152732478 +0000
++++ b/build.rs	2026-11-01 14:14:27.059607824 +0000
+@@ -1,7 +1,6 @@
+ fn main() {
+-    // P1: napi_build::setup() removed. Only the Kotlin grammar (vendored C) is
+-    // compiled here; the other vendored grammars (lua, scala, dart, swift)
+-    // join with their walkers in M5.
++    // P1: napi_build::setup() removed. P5: the Kotlin and Swift grammars
++    // (vendored C) are compiled here; lua, scala and dart are not vendored.
+     if std::env::var_os("CARGO_FEATURE_LANG_KOTLIN").is_some() {
+         // Kotlin grammar — vendored C, compiled here instead of a crate dep: the
+         // crates.io tree-sitter-kotlin 0.3.8 pins `tree-sitter >= 0.21, < 0.23`
+@@ -26,5 +25,25 @@
+         c.compile("tree-sitter-kotlin");
+         println!("cargo:rerun-if-changed=grammars/kotlin");
+     }
++    // P5: Swift grammar - vendored C, the crates.io tree-sitter-swift 0.7.3
++    // tarball's src/ with upstream's scanner fix (`1ULL << FAKE_TRY_BANG`: the
++    // crate's `1UL` overflows where `unsigned long` is 32 bits, i.e. MSVC, and
++    // `try! Foo()` would read as `!Foo`). Flags crib the tarball's own
++    // bindings/rust/build.rs (c11).
++    //   parser.c  d3edff6effe31b9a507f496577407987343b101b23eb7bee7a9b050e8ab5d27a
++    //   scanner.c 8acafef098ea4a52ebfc4cdf2fe26706113a22ac8ba2faf7d952755ff350cad6 (patched)
++    if std::env::var_os("CARGO_FEATURE_LANG_SWIFT").is_some() {
++        let mut swift = cc::Build::new();
++        swift.std("c11");
++        swift.include("grammars/swift");
++        swift.file("grammars/swift/parser.c");
++        swift.file("grammars/swift/scanner.c");
++        swift.flag_if_supported("-Wno-unused-parameter");
++        swift.flag_if_supported("-Wno-unused-but-set-variable");
++        swift.flag_if_supported("-Wno-trigraphs");
++        swift.flag_if_supported("-utf-8"); // msvc
++        swift.compile("tree-sitter-swift");
++        println!("cargo:rerun-if-changed=grammars/swift");
++    }
+     println!("cargo:rerun-if-changed=build.rs");
+ }
+diff -ruN a/src/ccpp/mod.rs b/src/ccpp/mod.rs
+--- a/src/ccpp/mod.rs	2026-11-01 14:14:00.931858859 +0000
++++ b/src/ccpp/mod.rs	2026-11-01 14:14:12.928850049 +0000
+@@ -398,13 +398,13 @@
+     parser
+         .set_language(&grammar)
+         .map_err(|e| format!("set_language({language}) failed: {e}"))?;
+-    let tree = parser
+-        .parse(source, None)
++    let tree = crate::hooks::parse(&mut parser, source)
+         .ok_or_else(|| "parser returned null tree".to_string())?;
+     // Measurement hatch (parity sweeps only — never set in production): skip
+     // the defer so the sweep can QUANTIFY how often UTF-8 vs UTF-16 error
+     // recovery actually diverges on this language's erroring files.
+-    let no_defer = std::env::var("CODEGRAPH_KERNEL_CCPP_ERROR_EXTRACT").as_deref() == Ok("1");
++    let no_defer = crate::allow_error_trees()
++        || std::env::var("CODEGRAPH_KERNEL_CCPP_ERROR_EXTRACT").as_deref() == Ok("1");
+     if tree.root_node().has_error() && !no_defer {
+         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
+     }
+diff -ruN a/src/csharp.rs b/src/csharp.rs
+--- a/src/csharp.rs	2026-11-01 14:14:00.939858859 +0000
++++ b/src/csharp.rs	2026-11-01 14:14:12.926470262 +0000
+@@ -151,10 +151,9 @@
+     parser
+         .set_language(&grammar)
+         .map_err(|e| format!("set_language(csharp) failed: {e}"))?;
+-    let tree = parser
+-        .parse(source, None)
++    let tree = crate::hooks::parse(&mut parser, source)
+         .ok_or_else(|| "parser returned null tree".to_string())?;
+-    if tree.root_node().has_error() {
++    if tree.root_node().has_error() && !crate::allow_error_trees() {
+         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
+     }
+ 
+diff -ruN a/src/langs.rs b/src/langs.rs
+--- a/src/langs.rs	2026-11-01 14:14:01.153108443 +0000
++++ b/src/langs.rs	2026-11-01 14:14:42.079790616 +0000
+@@ -1,6 +1,7 @@
+ //! Grammar registry: codegraph `Language` string -> native tree-sitter grammar.
+ //!
+-//! P1: reduced to the MVP languages (each behind a cargo feature). `tsx` and
++//! P1: reduced to the MVP languages (each behind a cargo feature); P5 adds C/C++,
++//! C#, PHP, Ruby and Swift behind their own features. `tsx` and
+ //! `jsx` reuse another language's grammar exactly as upstream does.
+ 
+ use tree_sitter::Language;
+@@ -10,6 +11,11 @@
+ extern "C" {
+     fn tree_sitter_kotlin() -> *const ();
+ }
++// P5: vendored swift grammar (build.rs-compiled C, crate 0.7.3 src/ + scanner fix).
++#[cfg(feature = "lang-swift")]
++extern "C" {
++    fn tree_sitter_swift() -> *const ();
++}
+ 
+ /// Languages this kernel build can extract.
+ pub const LANGUAGES: &[&str] = &[
+@@ -31,6 +37,18 @@
+     "rust",
+     #[cfg(feature = "lang-kotlin")]
+     "kotlin",
++    #[cfg(feature = "lang-c")]
++    "c",
++    #[cfg(feature = "lang-c")]
++    "cpp",
++    #[cfg(feature = "lang-csharp")]
++    "csharp",
++    #[cfg(feature = "lang-php")]
++    "php",
++    #[cfg(feature = "lang-ruby")]
++    "ruby",
++    #[cfg(feature = "lang-swift")]
++    "swift",
+ ];
+ 
+ pub fn grammar_for(language: &str) -> Option<Language> {
+@@ -53,6 +71,21 @@
+         "kotlin" => {
+             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_kotlin) }.into())
+         }
++        #[cfg(feature = "lang-c")]
++        "c" => Some(tree_sitter_c::LANGUAGE.into()),
++        #[cfg(feature = "lang-c")]
++        "cpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
++        #[cfg(feature = "lang-csharp")]
++        "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
++        #[cfg(feature = "lang-ruby")]
++        "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
++        // The full HTML-interleaving variant, never LANGUAGE_PHP_ONLY.
++        #[cfg(feature = "lang-php")]
++        "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
++        #[cfg(feature = "lang-swift")]
++        "swift" => {
++            Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_swift) }.into())
++        }
+         _ => None,
+     }
+ }
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-11-01 14:14:01.162521219 +0000
++++ b/src/lib.rs	2026-11-01 14:14:42.078583258 +0000
+@@ -34,16 +34,26 @@
+ mod stack;
+ mod textutil;
+ 
++#[cfg(feature = "lang-c")]
++mod ccpp;
++#[cfg(feature = "lang-csharp")]
++mod csharp;
+ #[cfg(feature = "lang-go")]
+ mod go;
+ #[cfg(feature = "lang-java")]
+ mod java;
+ #[cfg(feature = "lang-kotlin")]
+ mod kotlin;
++#[cfg(feature = "lang-php")]
++mod php;
+ #[cfg(feature = "lang-python")]
+ mod python;
++#[cfg(feature = "lang-ruby")]
++mod ruby;
+ #[cfg(feature = "lang-rust")]
+ mod rustlang;
++#[cfg(feature = "lang-swift")]
++mod swift;
+ #[cfg(feature = "lang-ts")]
+ mod tsjs;
+ 
+@@ -147,6 +157,16 @@
+         "kotlin" => kotlin::extract(path, src),
+         #[cfg(feature = "lang-ts")]
+         "typescript" | "tsx" | "javascript" | "jsx" => tsjs::extract(path, src, language),
++        #[cfg(feature = "lang-c")]
++        "c" | "cpp" => ccpp::extract(path, src, language),
++        #[cfg(feature = "lang-csharp")]
++        "csharp" => csharp::extract(path, src),
++        #[cfg(feature = "lang-php")]
++        "php" => php::extract(path, src),
++        #[cfg(feature = "lang-ruby")]
++        "ruby" => ruby::extract(path, src),
++        #[cfg(feature = "lang-swift")]
++        "swift" => swift::extract(path, src),
+         other => Err(format!("unsupported language: {other}")),
+     });
+     out.map_err(|e| {
+diff -ruN a/src/php.rs b/src/php.rs
+--- a/src/php.rs	2026-11-01 14:14:00.951858860 +0000
++++ b/src/php.rs	2026-11-01 14:14:12.927096783 +0000
+@@ -161,10 +161,9 @@
+     parser
+         .set_language(&grammar)
+         .map_err(|e| format!("set_language(php) failed: {e}"))?;
+-    let tree = parser
+-        .parse(source, None)
++    let tree = crate::hooks::parse(&mut parser, source)
+         .ok_or_else(|| "parser returned null tree".to_string())?;
+-    if tree.root_node().has_error() {
++    if tree.root_node().has_error() && !crate::allow_error_trees() {
+         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
+     }
+ 
+diff -ruN a/src/ruby.rs b/src/ruby.rs
+--- a/src/ruby.rs	2026-11-01 14:14:00.963858861 +0000
++++ b/src/ruby.rs	2026-11-01 14:14:12.927639277 +0000
+@@ -140,10 +140,9 @@
+     parser
+         .set_language(&grammar)
+         .map_err(|e| format!("set_language(ruby) failed: {e}"))?;
+-    let tree = parser
+-        .parse(source, None)
++    let tree = crate::hooks::parse(&mut parser, source)
+         .ok_or_else(|| "parser returned null tree".to_string())?;
+-    if tree.root_node().has_error() {
++    if tree.root_node().has_error() && !crate::allow_error_trees() {
+         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
+     }
+ 
+diff -ruN a/src/swift.rs b/src/swift.rs
+--- a/src/swift.rs	2026-11-01 14:14:00.967858861 +0000
++++ b/src/swift.rs	2026-11-01 14:14:12.928070188 +0000
+@@ -240,10 +240,9 @@
+     parser
+         .set_language(&grammar)
+         .map_err(|e| format!("set_language(swift) failed: {e}"))?;
+-    let tree = parser
+-        .parse(source, None)
++    let tree = crate::hooks::parse(&mut parser, source)
+         .ok_or_else(|| "parser returned null tree".to_string())?;
+-    if tree.root_node().has_error() {
++    if tree.root_node().has_error() && !crate::allow_error_trees() {
+         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
+     }
+ 

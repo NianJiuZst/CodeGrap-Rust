@@ -1,6 +1,7 @@
 //! Grammar registry: codegraph `Language` string -> native tree-sitter grammar.
 //!
-//! P1: reduced to the MVP languages (each behind a cargo feature). `tsx` and
+//! P1: reduced to the MVP languages (each behind a cargo feature); P5 adds C/C++,
+//! C#, PHP, Ruby and Swift behind their own features. `tsx` and
 //! `jsx` reuse another language's grammar exactly as upstream does.
 
 use tree_sitter::Language;
@@ -9,6 +10,11 @@ use tree_sitter::Language;
 #[cfg(feature = "lang-kotlin")]
 extern "C" {
     fn tree_sitter_kotlin() -> *const ();
+}
+// P5: vendored swift grammar (build.rs-compiled C, crate 0.7.3 src/ + scanner fix).
+#[cfg(feature = "lang-swift")]
+extern "C" {
+    fn tree_sitter_swift() -> *const ();
 }
 
 /// Languages this kernel build can extract.
@@ -31,6 +37,18 @@ pub const LANGUAGES: &[&str] = &[
     "rust",
     #[cfg(feature = "lang-kotlin")]
     "kotlin",
+    #[cfg(feature = "lang-c")]
+    "c",
+    #[cfg(feature = "lang-c")]
+    "cpp",
+    #[cfg(feature = "lang-csharp")]
+    "csharp",
+    #[cfg(feature = "lang-php")]
+    "php",
+    #[cfg(feature = "lang-ruby")]
+    "ruby",
+    #[cfg(feature = "lang-swift")]
+    "swift",
 ];
 
 pub fn grammar_for(language: &str) -> Option<Language> {
@@ -52,6 +70,21 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         #[cfg(feature = "lang-kotlin")]
         "kotlin" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_kotlin) }.into())
+        }
+        #[cfg(feature = "lang-c")]
+        "c" => Some(tree_sitter_c::LANGUAGE.into()),
+        #[cfg(feature = "lang-c")]
+        "cpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
+        #[cfg(feature = "lang-csharp")]
+        "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        #[cfg(feature = "lang-ruby")]
+        "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
+        // The full HTML-interleaving variant, never LANGUAGE_PHP_ONLY.
+        #[cfg(feature = "lang-php")]
+        "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
+        #[cfg(feature = "lang-swift")]
+        "swift" => {
+            Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_swift) }.into())
         }
         _ => None,
     }

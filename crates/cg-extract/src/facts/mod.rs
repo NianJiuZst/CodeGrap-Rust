@@ -6,12 +6,17 @@ use crate::rows::FileRows;
 use cg_core::{text, Lang, NONE};
 use tree_sitter::{Node, Tree};
 
+mod c;
+mod csharp;
 mod go;
 mod java;
 mod js;
 mod kotlin;
+mod php;
 mod python;
+mod ruby;
 mod rust;
+mod swift;
 mod util;
 pub use util::Cx;
 
@@ -187,6 +192,11 @@ pub fn extract_with_timeout(lang: Lang, tree: &Tree, src: &str, rows: FileRows<'
         Lang::Java => java::extract(&mut cx, root),
         Lang::Rust => rust::extract(&mut cx, root),
         Lang::Kotlin => kotlin::extract(&mut cx, root),
+        Lang::C | Lang::Cpp => c::extract(&mut cx, root),
+        Lang::CSharp => csharp::extract(&mut cx, root),
+        Lang::Php => php::extract(&mut cx, root),
+        Lang::Ruby => ruby::extract(&mut cx, root),
+        Lang::Swift => swift::extract(&mut cx, root),
         _ => {}
     }
     cx.finish()

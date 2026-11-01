@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 cg-core = { workspace = true }
-cg-kernel = { workspace = true, features = ["lang-ts", "lang-python", "lang-go", "lang-java", "lang-rust", "lang-kotlin"] }
+cg-kernel = { workspace = true, features = ["lang-ts", "lang-python", "lang-go", "lang-java", "lang-rust", "lang-kotlin", "lang-c", "lang-csharp", "lang-php", "lang-ruby", "lang-swift"] }
 cg-scan = { workspace = true }
 tree-sitter = { workspace = true }
 rayon = { workspace = true }

@@ -34,16 +34,26 @@ mod langs;
 mod stack;
 mod textutil;
 
+#[cfg(feature = "lang-c")]
+mod ccpp;
+#[cfg(feature = "lang-csharp")]
+mod csharp;
 #[cfg(feature = "lang-go")]
 mod go;
 #[cfg(feature = "lang-java")]
 mod java;
 #[cfg(feature = "lang-kotlin")]
 mod kotlin;
+#[cfg(feature = "lang-php")]
+mod php;
 #[cfg(feature = "lang-python")]
 mod python;
+#[cfg(feature = "lang-ruby")]
+mod ruby;
 #[cfg(feature = "lang-rust")]
 mod rustlang;
+#[cfg(feature = "lang-swift")]
+mod swift;
 #[cfg(feature = "lang-ts")]
 mod tsjs;
 
@@ -147,6 +157,16 @@ pub fn extract_file(
         "kotlin" => kotlin::extract(path, src),
         #[cfg(feature = "lang-ts")]
         "typescript" | "tsx" | "javascript" | "jsx" => tsjs::extract(path, src, language),
+        #[cfg(feature = "lang-c")]
+        "c" | "cpp" => ccpp::extract(path, src, language),
+        #[cfg(feature = "lang-csharp")]
+        "csharp" => csharp::extract(path, src),
+        #[cfg(feature = "lang-php")]
+        "php" => php::extract(path, src),
+        #[cfg(feature = "lang-ruby")]
+        "ruby" => ruby::extract(path, src),
+        #[cfg(feature = "lang-swift")]
+        "swift" => swift::extract(path, src),
         other => Err(format!("unsupported language: {other}")),
     });
     out.map_err(|e| {

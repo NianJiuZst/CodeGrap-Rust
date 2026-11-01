@@ -10,13 +10,22 @@ description = "Upstream CodeGraph extraction kernel (MIT, colbymchenry/codegraph
 crate-type = ["rlib"]
 
 [features]
-default = ["lang-ts", "lang-python", "lang-go", "lang-java", "lang-rust", "lang-kotlin"]
+default = [
+    "lang-ts", "lang-python", "lang-go", "lang-java", "lang-rust", "lang-kotlin",
+    "lang-c", "lang-csharp", "lang-php", "lang-ruby", "lang-swift",
+]
 lang-ts = ["dep:tree-sitter-typescript", "dep:tree-sitter-javascript"]
 lang-python = ["dep:tree-sitter-python"]
 lang-go = ["dep:tree-sitter-go"]
 lang-java = ["dep:tree-sitter-java"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-kotlin = ["dep:tree-sitter-language"]
+# P5: second-phase languages. `lang-c` covers C and C++ (one walker, two grammars).
+lang-c = ["dep:tree-sitter-c", "dep:tree-sitter-cpp"]
+lang-csharp = ["dep:tree-sitter-c-sharp"]
+lang-php = ["dep:tree-sitter-php"]
+lang-ruby = ["dep:tree-sitter-ruby"]
+lang-swift = ["dep:tree-sitter-language"]
 
 [dependencies]
 tree-sitter = "0.25"
@@ -31,7 +40,13 @@ tree-sitter-java = { version = "0.23", optional = true }
 tree-sitter-python = { version = "0.23", optional = true }
 tree-sitter-go = { version = "0.23", optional = true }
 tree-sitter-rust = { version = "=0.24.2", optional = true }
-# Kotlin is vendored C (grammars/kotlin, compiled by build.rs): no usable crate exists.
+tree-sitter-c = { version = "=0.24.2", optional = true }
+tree-sitter-cpp = { version = "=0.23.4", optional = true }
+tree-sitter-c-sharp = { version = "=0.23.5", optional = true }
+tree-sitter-ruby = { version = "=0.23.1", optional = true }
+# php: the walker calls LANGUAGE_PHP (HTML-interleaving variant), never LANGUAGE_PHP_ONLY.
+tree-sitter-php = { version = "=0.24.2", optional = true }
+# Kotlin and Swift are vendored C (grammars/{kotlin,swift}, compiled by build.rs).
 tree-sitter-language = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
