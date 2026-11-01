@@ -1,7 +1,9 @@
 //! Reference-name shapes (design doc 6.3): the walkers encode the syntactic form of a call in
 //! the name (`this.svc.run`, `new Widget().render`, `super().run`, `T::new`, `inner().m`).
 
+use cg_core::LangFamily;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Shape<'a> {
@@ -94,6 +96,124 @@ pub fn parse_shape(name: &str) -> Shape<'_> {
     Shape::Member { root: first.trim_end_matches("[]"), path: segs[1..n - 1].iter().map(|s| s.trim_end_matches("[]")).collect(), method }
 }
 
+/// Bring the call names of the C-family, C#, PHP, Ruby and Swift walkers into the shapes
+/// `parse_shape` understands. Other families pass through unchanged.
+///
+/// * whitespace around member operators (`a\n  .b`) is dropped;
+/// * null-conditional / forced access (`a?.b`, `a!.b`) and `->` become `.`;
+/// * PHP: `parent::m` -> `super.m`, `self::m` / `static::m` -> `this.m`, `$f` -> `f`,
+///   `\Ns\Klass::m` -> `Klass::m` (the namespace is resolved through `use` imports);
+/// * C#: `base.M` -> `super.M`, verbatim identifiers `@x` -> `x`;
+/// * Ruby: `@x.m` -> `self.@x.m`, `self.class.m` -> `self.m`, `::Foo.m` -> `Foo.m`;
+/// * C/C++: a trailing arity marker (`Foo::Foo/0`) is dropped.
+pub fn normalize_call_name(family: LangFamily, name: &str) -> Cow<'_, str> {
+    if !matches!(family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby | LangFamily::Swift) {
+        return Cow::Borrowed(name);
+    }
+    let mut s: Cow<'_, str> = Cow::Borrowed(name.trim());
+    if s.contains(char::is_whitespace) && !s.starts_with("new ") {
+        s = Cow::Owned(squeeze_member_whitespace(&s));
+    }
+    match family {
+        LangFamily::C => {
+            if let Some(i) = s.rfind('/') {
+                if i + 1 < s.len() && s[i + 1..].bytes().all(|b| b.is_ascii_digit()) {
+                    s = Cow::Owned(s[..i].to_owned());
+                }
+            }
+            if s.contains("->") && !s.contains("->*") {
+                s = Cow::Owned(s.replace("->", "."));
+            }
+        }
+        LangFamily::CSharp => {
+            if s.contains("?.") || s.contains("!.") {
+                s = Cow::Owned(s.replace("?.", ".").replace("!.", "."));
+            }
+            if let Some(rest) = s.strip_prefix("base.") {
+                s = Cow::Owned(format!("super.{rest}"));
+            }
+            if s.contains('@') {
+                s = Cow::Owned(s.replace('@', ""));
+            }
+        }
+        LangFamily::Php => {
+            if s.contains("->") {
+                s = Cow::Owned(s.replace("?->", ".").replace("->", "."));
+            }
+            for (pre, to) in [("parent::", "super."), ("self::", "this."), ("static::", "this.")] {
+                if let Some(rest) = s.strip_prefix(pre) {
+                    s = Cow::Owned(format!("{to}{rest}"));
+                    break;
+                }
+            }
+            if s.contains('\\') {
+                // drop the namespace of the first segment only: `\A\B::m` -> `B::m`
+                let head_end = s.find(['.', '(']).unwrap_or(s.len());
+                let head = &s[..head_end];
+                let cut = head.find("::").map(|i| &head[..i]).unwrap_or(head).rfind('\\');
+                if let Some(i) = cut {
+                    s = Cow::Owned(s[i + 1..].to_owned());
+                }
+            }
+            if let Some(rest) = s.strip_prefix('$') {
+                s = Cow::Owned(rest.to_owned());
+            }
+        }
+        LangFamily::Ruby => {
+            if let Some(rest) = s.strip_prefix("::") {
+                s = Cow::Owned(rest.to_owned());
+            }
+            if let Some(rest) = s.strip_prefix("self.class.") {
+                s = Cow::Owned(format!("self.{rest}"));
+            }
+            if s.starts_with('@') && s.contains('.') {
+                s = Cow::Owned(format!("self.{s}"));
+            }
+            if s.contains("&.") {
+                s = Cow::Owned(s.replace("&.", "."));
+            }
+        }
+        LangFamily::Swift if s.contains("?.") || s.contains("!.") => {
+            s = Cow::Owned(s.replace("?.", ".").replace("!.", "."));
+        }
+        _ => {}
+    }
+    s
+}
+
+/// `a\n   .b` -> `a.b`: drop whitespace that touches a member operator.
+fn squeeze_member_whitespace(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let next = &s[j..];
+            let prev = out.as_bytes().last().copied();
+            let touches = next.starts_with('.')
+                || next.starts_with("?.")
+                || next.starts_with("!.")
+                || next.starts_with("&.")
+                || next.starts_with("->")
+                || next.starts_with("::")
+                || matches!(prev, Some(b'.') | Some(b'>') | Some(b':'));
+            if !touches {
+                out.push(' ');
+            }
+            i = j;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// First and remaining segments of a dotted / `::` name (type references like `pkg.Type`).
 pub fn split_head(name: &str) -> Option<(&str, &str)> {
     if let Some(i) = name.find("::") {
@@ -122,5 +242,27 @@ mod tests {
         assert_eq!(split_head("pkg.Type"), Some(("pkg", "Type")));
         assert_eq!(split_head("a::B"), Some(("a", "B")));
         assert_eq!(split_head("Type"), None);
+    }
+
+    #[test]
+    fn normalized_names() {
+        let n = |f, s| normalize_call_name(f, s).into_owned();
+        assert_eq!(n(LangFamily::Php, "this->repo.find"), "this.repo.find");
+        assert_eq!(n(LangFamily::Php, "parent::__construct"), "super.__construct");
+        assert_eq!(n(LangFamily::Php, "static::create"), "this.create");
+        assert_eq!(n(LangFamily::Php, "\\FastRoute\\simpleDispatcher"), "simpleDispatcher");
+        assert_eq!(n(LangFamily::Php, "\\App\\Models\\User::find"), "User::find");
+        assert_eq!(n(LangFamily::Php, "$callback"), "callback");
+        assert_eq!(n(LangFamily::CSharp, "svc\n        ?.Run"), "svc.Run");
+        assert_eq!(n(LangFamily::CSharp, "base.Dispose"), "super.Dispose");
+        assert_eq!(n(LangFamily::CSharp, "@interface.IsOpenGeneric"), "interface.IsOpenGeneric");
+        assert_eq!(n(LangFamily::Ruby, "@repo.find"), "self.@repo.find");
+        assert_eq!(n(LangFamily::Ruby, "self.class.settings"), "self.settings");
+        assert_eq!(n(LangFamily::Ruby, "::File.join"), "File.join");
+        assert_eq!(n(LangFamily::C, "fmt::basic_format_arg::basic_format_arg/0"), "fmt::basic_format_arg::basic_format_arg");
+        assert_eq!(n(LangFamily::C, "node->next.visit"), "node.next.visit");
+        assert_eq!(n(LangFamily::Swift, "session?.request"), "session.request");
+        assert_eq!(n(LangFamily::Js, "a?.b"), "a?.b");
+        assert_eq!(n(LangFamily::Ruby, "new Foo().bar"), "new Foo().bar");
     }
 }

@@ -311,6 +311,7 @@ mod tests {
             ("node_modules/pkg/index.js", "x"),
             ("README.md", "# hi"),
             ("lib/native.c", "int x;"),
+            ("lib/app.dart", "void main() {}"),
             (".gitignore", "ignored.ts\n"),
             ("ignored.ts", "export {}"),
             ("src/App.kt", "class App"),
@@ -319,8 +320,8 @@ mod tests {
         opts.tracked_ignored = false;
         let r = scan(&opts);
         let names: Vec<&str> = r.files.iter().map(|f| f.rel.as_str()).collect();
-        assert_eq!(names, vec!["a/m.ts", "a/n.go", "b/z.py", "src/App.kt"]);
-        assert_eq!(r.unsupported, 1, "the .c file has no walker in the MVP build");
+        assert_eq!(names, vec!["a/m.ts", "a/n.go", "b/z.py", "lib/native.c", "src/App.kt"]);
+        assert_eq!(r.unsupported, 1, "the .dart file has no walker in this build");
     }
 
     #[test]

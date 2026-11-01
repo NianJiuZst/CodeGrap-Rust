@@ -472,7 +472,13 @@ impl<'v> Engine<'v> {
             }
             best.get_or_insert(cand);
         }
-        best.filter(|_| tn.qname().contains("::") && self.view.file(tfile).lang().family() == LangFamily::Jvm)
+        // Java/Kotlin nested types; C# partial classes, Ruby reopened classes, Swift
+        // extensions and C++ out-of-line definitions declare members in other files.
+        best.filter(|_| match self.view.file(tfile).lang().family() {
+            LangFamily::Jvm => tn.qname().contains("::"),
+            LangFamily::CSharp | LangFamily::Ruby | LangFamily::Swift | LangFamily::C => true,
+            _ => false,
+        })
     }
 
     /// Equal unqualified type names in different Rust modules are distinct.

@@ -1,6 +1,7 @@
 //! cg-extract: turns files into per-file node/edge/reference tables plus facts.
 
 pub mod facts;
+pub mod macro_mask;
 pub mod pipeline;
 pub mod post;
 pub mod rows;

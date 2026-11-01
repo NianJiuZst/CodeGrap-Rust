@@ -6,7 +6,7 @@
 use crate::builtins::{is_builtin, is_common_method};
 use crate::engine::{Bound, Engine};
 use crate::modules::{ImportTarget, PkgId};
-use crate::shape::{parse_shape, split_head, Shape};
+use crate::shape::{normalize_call_name, parse_shape, split_head, Shape};
 use cg_core::{text::pack_pos, EdgeKind, FileId, Lang, LangFamily, NodeIdx, NodeKind, RefKind, Visibility, NONE};
 use cg_extract::facts::COMMONJS_MODULE;
 use cg_extract::{BindKind, ImportKind, ScopeKind};
@@ -418,7 +418,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let mut cur = from;
         for _ in 0..24 {
             let n = view.node(cur);
-            if n.kind().is_type() {
+            if self.holds_members(n.kind()) {
                 return Some(cur);
             }
             match n.parent() {
@@ -431,7 +431,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let prefix = &q[..q.rfind("::")?];
         let mut best = None;
         for cand in view.by_qname(prefix) {
-            if !view.node(cand).kind().is_type() {
+            if !self.holds_members(view.node(cand).kind()) {
                 continue;
             }
             let cf = view.hot(cand).file;
@@ -450,6 +450,12 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         best
+    }
+
+    /// Kinds whose members are reached through the type: every type, and Ruby modules
+    /// (`module Helpers; def halt; end; end`).
+    fn holds_members(&self, k: NodeKind) -> bool {
+        k.is_type() || (self.family == LangFamily::Ruby && k == NodeKind::Module)
     }
 
     /// Node of the class scope that corresponds to type node `t` (same start position).
@@ -562,7 +568,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
     fn nested_type(&self, _wcx: &mut WorkerCx<'e, 'v>, mut n: NodeIdx, rest: &str) -> TypeRes {
         for seg in rest.split(['.', ':']).filter(|s| !s.is_empty()) {
             match self.e.direct_member(n, seg) {
-                Some(m) if self.view.node(m).kind().is_type() => n = m,
+                Some(m) if self.holds_members(self.view.node(m).kind()) => n = m,
                 _ => return TypeRes::Unknown,
             }
         }
@@ -758,7 +764,12 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 return self.member_return(wcx, receiver, method, depth + 1);
             }
         }
-        let split = callee.rsplit_once("::").or_else(|| callee.rsplit_once('.'));
+        // the last separator of either kind: `Foo::Bar.create` is `create` on `Foo::Bar`
+        let split = match (callee.rfind("::"), callee.rfind('.')) {
+            (Some(c), Some(d)) if d > c => callee.rsplit_once('.'),
+            (Some(_), _) => callee.rsplit_once("::"),
+            (None, _) => callee.rsplit_once('.'),
+        };
         if let Some((owner, method)) = split {
             // Django's default manager returns the concrete model for these
             // operations. Require the actual Model base in the resolved
@@ -998,7 +1009,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 return NameRes::Local;
             }
             // members of the enclosing class are visible by bare name in these languages
-            if matches!(self.family, LangFamily::Jvm | LangFamily::Python) {
+            // (PHP: the kernel emits `$this->m()` as a bare `m`)
+            if matches!(
+                self.family,
+                LangFamily::Jvm | LangFamily::Python | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby | LangFamily::Swift | LangFamily::C
+            ) {
                 if let Some(m) = self.enclosing_member(from, name) {
                     return NameRes::Found(m, by::RECEIVER, 90);
                 }
@@ -1068,6 +1083,16 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 }
             }
         }
+        // C#: types of the enclosing namespaces need no `using`
+        if self.family == LangFamily::CSharp {
+            for p in e.modules.parent_namespaces(self.pkg) {
+                if let Some(list) = e.pkg_defs.get(p.0 as usize).and_then(|m| m.get(name)) {
+                    if let Some(n) = list.iter().copied().find(|n| accept.ok(kind_of(view, *n))) {
+                        return NameRes::Found(n, by::PACKAGE, 85);
+                    }
+                }
+            }
+        }
         // Rust: a child module is visible by name
         if self.family == LangFamily::Rust && accept != Accept::Callable {
             if let Some(m) = e.submodule(self.file, name) {
@@ -1116,7 +1141,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
         for f in path {
             match self.field_type(wcx, t, f) {
                 Some(ft) => t = ft,
-                None => return Outcome::st(status::NO_CANDIDATE),
+                // `Outer.Inner.m()` / `Mod::Klass.m`: a nested type rather than a field
+                None => match self.e.direct_member(t, f) {
+                    Some(inner) if self.holds_members(self.view.node(inner).kind()) => t = inner,
+                    _ => return Outcome::st(status::NO_CANDIDATE),
+                },
             }
         }
         match self.e.find_member(t, method) {
@@ -1311,8 +1340,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
         }
         match self.lookup_type(wcx, root) {
             TypeRes::Node(t) => {
-                if view.node(t).kind().is_type() {
-                    return self.member_of(wcx, t, path, method, 90);
+                if self.holds_members(view.node(t).kind()) {
+                    let o = self.member_of(wcx, t, path, method, 90);
+                    if o.status == status::RESOLVED || !matches!(self.family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby) {
+                        return o;
+                    }
                 }
             }
             TypeRes::External => return Outcome::st(status::EXTERNAL),
@@ -1321,6 +1353,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
         }
         if is_builtin(self.family, root) {
             return Outcome::st(status::BUILTIN);
+        }
+        if matches!(self.family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby) {
+            if let Some(n) = self.qualified_callable(r.from, root, path, method) {
+                return Outcome::found(n, by::QUALIFIED, 90);
+            }
         }
         // (d) nothing known about the receiver
         if path.is_empty() {
@@ -1388,8 +1425,52 @@ impl<'e, 'v> FileCx<'e, 'v> {
         self.member_of(wcx, t, &[], method, 85)
     }
 
+    /// A namespace-qualified callable (`fmt::detail::write`, `Ns.Util.Run`, `Rack::Utils.escape`)
+    /// by its qualified name, as written or relative to the namespaces enclosing the caller.
+    fn qualified_callable(&self, from: NodeIdx, root: &str, path: &[&str], method: &str) -> Option<NodeIdx> {
+        let view = self.view;
+        let mut segs: SmallVec<[&str; 6]> = SmallVec::new();
+        segs.push(root);
+        segs.extend(path.iter().copied());
+        segs.push(method);
+        let joined = segs.join("::");
+        let mut cands: Vec<String> = vec![joined.clone()];
+        let sep = match self.family {
+            LangFamily::CSharp => Some("."),
+            LangFamily::Php => Some("\\"),
+            _ => None,
+        };
+        if let Some(sep) = sep {
+            // the namespace part of a qualified name uses the language's separator
+            for i in (1..segs.len() - 1).rev() {
+                cands.push(format!("{}::{}", segs[..i].join(sep), segs[i..].join("::")));
+            }
+        }
+        let from_q = view.node(from).qname();
+        let mut prefix = from_q;
+        while let Some(i) = prefix.rfind("::") {
+            prefix = &prefix[..i];
+            cands.push(format!("{prefix}::{joined}"));
+        }
+        for q in &cands {
+            for n in view.by_qname(q) {
+                let node = view.node(n);
+                if view.file(node.file()).lang().family() == self.family && Accept::Callable.ok(node.kind()) && node.kind() != NodeKind::File {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
     pub fn resolve_call_name(&self, wcx: &mut WorkerCx<'e, 'v>, r: &RefRec, name: &str) -> Outcome {
-        match parse_shape(name) {
+        let normalized = normalize_call_name(self.family, name);
+        let name = normalized.as_ref();
+        // Swift `$0.m()`, PHP `$fn()` callables held in variables or closure parameters
+        if self.family == LangFamily::Swift && name.starts_with('$') && name[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            return Outcome::st(status::LOCAL_BINDING);
+        }
+        let outcome = match parse_shape(name) {
             Shape::Bare(n) => self.call_bare(wcx, r, n, Accept::Callable),
             Shape::Member { root, path, method } => self.call_member(wcx, r, root, &path, method),
             Shape::This { kw, fields, method } => self.call_this(wcx, r, kw, &fields, method),
@@ -1407,7 +1488,8 @@ impl<'e, 'v> FileCx<'e, 'v> {
                     None => Outcome::st(status::NO_CANDIDATE),
                 }
             }
-        }
+        };
+        outcome
     }
 
     // ------------------------------------------------------------ reference kinds

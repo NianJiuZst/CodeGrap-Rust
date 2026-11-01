@@ -220,7 +220,23 @@ pub fn extract_bytes(rel: &str, bytes: &[u8], mtime_ns: i64, lang_hint: Lang, cf
         flags |= fileflags::TEST;
     }
     let mut errors = Vec::new();
-    let mut outcome = run_kernel(rel, &src, lang, cfg);
+    // Rust items inside conditional wrappers (`cfg_rt! { .. }`) are extracted from a
+    // position-preserving view with the wrapper tokens blanked; see macro_mask.rs. The
+    // original text is used again if blanking introduced a syntax error.
+    let masked = if lang == Lang::Rust { crate::macro_mask::rust_item_wrappers(&src, cfg.parse_timeout) } else { None };
+    let mut use_mask = masked.is_some();
+    let mut outcome = match &masked {
+        Some((m, _)) => run_kernel(rel, m, lang, cfg),
+        None => run_kernel(rel, &src, lang, cfg),
+    };
+    if let (Some((_, false)), KernelOutcome::Ok { had_error_tree: true, .. }) = (&masked, &outcome) {
+        use_mask = false;
+        outcome = run_kernel(rel, &src, lang, cfg);
+    }
+    let src = match masked {
+        Some((m, _)) if use_mask => std::borrow::Cow::Owned(m),
+        _ => src,
+    };
     if matches!(outcome, KernelOutcome::TooDeep) {
         outcome = run_kernel_big_stack(rel, &src, lang, cfg);
     }
