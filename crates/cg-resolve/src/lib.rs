@@ -8,6 +8,7 @@ pub use modules::{ImportTarget, Modules, PkgId};
 pub mod engine;
 pub use engine::{Bound, Engine, ExportEntry};
 pub mod builtins;
+pub mod overload;
 pub mod shape;
 pub use shape::{parse_shape, Shape};
 pub mod resolve;

@@ -6,11 +6,12 @@ use crate::rows::FileRows;
 use cg_core::{text, Lang, NONE};
 use tree_sitter::{Node, Tree};
 
+pub mod args;
 mod c;
 mod csharp;
 mod go;
 mod java;
-mod js;
+pub mod js;
 mod kotlin;
 mod php;
 mod python;
@@ -116,6 +117,18 @@ pub enum BindKind {
     /// Return annotation or a bounded inferred return expression, keyed by the
     /// function's node. Metadata only; not a lexical binding.
     ReturnType = 6,
+    /// `const local = other`: a name bound to nothing but another name (`init_ctor`). A call
+    /// through it is a call of what the other name is.
+    Alias = 7,
+    /// Rust `impl Deref for X { type Target = Y; }`: `name` is the type as the impl writes it,
+    /// `decl_type` the target. Metadata only; not a lexical binding.
+    Deref = 8,
+    /// A pytest fixture, keyed by the function's node: what it returns, as `ReturnType`.
+    /// Metadata only; not a lexical binding.
+    Fixture = 9,
+    /// Rust `type X = Y;` outside an impl, keyed by the alias's node: `decl_type` is `Y`.
+    /// Metadata only; not a lexical binding.
+    TypeAlias = 10,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +158,15 @@ pub struct Facts {
     /// Precise call paths lost by the compatibility kernel. Applied to matching
     /// call references before storage; node identities and sites stay unchanged.
     pub call_names: Vec<CallNameFact>,
+    /// Argument shapes of call sites, for overload selection (see `args`).
+    pub call_args: Vec<CallArgsFact>,
+    /// Go type declarations whose names stand for other types: true aliases and the type
+    /// parameters of generic types (structural interface matching leaves them open).
+    pub go_types: Vec<GoTypeFact>,
+    /// Go types a struct or interface embeds, as written (`io.Reader`, `*os.File`, `error`).
+    pub go_embeds: Vec<GoEmbedFact>,
+    /// Go struct fields of a func type, and the values code puts in struct fields.
+    pub go_fields: Vec<GoFieldFact>,
     /// A supplementary parse exhausted its deadline. The pipeline exposes this
     /// as an incomplete file rather than silently advertising complete facts.
     pub timed_out: bool,
@@ -157,6 +179,49 @@ pub struct CallNameFact {
     pub tail: String,
     pub kernel_name: String,
     pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoTypeFact {
+    pub name: String,
+    /// `type A = B`
+    pub alias: bool,
+    pub type_params: Vec<String>,
+    /// `type HandlerFunc func(...)`: a value of the type is a function.
+    pub func_type: bool,
+}
+
+/// One embedded type of a Go struct or interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoEmbedFact {
+    /// Kernel node row of the embedding type.
+    pub row: u32,
+    /// The package qualifier as written (`io` in `io.Reader`), empty for none.
+    pub qualifier: String,
+    /// The embedded type's name.
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoFieldFact {
+    /// A struct field declared with a literal func type (`refreshf func(ctx) error`).
+    FuncField { row: u32, field: String },
+    /// A value put in a field by a composite literal: `T{F: v}`, or positional `T{a, v}`
+    /// (`field` is then `#index`).
+    Literal { ty: String, field: String, value: String, line: u32, col: u32 },
+    /// An assignment `x.F = v` / `x.y.F = v`: `receiver` is `x` / `x.y`.
+    Assign { receiver: String, field: String, value: String, line: u32, col: u32 },
+}
+
+/// The arguments of one call, keyed like the kernel's call reference: its position and the
+/// called name's last segment. Stored with the reference (`args::ARGS_MARK` list).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallArgsFact {
+    pub line: u32,
+    pub col: u32,
+    pub tail: String,
+    /// One shape per argument, in order (see `args`).
+    pub args: Vec<String>,
 }
 
 impl Facts {

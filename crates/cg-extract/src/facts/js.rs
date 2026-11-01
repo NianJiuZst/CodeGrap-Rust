@@ -4,8 +4,32 @@
 use super::util::*;
 use super::*;
 
+/// Export-fact name marking a `declare module 'name' { ... }` block (`from_spec` is the module's
+/// name, `from_name` `script` when the file has no top-level import or export, so that the block
+/// declares the module rather than augmenting one). The leading NUL keeps it out of real names.
+pub const AMBIENT_MODULE: &str = "\0ambient";
+
 pub fn extract(cx: &mut Cx, root: Node) {
     walk(cx, root, 0);
+    let script = !kids(root).any(|c| matches!(c.kind(), "import_statement" | "export_statement" | "import_alias"));
+    for decl in kids(root).filter(|c| c.kind() == "ambient_declaration") {
+        let Some(module) = kids(decl).find(|c| c.kind() == "module") else { continue };
+        let (Some(name), Some(_body)) = (module.child_by_field_name("name"), module.child_by_field_name("body")) else { continue };
+        if name.kind() != "string" {
+            continue;
+        }
+        let spec = unquote(cx.text(name)).to_owned();
+        if spec.is_empty() || spec.contains('*') {
+            continue; // a wildcard pattern names no specifier exactly
+        }
+        cx.facts.exports.push(ExportFact {
+            name: AMBIENT_MODULE.into(),
+            node_row: NONE,
+            from_spec: spec,
+            from_name: if script { "script" } else { "module" }.into(),
+            star: false,
+        });
+    }
 }
 
 fn walk_children(cx: &mut Cx, n: Node, scope: u32) {
@@ -41,6 +65,10 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
         "function_expression" | "function" | "generator_function" | "arrow_function" | "method_definition" => function(cx, n, scope),
         "class_declaration" | "abstract_class_declaration" | "class" => class(cx, n, scope),
         "lexical_declaration" | "variable_declaration" => var_decl(cx, n, scope),
+        "call_expression" => {
+            super::args::js_call(cx, n);
+            walk_children(cx, n, scope);
+        }
         "for_in_statement" => {
             if let Some(l) = n.child_by_field_name("left") {
                 bind_pattern(cx, l, scope, BindKind::Local, "", "");
@@ -99,6 +127,8 @@ fn ts_type_name(cx: &Cx, n: Node) -> String {
     match n.kind() {
         "type_annotation" => n.named_child(0).map(|c| ts_type_name(cx, c)).unwrap_or_default(),
         "type_identifier" | "identifier" => cx.text(n).to_owned(),
+        // primitives type arguments for overload selection (`args`); `any` / `unknown` say nothing
+        "predefined_type" if matches!(cx.text(n), "string" | "number" | "boolean" | "bigint" | "symbol") => cx.text(n).to_owned(),
         "nested_type_identifier" | "member_expression" => cx.text(n).to_owned(),
         "generic_type" => n.child_by_field_name("name").map(|c| ts_type_name(cx, c)).unwrap_or_default(),
         "parenthesized_type" | "readonly_type" | "required_parameter" => n.named_child(0).map(|c| ts_type_name(cx, c)).unwrap_or_default(),
@@ -108,7 +138,7 @@ fn ts_type_name(cx: &Cx, n: Node) -> String {
                     continue;
                 }
                 let t = ts_type_name(cx, ch);
-                if !t.is_empty() && t != "null" && t != "undefined" {
+                if !t.is_empty() && !matches!(t.as_str(), "null" | "undefined" | "string" | "number" | "boolean" | "bigint" | "symbol") {
                     return t;
                 }
             }
@@ -364,19 +394,71 @@ fn commonjs_value(cx: &mut Cx, name: &str, value: Node) {
     cx.facts.exports.push(ExportFact { name: name.to_owned(), node_row, from_spec, from_name, star: false });
 }
 
+/// `X.prototype` -> `X`.
+fn prototype_of<'a>(cx: &Cx<'a>, n: Node) -> Option<&'a str> {
+    if n.kind() != "member_expression" || n.child_by_field_name("property").map(|p| cx.text(p)) != Some("prototype") {
+        return None;
+    }
+    let object = n.child_by_field_name("object").filter(|o| o.kind() == "identifier")?;
+    Some(cx.text(object))
+}
+
+/// The ES5 constructor an object literal's members are given to: `X.prototype = { ... }` or
+/// `Object.assign(X.prototype, { ... })`.
+fn prototype_object_owner<'a>(cx: &Cx<'a>, object: Node) -> Option<&'a str> {
+    let parent = object.parent()?;
+    match parent.kind() {
+        "assignment_expression" if parent.child_by_field_name("right") == Some(object) => prototype_of(cx, parent.child_by_field_name("left")?),
+        "arguments" => {
+            let call = parent.parent().filter(|c| c.kind() == "call_expression")?;
+            if call.child_by_field_name("function").map(|f| cx.text(f)) != Some("Object.assign") {
+                return None;
+            }
+            prototype_of(cx, parent.named_child(0)?)
+        }
+        _ => None,
+    }
+}
+
+/// The function declaration a node sits in, when its name reads as a constructor's (`Foo`).
+fn enclosing_constructor<'a>(cx: &Cx<'a>, n: Node) -> Option<&'a str> {
+    let mut cur = n.parent();
+    while let Some(p) = cur {
+        if matches!(p.kind(), "function_declaration" | "function_expression" | "function" | "arrow_function" | "method_definition" | "class_body") {
+            let name = (p.kind() == "function_declaration").then(|| p.child_by_field_name("name")).flatten().map(|nm| cx.text(nm))?;
+            return name.starts_with(|c: char| c.is_ascii_uppercase()).then_some(name);
+        }
+        cur = p.parent();
+    }
+    None
+}
+
 fn function(cx: &mut Cx, n: Node, scope: u32) {
     // The kernel labels `obj.method = function method() {}` as a Function. Keep
     // evidence of the member assignment so an unknown receiver cannot match an
-    // unrelated, plain function with the same name.
+    // unrelated, plain function with the same name. A member given to an ES5
+    // constructor's prototype (`X.prototype.m = ...`, `this.m = ...` in `function X`)
+    // records the constructor's name.
     if let Some(parent) = n.parent() {
-        let member = match parent.kind() {
-            "object" if n.kind() == "method_definition" => n.child_by_field_name("name"),
-            "assignment_expression" if parent.child_by_field_name("right") == Some(n) => parent
-                .child_by_field_name("left")
-                .filter(|left| matches!(left.kind(), "member_expression" | "subscript_expression"))
-                .and_then(|left| left.child_by_field_name("property").or_else(|| left.child_by_field_name("index").filter(|index| index.kind() == "string"))),
-            "pair" if parent.child_by_field_name("value") == Some(n) => parent.child_by_field_name("key"),
-            _ => None,
+        let (member, owner) = match parent.kind() {
+            "object" if n.kind() == "method_definition" => (n.child_by_field_name("name"), prototype_object_owner(cx, parent)),
+            "assignment_expression" if parent.child_by_field_name("right") == Some(n) => {
+                let left = parent.child_by_field_name("left").filter(|left| matches!(left.kind(), "member_expression" | "subscript_expression"));
+                let member = left.and_then(|left| {
+                    left.child_by_field_name("property").or_else(|| left.child_by_field_name("index").filter(|index| index.kind() == "string"))
+                });
+                let object = left.and_then(|left| left.child_by_field_name("object"));
+                let owner = match object {
+                    Some(o) if o.kind() == "this" => enclosing_constructor(cx, parent),
+                    Some(o) => prototype_of(cx, o),
+                    None => None,
+                };
+                (member, owner)
+            }
+            "pair" if parent.child_by_field_name("value") == Some(n) => {
+                (parent.child_by_field_name("key"), parent.parent().and_then(|o| prototype_object_owner(cx, o)))
+            }
+            _ => (None, None),
         };
         if let Some(member) = member {
             if let Some(row) = cx.row_at(cx.start(n)) {
@@ -384,7 +466,7 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
                     scope,
                     name: cx.text(member).trim_matches(['\'', '"']).to_owned(),
                     kind: BindKind::MemberFn,
-                    decl_type: String::new(),
+                    decl_type: owner.unwrap_or_default().to_owned(),
                     init_ctor: String::new(),
                     line: cx.line(n),
                     node_row: row,
@@ -523,10 +605,16 @@ fn var_decl(cx: &mut Cx, n: Node, scope: u32) {
                 continue;
             }
             let is_fn = matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "generator_function");
+            let constant = kids(n).next().is_some_and(|k| k.kind() == "const");
             if is_fn && name.kind() == "identifier" {
                 let nm = cx.text(name).to_owned();
                 let line = cx.line(d);
                 cx.add_binding(scope, &nm, BindKind::LocalFn, "", "", line);
+            } else if constant && name.kind() == "identifier" && v.kind() == "identifier" && ty.is_empty() && cx.text(v) != cx.text(name) {
+                // `const local = other`: the name is the other name
+                let (nm, other) = (cx.text(name).to_owned(), cx.text(v).to_owned());
+                let line = cx.line(d);
+                cx.add_binding(scope, &nm, BindKind::Alias, "", &other, line);
             } else {
                 let (vt, init) = value_info(cx, v);
                 let dt = if ty.is_empty() { vt } else { ty };

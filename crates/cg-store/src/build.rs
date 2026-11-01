@@ -448,13 +448,35 @@ pub fn build_draft_at(batches: &[FileBatch], delta: Option<(&[FileId], BuildBase
                     .or_insert(Some(call.name.as_str()));
             }
         }
+        // Argument shapes ride on the call reference as its candidate list (the kernel gives
+        // calls none). Two calls at one position with one name are told apart by nothing.
+        let mut call_args: rustc_hash::FxHashMap<(u32, u32, &str), Option<&cg_extract::facts::CallArgsFact>> = rustc_hash::FxHashMap::default();
+        for call in &b.facts.call_args {
+            call_args
+                .entry((call.line, call.col, call.tail.as_str()))
+                .and_modify(|prev| {
+                    if prev.is_some_and(|p| p.args != call.args) {
+                        *prev = None;
+                    }
+                })
+                .or_insert(Some(call));
+        }
         for r in rows.refs() {
             let from_row = r.from_row().filter(|x| *x < kcount as u32).or_else(|| row_by_id(&mut id_to_row, &rows, r.from_id()?));
             let from = nstart + from_row.unwrap_or(0);
-            let name = if r.kind() == RefKind::Edge(EdgeKind::Calls) {
-                call_names.get(&(r.line(), r.col(), r.name())).copied().flatten().unwrap_or_else(|| r.name())
+            let is_call = r.kind() == RefKind::Edge(EdgeKind::Calls);
+            let name = if is_call { call_names.get(&(r.line(), r.col(), r.name())).copied().flatten().unwrap_or_else(|| r.name()) } else { r.name() };
+            let args = if is_call && r.candidates().is_none() {
+                call_args.get(&(r.line(), r.col(), tail_of(name))).copied().flatten().map(|call| {
+                    let mut joined = String::from(cg_extract::facts::args::ARGS_MARK);
+                    for a in &call.args {
+                        joined.push('\0');
+                        joined.push_str(a);
+                    }
+                    arena.alloc(joined)
+                })
             } else {
-                r.name()
+                None
             };
             let tail_src: &str =
                 if r.kind().edge_kind() == EdgeKind::Imports && import_specs.contains(name) { arena.alloc(format!("module:{name}")) } else { tail_of(name) };
@@ -467,7 +489,7 @@ pub fn build_draft_at(batches: &[FileBatch], delta: Option<(&[FileId], BuildBase
                 by: 0,
                 line: r.line(),
                 col: r.col(),
-                candidates: r.candidates().map(|c| lists.push_nul_joined(c, &mut text)).unwrap_or(ListId::NONE),
+                candidates: r.candidates().or(args).map(|c| lists.push_nul_joined(c, &mut text)).unwrap_or(ListId::NONE),
                 target: NodeIdx::NONE,
                 tail: StrId(names.intern(tail_src)),
             });

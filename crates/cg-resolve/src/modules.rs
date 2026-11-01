@@ -53,6 +53,9 @@ pub struct Modules<'v> {
     rs_file_mod: FxHashMap<FileId, (u32, String)>,
     /// C/C++ and Ruby: file name -> files, for `#include "a/b.h"` / `require 'a/b'` lookups.
     by_basename: FxHashMap<&'v str, Vec<FileId>>,
+    /// TypeScript: the declaration file a `declare module 'name' { ... }` block declares each
+    /// module in (upstream `ambient-modules.ts`), first by path.
+    ambient: FxHashMap<&'v str, FileId>,
 }
 
 /// Package key prefixes of the namespace-based languages (Java/Kotlin use the bare name).
@@ -62,6 +65,11 @@ pub const SWIFT_PKG: &str = "swift:";
 
 fn dir_of(p: &str) -> &str {
     parent_dir(p)
+}
+
+/// A TypeScript declaration file: `.d.ts`, `.d.mts`, `.d.cts`.
+fn is_declaration_file(path: &str) -> bool {
+    path.ends_with(".d.ts") || path.ends_with(".d.mts") || path.ends_with(".d.cts")
 }
 
 impl<'v> Modules<'v> {
@@ -80,6 +88,7 @@ impl<'v> Modules<'v> {
             rs_mod_to_file: FxHashMap::default(),
             rs_file_mod: FxHashMap::default(),
             by_basename: FxHashMap::default(),
+            ambient: FxHashMap::default(),
         };
         let mut files: Vec<FileId> = view.files().collect();
         // Delta file ids are appended, unlike a fresh build's path-ordered ids. Package
@@ -105,6 +114,14 @@ impl<'v> Modules<'v> {
                 Lang::CSharp => m.index_namespace(f, CS_PKG),
                 Lang::Php => m.index_namespace(f, PHP_PKG),
                 Lang::Swift => m.index_swift(f, path),
+                Lang::TypeScript if is_declaration_file(path) => {
+                    // a script declaration file (no top-level import or export) declares its modules
+                    for ex in view.exports_of(f) {
+                        if view.text_str(ex.name) == cg_extract::facts::js::AMBIENT_MODULE && view.text_str(ex.from_name) == "script" {
+                            m.ambient.entry(view.text_str(ex.from_spec)).or_insert(f);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -578,6 +595,13 @@ impl<'v> Modules<'v> {
                         return ImportTarget::File(f);
                     }
                 }
+            }
+        }
+        // a module the repository declares itself (`declare module 'mammoth' { ... }`): the
+        // checker reads it before the package, and only TypeScript reads it at all
+        if from_lang.is_typescript() {
+            if let Some(f) = self.ambient.get(spec) {
+                return ImportTarget::File(*f);
             }
         }
         ImportTarget::External

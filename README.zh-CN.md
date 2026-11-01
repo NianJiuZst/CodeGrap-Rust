@@ -46,25 +46,28 @@ Node.js 运行时或数据库服务。原生索引保存在项目的 `.cgr/` 目
 
 ## 实测性能
 
-**2026-11-01 对已合并 main 的复测**：四个固定仓库的全量索引加速比几何平均为 **4.95×**，
-建索引峰值 RSS 降低 **85.9%–90.0%**。两边索引的文件及源码字节完全相同，
-原版已加载原生 Rust 提取内核，并启用被测语言的原生路由。
+**2026-11-01 六仓库复测**：`cgr` **`edb403e`** 对照原版 **`d2e0389`**，
+全量索引加速比几何平均 **4.77×**，峰值 RSS 的中位数降低 **78.3%–88.7%**。
+对比集在原有四仓库基础上新增 TypeScript 的 Zod 和 Kotlin/Java 的 OkHttp；双方
+索引的文件及源码字节一致，原版启用原生提取内核。
 
 | 仓库 | 文件数 | 原版全量索引 | `cgr` 全量索引 | 加速比 | 峰值 RSS：原版 → `cgr` |
 |---|---:|---:|---:|---:|---:|
-| Express | 142 | 532.7 ms | 121.9 ms | **4.37×** | 225.7 → 27.9 MiB |
-| Gin | 99 | 636.6 ms | 129.6 ms | **4.91×** | 246.3 → 34.8 MiB |
-| Tokio | 814 | 2,599.3 ms | 504.6 ms | **5.15×** | 736.1 → 73.4 MiB |
-| Django | 2,984 | 10,878.0 ms | 2,002.1 ms | **5.43×** | 1,909.2 → 229.6 MiB |
+| Express | 142 | 536.2 ms | 136.0 ms | **3.94×** | 225.6 → 48.9 MiB |
+| Gin | 99 | 620.8 ms | 130.5 ms | **4.76×** | 246.9 → 37.0 MiB |
+| Tokio | 814 | 2,592.2 ms | 555.3 ms | **4.67×** | 733.6 → 83.3 MiB |
+| Django | 2,984 | 10,597.8 ms | 1,934.0 ms | **5.48×** | 1,896.8 → 237.4 MiB |
+| Zod | 523 | 2,287.0 ms | 474.1 ms | **4.82×** | 627.2 → 93.8 MiB |
+| OkHttp | 690 | 3,136.6 ms | 613.9 ms | **5.11×** | 814.2 → 109.0 MiB |
 
-被测版本：`cgr` **`b827b1d`**、原版 **`d2e0389`**（package 版本 1.6.2）。
-机器为 Apple M5、10 核、16 GiB 内存，macOS 26.5.2，固定外接电源；Rust 1.94.1 release、Node 24.18.0。
-本轮采用**受限档**：两边提取/解析线程参数均为 2，`CGR_MEMORY_MB=2048`。
-全量索引为预热一次后的三次完整 CLI 重建中位数，每条命令之间至少冷却 30 秒，保留系统文件缓存。
-线程参数没有将进程绑定到两个物理核心。原有保护脚本检查可用内存、磁盘、Swap，并监控进程树 RSS。
+两边各预热一次并计时三次完整 CLI 重建；受限档采用两个工作线程、`cgr` 2 GiB
+内存预算。外接电源、热文件缓存，每条命令间隔至少 30 秒。相对原版的严格全图
+精确率和召回率在六个仓库均未同时达到 97% / 95% 门槛；图谱输出并不相同，且
+原版不是语义真值。详见[六仓库报告](docs/BENCHMARKS-SIX-REPO-2026-11-01.md)
+和[机器可读结果](docs/benchmarks/2026-11-01-six-repo-retest.json)。
 
-完整耗时、输出量及测量条件见[性能实测报告](docs/BENCHMARKS.md#full-indexing)，
-原始命令采样见[机器可读结果](docs/benchmarks/2026-11-01-main-retest.json)。
+下方同步和查询表保留旧版 **`b827b1d`** 的测量；新一轮仅完成 Express 同步，
+查询测评尚未完成。
 
 ### 增量同步延迟
 
@@ -100,7 +103,7 @@ main 已包含按事件路径同步、静默期纯数据快照合并、提取缓
 MCP 增加排队上限、协作取消及项目/监听资源回收。
 
 快照格式为 **version 2**，旧索引需运行 `cgr index /path/to/project` 重建。
-上方复测已覆盖合并后的实现。历史 **6.40×** 使用了不同线程参数和较早的上游版本，现保存在
+上方全量索引复测的版本已单独标注。历史 **6.40×** 使用了不同线程参数和较早的上游版本，现保存在
 [历史报告](docs/BENCHMARKS-HISTORICAL.md)，不能作为本轮代码优化的前后收益。
 实现边界见[中英双语优化记录](docs/PERFORMANCE-IMPLEMENTATION.md)。
 
@@ -215,11 +218,39 @@ MCP 服务运行且启用监听时，会在防抖后自动同步源码变化。
 
 ### 框架与动态分派规则
 
-已实现 **Express、Flask、FastAPI、Django、Gin、Spring、Axum、Next.js** 的路由提取 hook。
+已实现 **Express、Flask、FastAPI、Django、Gin、Spring、Axum、Next.js、NestJS、React Router 和 TanStack Router** 的路由提取 hook。
 框架检测依赖项目清单，因此缺失依赖声明或索引框架自身仓库时，路由覆盖可能不同；实测文档记录了已观察到的差异。
 
 合成边规则覆盖接口与实现分派、Go 结构化接口、事件发射器处理函数、React 重新渲染、JSX 父子组件关系等模式。
 这些规则带有来源信息和数量限制，属于针对特定模式的启发式分析，不覆盖任意运行时行为。
+
+NestJS 中，可静态读取的 `RouterModule.register` 路径和由 `NestFactory.create` 创建的应用上的字面量
+`setGlobalPrefix`（包括可读取的排除项）会参与 HTTP 客户端匹配；路由节点名称仍使用控制器内的路径。
+React Router 支持通过导入和转导出使用其他文件中的导出路由数组，包括字面量父路由和 `children` 数组。
+索引会保留导出数组的候选路由节点，但只有被已识别的路由器调用使用的数组才参与导航匹配。
+动态路由配置不在此跨文件规则的覆盖范围内。
+Go 接口分派包含无歧义的提升方法；方法集推断仍是有界的静态近似。
+
+引擎规则版本 7 补充了以下解析规则与合成边（均为有界的静态规则，歧义时不连）：
+
+- **Go**：嵌入的标准库类型参与接口判定（`io.Reader`、`*os.File`、`error` 等方法表移植自上游），
+  其他外部嵌入类型按"不透明"处理；按书写的包限定绑定内核丢掉限定的项目内嵌入；
+  func 字段分派（`d.refreshf()` 连到写入该字段的函数，含一层字段间复制）；
+  protoc 生成的 `Unimplemented*Server` 连到手写实现；Gin `Context.Next` 连到注册的中间件。
+- **TS/JS**：`const local = other` 与 `export const alias = realImpl` 的调用转发到真实函数，
+  对象字面量成员（`api.run()`）同样转发；模块级常量的条件 / `??` / `||` 各分支（`const-alias`）；
+  ES5 构造函数及其 `prototype` 方法、`util.inherits` / `Object.create` 继承；
+  `.d.ts` 中 `declare module 'x'` 声明的环境模块；Redux thunk 的 `dispatch` 链与 RTK Query 生成的 hook。
+- **Rust**：泛型参数按 trait 约束解析（无约束的类型参数不再误连同名项目类型）；
+  `impl Deref` 目标类型、`type X = Y` 别名、`Mutex` / `RwLock` 的锁 guard 自动解引用；`self.字段` 调用链求值。
+- **Python**：分支返回不同类的工厂函数按最近公共基类类型化；`self.x = self.make()` 跨方法字段流；
+  pytest fixture 参数（同文件或上级目录 `conftest.py`）取 fixture 的返回类型。
+- **跨语言 / JVM**：Spring 测试请求（MockMvc、WebTestClient、TestRestTemplate、RestAssured）连到路由；
+  Kotlin Multiplatform `expect` 连到各平台 `actual`；Tauri 前端 `invoke('cmd')` 连到已注册的 `#[tauri::command]`；
+  React Native `NativeModules.X.m()` 连到 Java / Kotlin 模块的 `@ReactMethod`。
+
+尚未覆盖：MyBatis XML、Angular 模板、Vue / Svelte 生态的 store 与路由、React Native 事件与 Fabric/Expo 原生侧、
+Tauri 事件、GoFrame，以及 Python 参数类型流（上游仅对 Ruby 实现）。
 
 C/C++、C#、PHP、Ruby、Swift 使用上游的提取 walker，并配有本项目自己的解析规则（头文件包含、命名空间、`require`、SwiftPM 模块、隐式 `this` 成员）；其解析质量只在样例仓库上做过检查，尚未与上游 oracle 对比，也还没有框架路由规则。Dart、Scala、Lua、Luau、R 只做语言识别，不做提取。当前也不包含 Vue/Svelte 专用提取逻辑。
 

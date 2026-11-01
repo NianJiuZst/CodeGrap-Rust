@@ -259,16 +259,24 @@ type ExportSig = Vec<(String, String, String, u8)>;
 type ResolverFactSig = BTreeSet<(u8, String, String, String, String)>;
 
 /// These facts change resolution even when the kernel's declaration identity
-/// stays the same (e.g. `obj.old = function internal` -> `obj.new = ...`).
+/// stays the same (e.g. `obj.old = function internal` -> `obj.new = ...`, or the target of a
+/// Rust `impl Deref`, which has no node of its own).
 fn resolver_fact_sig(view: &View, f: FileId) -> ResolverFactSig {
     view.bindings_of(f)
         .iter()
-        .filter(|b| (b.kind == BindKind::MemberFn as u8 || b.kind == BindKind::ReturnType as u8) && b.node.is_some())
+        .filter(|b| {
+            ((b.kind == BindKind::MemberFn as u8
+                || b.kind == BindKind::ReturnType as u8
+                || b.kind == BindKind::Fixture as u8
+                || b.kind == BindKind::TypeAlias as u8)
+                && b.node.is_some())
+                || b.kind == BindKind::Deref as u8
+        })
         .map(|b| {
             (
                 b.kind,
                 view.text_str(b.name).to_owned(),
-                view.node(b.node).qname().to_owned(),
+                if b.node.is_some() { view.node(b.node).qname().to_owned() } else { String::new() },
                 view.text_str(b.decl_type).to_owned(),
                 view.text_str(b.init_ctor).to_owned(),
             )
@@ -527,6 +535,12 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
     let mut definitions_changed = false;
     let mut export_changed: Vec<FileId> = Vec::new();
     let mut remap: FxHashMap<u32, u32> = FxHashMap::default();
+    // pytest injects a fixture by parameter name, with no import: a changed fixture re-resolves
+    // the Python files of its directory and below
+    let mut fixture_dirs: Vec<String> = Vec::new();
+    let fixture_dir = |view: &View, f: FileId, facts: &ResolverFactSig| -> Option<String> {
+        facts.iter().any(|fact| fact.0 == BindKind::Fixture as u8).then(|| cg_resolve::project::parent_dir(view.file(f).path()).to_owned())
+    };
     for (i, f) in ids.iter().enumerate() {
         let old = if states[i] == DeltaState::Replaced { defs_of(&base_view, *f) } else { BTreeMap::new() };
         let new = defs_of(&view1, *f);
@@ -537,9 +551,12 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
             definitions_changed = true;
             d_names.extend(old_facts.iter().chain(&new_facts).map(|fact| fact.1.clone()));
             export_changed.push(*f);
+            fixture_dirs.extend(fixture_dir(&view1, *f, &new_facts).or_else(|| fixture_dir(&view1, *f, &old_facts)));
         }
         for (k, details) in &new {
-            if (old.get(k) != Some(details)) && !old.contains_key(k) {
+            // a changed signature can move a call to another overload of the name, even one
+            // whose target kept its identity
+            if old.get(k) != Some(details) {
                 d_names.insert(k.name.clone());
             }
         }
@@ -556,7 +573,9 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
         }
     }
     for f in &removed {
-        d_names.extend(resolver_fact_sig(&base_view, *f).into_iter().map(|fact| fact.1));
+        let facts = resolver_fact_sig(&base_view, *f);
+        fixture_dirs.extend(fixture_dir(&base_view, *f, &facts));
+        d_names.extend(facts.into_iter().map(|fact| fact.1));
         for k in defs_of(&base_view, *f).keys() {
             d_names.insert(k.name.clone());
         }
@@ -630,6 +649,14 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
                 if reexports && seen.insert(*g) {
                     frontier.push(*g);
                 }
+            }
+        }
+    }
+    for dir in &fixture_dirs {
+        for (fi, rec) in base.p.files.iter().enumerate() {
+            let path = base.paths.get(rec.path);
+            if path.ends_with(".py") && (dir.is_empty() || path.starts_with(&format!("{dir}/"))) {
+                consumer_files.insert(fi as u32);
             }
         }
     }

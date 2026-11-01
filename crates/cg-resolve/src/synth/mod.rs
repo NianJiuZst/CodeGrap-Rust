@@ -2,11 +2,22 @@
 //! view (hierarchy, members, persisted sites), so the same code serves full builds and the
 //! incremental sync, which re-runs it and rewrites the files whose synthesised edges changed.
 
+pub mod bridges;
+pub mod dynamic;
+pub mod gin;
+pub mod go;
+pub mod go_fields;
+pub mod go_std;
+pub mod js_alias;
+pub mod js_proto;
+pub mod jvm;
+pub mod redux;
+pub mod scan;
 pub mod sites;
 
 use crate::engine::Engine;
 use crate::resolve::{Accept, NameRes, WorkerCx};
-use cg_core::{EdgeKind, FileId, Lang, NodeIdx, NodeKind, Provenance, NONE};
+use cg_core::{EdgeKind, FileId, Lang, LangFamily, NodeIdx, NodeKind, Provenance, NONE};
 use cg_store::{outkind, EdgeBuild, View};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -20,16 +31,15 @@ pub struct SynthOutput {
 }
 
 /// Fan-out ceilings: a key with more targets is skipped entirely (precision first, design 7.2).
-const MAX_IMPLS: usize = 12;
+/// Overrides linked per (type, supertype) pair (upstream `MAX_CALLBACKS_PER_CHANNEL`).
+const MAX_IMPLS_PER_PAIR: usize = 40;
 const MAX_EMITTERS: usize = 8;
 const MAX_HANDLERS: usize = 8;
-const MAX_GO_IMPLEMENTERS: usize = 24;
-
-/// Go method names that nearly every type has: an interface made only of these says nothing.
-const GENERIC_GO_METHODS: &[&str] = &["String", "Error", "Close", "Read", "Write", "Len", "Less", "Swap", "Reset", "Unwrap", "Is", "As", "Format", "Clone"];
+/// Implementers linked per Go interface, in file order (upstream `MAX_CALLBACKS_PER_CHANNEL`).
+const MAX_GO_IMPLEMENTERS: usize = 40;
 
 #[derive(Default)]
-struct Out {
+pub(crate) struct Out {
     edges: Vec<EdgeBuild>,
     emeta: Vec<String>,
     meta_ids: FxHashMap<String, u32>,
@@ -54,8 +64,32 @@ impl Out {
             edge
         }));
     }
+    /// An edge with its metadata object as is (the passes that carry more than one extra key).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_meta(&mut self, kind: EdgeKind, src: NodeIdx, dst: NodeIdx, line: u32, col: u32, meta: serde_json::Value, order: u16) {
+        if src == dst {
+            return;
+        }
+        let json = meta.to_string();
+        let id = *self.meta_ids.entry(json.clone()).or_insert_with(|| {
+            self.emeta.push(json);
+            (self.emeta.len() - 1) as u32
+        });
+        self.edges.push(EdgeBuild {
+            src: src.0,
+            dst: dst.0,
+            kind: outkind::pack(kind, Provenance::Heuristic, outkind::CLASS_SYNTH),
+            line: if line == 0 { NONE } else { line },
+            col,
+            res: 0,
+            ref_idx: NONE,
+            meta: id,
+            order,
+        });
+    }
+
     #[allow(clippy::too_many_arguments)] // one call site per synthesis pass; a builder would only add noise
-    fn push(
+    pub(crate) fn push(
         &mut self,
         kind: EdgeKind,
         src: NodeIdx,
@@ -100,161 +134,123 @@ fn path_line(view: &View, f: FileId, line: u32) -> String {
     format!("{}:{}", view.file(f).path(), line)
 }
 
-/// Invert the engine's hierarchy: type -> direct subtypes.
-fn subtypes(e: &Engine<'_>, extra: &[(NodeIdx, NodeIdx)]) -> FxHashMap<NodeIdx, Vec<NodeIdx>> {
-    let mut subs: FxHashMap<NodeIdx, Vec<NodeIdx>> = FxHashMap::default();
-    for (sub, sups) in &e.supers {
-        for s in sups {
-            subs.entry(*s).or_default().push(*sub);
-        }
-    }
-    for (sub, sup) in extra {
-        subs.entry(*sup).or_default().push(*sub);
-    }
-    for v in subs.values_mut() {
-        v.sort();
-        v.dedup();
-    }
-    subs
+/// Languages whose supertype methods dispatch to a subtype's same-named methods.
+fn overrides_lang(l: Lang) -> bool {
+    matches!(l.family(), LangFamily::Jvm | LangFamily::Js) || matches!(l, Lang::Go | Lang::Rust)
 }
 
-fn descendants(subs: &FxHashMap<NodeIdx, Vec<NodeIdx>>, t: NodeIdx) -> Vec<NodeIdx> {
-    let mut out = Vec::new();
-    let mut seen: FxHashSet<NodeIdx> = FxHashSet::default();
-    seen.insert(t);
-    let mut frontier = vec![t];
-    for _ in 0..10 {
-        let mut next = Vec::new();
-        for x in frontier {
-            for s in subs.get(&x).into_iter().flatten() {
-                if seen.insert(*s) {
-                    out.push(*s);
-                    next.push(*s);
-                }
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
-    out
-}
-
-/// Go has no `implements`: a struct implements an interface when it has every method (by name).
-fn go_implements(e: &Engine<'_>, out: &mut Out) -> Vec<(NodeIdx, NodeIdx)> {
+/// The methods of `t` called `name`: its body's, or for Go / Rust the receiver and impl
+/// methods declared outside it.
+fn own_methods(e: &Engine<'_>, t: NodeIdx, name: &str) -> Vec<NodeIdx> {
     let view = e.view;
-    // method name -> types that declare it (receiver methods are named `Type::method`)
-    let mut by_method: FxHashMap<&str, Vec<NodeIdx>> = FxHashMap::default();
-    let mut interfaces: Vec<(NodeIdx, Vec<&str>)> = Vec::new();
-    for f in view.files() {
-        if view.file(f).lang() != Lang::Go {
-            continue;
-        }
-        for n in view.nodes_in_file(f) {
-            let n = NodeIdx(n);
-            let node = view.node(n);
-            match node.kind() {
-                NodeKind::Interface => {
-                    let mut names: Vec<&str> = view
-                        .out_edges(n)
-                        .filter(|ed| ed.kind == EdgeKind::Contains)
-                        .map(|ed| view.node(ed.dst))
-                        .filter(|c| c.kind() == NodeKind::Method)
-                        .map(|c| c.name())
-                        .collect();
-                    names.sort_unstable();
-                    names.dedup();
-                    if !names.is_empty() {
-                        interfaces.push((n, names));
-                    }
-                }
-                NodeKind::Method | NodeKind::Function => {
-                    if let Some((tq, name)) = node.qname().rsplit_once("::") {
-                        if name == node.name() {
-                            for t in view.by_qname(tq) {
-                                if matches!(view.node(t).kind(), NodeKind::Struct | NodeKind::Class) && view.hot(t).file != FileId::NONE {
-                                    by_method.entry(view.name_str(view.hot(n).name)).or_default().push(t);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+    let mut v: Vec<NodeIdx> = view
+        .out_edges(t)
+        .filter(|ed| ed.kind == EdgeKind::Contains)
+        .map(|ed| ed.dst)
+        .filter(|m| view.node(*m).kind() == NodeKind::Method && view.node(*m).name() == name)
+        .collect();
+    if v.is_empty() && matches!(view.file(view.node(t).file()).lang(), Lang::Go | Lang::Rust) {
+        v.extend(e.direct_member(t, name).filter(|m| view.node(*m).kind().is_callable()));
     }
-    let mut pairs: Vec<(NodeIdx, NodeIdx)> = Vec::new();
-    for (iface, names) in &interfaces {
-        if names.iter().all(|n| GENERIC_GO_METHODS.contains(n)) {
-            continue;
-        }
-        // intersect candidate sets, rarest method first
-        let mut order: Vec<&str> = names.to_vec();
-        order.sort_by_key(|n| by_method.get(*n).map_or(0, |v| v.len()));
-        let Some(first) = by_method.get(order[0]) else { continue };
-        let mut cands: Vec<NodeIdx> = first.clone();
-        cands.sort();
-        cands.dedup();
-        for n in &order[1..] {
-            let Some(set) = by_method.get(*n) else {
-                cands.clear();
-                break;
-            };
-            let set: FxHashSet<NodeIdx> = set.iter().copied().collect();
-            cands.retain(|c| set.contains(c));
-            if cands.is_empty() {
-                break;
-            }
-        }
-        if cands.is_empty() || cands.len() > MAX_GO_IMPLEMENTERS {
-            continue;
-        }
-        for c in cands {
-            if c != *iface {
-                out.push(EdgeKind::Implements, c, *iface, view.hot(c).start_line, "go-implements", None, None, 10);
-                pairs.push((c, *iface));
-            }
-        }
-    }
-    pairs
+    v
 }
 
-/// A call to an interface / abstract method lands on its implementations: the hop
-/// `Interface.m -> Impl.m` lets a flow continue through dynamic dispatch.
-fn interface_impl(e: &Engine<'_>, subs: &FxHashMap<NodeIdx, Vec<NodeIdx>>, out: &mut Out) {
+/// Of an overloaded name, the methods that can override `base`: Java, Kotlin and TypeScript
+/// make an override repeat the parameters it overrides. Unreadable signatures stay in.
+fn overrides_of(e: &Engine<'_>, base: NodeIdx, impls: &[NodeIdx]) -> Vec<NodeIdx> {
     let view = e.view;
-    let mut types: Vec<NodeIdx> = subs.keys().copied().collect();
+    let params = |n: NodeIdx| -> Option<Vec<String>> {
+        let lang = view.file(view.node(n).file()).lang();
+        crate::overload::parse_params(lang, view.node(n).signature()?).map(|p| p.items.iter().map(|i| i.ty.clone()).collect())
+    };
+    let Some(want) = params(base) else { return impls.to_vec() };
+    let (mut same, mut maybe) = (Vec::new(), Vec::new());
+    for &m in impls {
+        match params(m) {
+            None => maybe.push(m),
+            Some(have) if have.len() != want.len() => {}
+            Some(have) => {
+                if have == want {
+                    same.push(m);
+                } else if have.iter().zip(&want).all(|(a, b)| a == b || a.is_empty() || b.is_empty() || a.len() == 1 || b.len() == 1) {
+                    maybe.push(m); // a type parameter on either side
+                }
+            }
+        }
+    }
+    if same.is_empty() {
+        maybe
+    } else {
+        same
+    }
+}
+
+/// A call through a supertype's method lands on what a subtype declares for it (upstream
+/// `interfaceOverrideEdges`): per concrete type and each direct supertype, every base method
+/// links to the type's own methods of that name, overloads paired by their parameters,
+/// a JS static only to a static. Capped per (type, supertype) pair. Go's structural and
+/// promoted method dispatch is handled together by `go_implements`.
+fn interface_impl(e: &Engine<'_>, out: &mut Out) {
+    let view = e.view;
+    let mut sups: FxHashMap<NodeIdx, Vec<NodeIdx>> = FxHashMap::default();
+    for (sub, list) in &e.supers {
+        sups.entry(*sub).or_default().extend(list.iter().copied());
+    }
+    let mut types: Vec<NodeIdx> = sups.keys().copied().collect();
     types.sort();
-    for t in types {
-        let tn = view.node(t);
-        let abstract_type = matches!(tn.kind(), NodeKind::Interface | NodeKind::Trait | NodeKind::Protocol) || tn.is_abstract() == Some(true);
-        let descs = descendants(subs, t);
-        if descs.is_empty() {
+    for cls in types {
+        let cn = view.node(cls);
+        let lang = view.file(cn.file()).lang();
+        // Go structural matching and dispatch share the same promoted method set.
+        if lang == Lang::Go {
             continue;
         }
-        let mut members: Vec<NodeIdx> =
-            view.out_edges(t).filter(|ed| ed.kind == EdgeKind::Contains).map(|ed| ed.dst).filter(|m| view.node(*m).kind() == NodeKind::Method).collect();
-        // Go / Rust declare trait-like methods through qualified names as well
-        members.sort();
-        for m in members {
-            let mn = view.node(m);
-            if !abstract_type && mn.is_abstract() != Some(true) {
+        let concrete = matches!(cn.kind(), NodeKind::Class | NodeKind::Struct | NodeKind::Union)
+            || (lang == Lang::Go && cn.kind() == NodeKind::TypeAlias)
+            || (lang == Lang::Rust && cn.kind() == NodeKind::Enum);
+        if !concrete || !overrides_lang(lang) {
+            continue;
+        }
+        let mut bases = sups[&cls].clone();
+        bases.sort();
+        bases.dedup();
+        for base in bases {
+            let bn = view.node(base);
+            let blang = view.file(bn.file()).lang();
+            if base == cls || !overrides_lang(blang) || (lang == Lang::Go && bn.kind() != NodeKind::Interface) {
                 continue;
             }
-            let mut impls: Vec<NodeIdx> = Vec::new();
-            for d in &descs {
-                if let Some(im) = e.direct_member(*d, mn.name()) {
-                    if im != m && view.node(im).kind().is_callable() && !impls.contains(&im) {
-                        impls.push(im);
-                    }
+            let base_methods: Vec<NodeIdx> =
+                view.out_edges(base).filter(|ed| ed.kind == EdgeKind::Contains).map(|ed| ed.dst).filter(|m| view.node(*m).kind() == NodeKind::Method).collect();
+            let mut added = 0;
+            for &bm in &base_methods {
+                if added >= MAX_IMPLS_PER_PAIR {
+                    break;
                 }
-            }
-            if impls.is_empty() || impls.len() > MAX_IMPLS {
-                continue;
-            }
-            for im in impls {
-                out.push(EdgeKind::Calls, m, im, mn.start_line(), "interface-impl", None, None, 20);
+                let bmn = view.node(bm);
+                let mut impls = own_methods(e, cls, bmn.name());
+                if lang == Lang::Go && !bmn.name().starts_with(|c: char| c.is_uppercase()) {
+                    // an unexported method matches only in the interface's package
+                    let dir = crate::project::parent_dir(view.file(bmn.file()).path());
+                    impls.retain(|m| crate::project::parent_dir(view.file(view.node(*m).file()).path()) == dir);
+                }
+                if impls.is_empty() {
+                    continue;
+                }
+                let overloaded = impls.len() > 1 || base_methods.iter().filter(|o| view.node(**o).name() == bmn.name()).count() > 1;
+                let chosen = if overloaded { overrides_of(e, bm, &impls) } else { impls };
+                for m in chosen {
+                    if added >= MAX_IMPLS_PER_PAIR || m == bm {
+                        continue;
+                    }
+                    let mn = view.node(m);
+                    if lang.family() == LangFamily::Js && (bmn.is_static() == Some(true)) != (mn.is_static() == Some(true)) {
+                        continue;
+                    }
+                    let at = format!("{}:{}", view.file(mn.file()).path(), mn.start_line());
+                    out.push(EdgeKind::Calls, bm, m, bmn.start_line(), "interface-impl", Some(at), Some(("via", mn.name())), order_of("interface-impl"));
+                    added += 1;
+                }
             }
         }
     }
@@ -329,7 +325,7 @@ fn event_emitter<'e, 'v>(e: &'e Engine<'v>, out: &mut Out, wcx: &mut WorkerCx<'e
         }
         for em in &k.emitters {
             for (t, line, f) in &targets {
-                out.push(EdgeKind::Calls, *em, *t, 0, "event-emitter", Some(path_line(view, *f, *line)), Some(("event", event)), 30);
+                out.push(EdgeKind::Calls, *em, *t, 0, "event-emitter", Some(path_line(view, *f, *line)), Some(("event", event)), order_of("event-emitter"));
             }
         }
         out
@@ -373,7 +369,7 @@ fn react_render(e: &Engine<'_>, out: &mut Out, selected: Option<&FxHashSet<u32>>
             }
             if let Some(render) = e.direct_member(class, "render") {
                 if render != m {
-                    out.push(EdgeKind::Calls, m, render, 0, "react-render", Some(path_line(view, f, s.line)), None, 40);
+                    out.push(EdgeKind::Calls, m, render, 0, "react-render", Some(path_line(view, f, s.line)), None, order_of("react-render"));
                 }
             }
         }
@@ -397,7 +393,7 @@ fn jsx_render<'e, 'v>(e: &'e Engine<'v>, out: &mut Out, wcx: &mut WorkerCx<'e, '
             if let NameRes::Found(t, ..) = cx.resolve_name(wcx, tag, Accept::Callable, 0, u32::MAX, None, false) {
                 let k = view.node(t).kind();
                 if matches!(k, NodeKind::Function | NodeKind::Class | NodeKind::Component | NodeKind::Variable | NodeKind::Constant) && t != s.node {
-                    out.push(EdgeKind::Calls, s.node, t, 0, "jsx-render", Some(path_line(view, f, s.line)), Some(("via", tag)), 50);
+                    out.push(EdgeKind::Calls, s.node, t, 0, "jsx-render", Some(path_line(view, f, s.line)), Some(("via", tag)), order_of("jsx-render"));
                 }
             }
         }
@@ -408,19 +404,128 @@ fn jsx_render<'e, 'v>(e: &'e Engine<'v>, out: &mut Out, wcx: &mut WorkerCx<'e, '
 pub fn run_all(e: &Engine<'_>) -> SynthOutput {
     let mut out = Out { edges: Vec::new(), emeta: Vec::new(), meta_ids: FxHashMap::default() };
     let mut wcx = WorkerCx::new();
-    let go_pairs = go_implements(e, &mut out);
-    let subs = subtypes(e, &go_pairs);
-    interface_impl(e, &subs, &mut out);
+    go::go_implements(e, &mut out);
+    interface_impl(e, &mut out);
     event_emitter(e, &mut out, &mut wcx, None);
     react_render(e, &mut out, None);
     jsx_render(e, &mut out, &mut wcx, None);
+    run_global(e, &mut out, &mut wcx);
     SynthOutput { edges: out.edges, emeta: out.emeta }
+}
+
+/// Passes whose keys span files (routes against navigations, a proxy against the routes it
+/// covers, a channel's two ends): cheap over persisted sites, so an incremental run
+/// recomputes them whole.
+const GLOBAL_PASSES: &[&str] = &[
+    "next-navigation",
+    "react-router-navigation",
+    "tanstack-navigation",
+    "next-link",
+    "react-router-link",
+    "tanstack-link",
+    "next-proxy",
+    "callback",
+    "object-registry",
+    "http-client",
+    "queue-job",
+    "event-bus",
+    "celery-dispatch",
+    "spring-event",
+    "go-func-field",
+    "go-grpc-stub-impl",
+    "gin-middleware-chain",
+    "const-alias",
+    "redux-thunk",
+    "rtk-query",
+    "test-request",
+    "kotlin-expect-actual",
+    "tauri-command",
+    "rn-native-module",
+];
+
+/// Merge order of a synthesis pass (upstream `SYNTH_PASSES`): of two synthesized edges
+/// between the same two symbols the earlier pass's stays. Go's fixed steps and navigation
+/// calls (resolved references upstream) stand outside the merge.
+pub(crate) fn order_of(by: &str) -> u16 {
+    match by {
+        "go-implements" | "go-method-contains" => 10,
+        "callback" => 100,
+        "http-client" | "queue-job" | "event-bus" => 120,
+        "tauri-command" => 125,
+        "test-request" => 130,
+        "event-emitter" => 150,
+        "react-render" => 160,
+        "jsx-render" => 170,
+        "interface-impl" => 260,
+        "kotlin-expect-actual" => 270,
+        "go-grpc-stub-impl" => 280,
+        "rn-native-module" => 320,
+        "gin-middleware-chain" => 340,
+        "redux-thunk" => 350,
+        "const-alias" => 360,
+        "rtk-query" => 400,
+        "object-registry" => 390,
+        "celery-dispatch" => 430,
+        "spring-event" => 440,
+        "go-func-field" => 480,
+        "next-link" => 510,
+        "next-proxy" => 520,
+        "react-router-link" => 530,
+        "tanstack-link" => 540,
+        _ => 600,
+    }
+}
+
+/// Keep the first synthesized edge per (source, target) in merge order.
+fn dedupe_pairs(out: &mut Out) {
+    let in_merge = |o: u16| (100..600).contains(&o);
+    let mut idx: Vec<usize> = (0..out.edges.len()).filter(|i| in_merge(out.edges[*i].order)).collect();
+    idx.sort_by_key(|i| {
+        let e = &out.edges[*i];
+        (e.order, e.src, e.dst, e.line, e.col, out.emeta.get(e.meta as usize).cloned().unwrap_or_default())
+    });
+    let mut seen: FxHashSet<(u32, u32)> = FxHashSet::default();
+    let mut drop = vec![false; out.edges.len()];
+    for i in idx {
+        let e = &out.edges[i];
+        if !seen.insert((e.src, e.dst)) {
+            drop[i] = true;
+        }
+    }
+    let mut k = 0;
+    out.edges.retain(|_| {
+        let keep = !drop[k];
+        k += 1;
+        keep
+    });
+}
+
+fn run_global<'e, 'v>(e: &'e Engine<'v>, out: &mut Out, wcx: &mut WorkerCx<'e, 'v>) {
+    dynamic::callbacks(e, out, wcx);
+    dynamic::cross_tier(e, out, wcx);
+    redux::thunks(e, out, wcx);
+    js_alias::const_aliases(e, out, wcx);
+    dynamic::registries(e, out, wcx);
+    redux::rtk_query(e, out);
+    dynamic::celery(e, out);
+    dynamic::spring_events(e, out);
+    bridges::link(e, out);
+    jvm::test_requests(e, out);
+    jvm::kotlin_expect_actual(e, out);
+    go_fields::func_fields(e, out, wcx);
+    go::grpc_stubs(e, out);
+    gin::middleware_chain(e, out);
+    crate::frameworks::nav::navigation(e, out);
+    crate::frameworks::nav::next_proxy(e, out);
+    dedupe_pairs(out);
 }
 
 /// Reconnect only changed event keys / per-file render sites when the definition and type
 /// tables did not change. Structural changes deliberately use the full pass set.
 pub fn run_incremental(e: &Engine<'_>, previous: &View, changed: &FxHashSet<u32>, remap: &FxHashMap<u32, u32>, structural: bool) -> SynthOutput {
-    if structural {
+    // Go aliases and type parameters change which implementers fit without changing a node
+    let go_types = |view: &View| view.files().filter(|f| changed.contains(&f.0)).any(|f| view.sites_of(f).iter().any(|s| s.pass == sites::PASS_GO_TYPES));
+    if structural || go_types(previous) || go_types(e.view) {
         return run_all(e);
     }
     let mut keys = FxHashSet::default();
@@ -443,7 +548,9 @@ pub fn run_incremental(e: &Engine<'_>, previous: &View, changed: &FxHashSet<u32>
                 let recompute = match by {
                     "event-emitter" => value.get("event").and_then(|v| v.as_str()).is_some_and(|key| keys.contains(key)),
                     "react-render" | "jsx-render" => changed.contains(&f.0),
-                    _ => false,
+                    // registration sites name lines of other files: recomputed whole, as cheap
+                    "interface-impl" | "go-implements" => true,
+                    by => GLOBAL_PASSES.contains(&by),
                 };
                 if recompute {
                     continue;
@@ -470,15 +577,18 @@ pub fn run_incremental(e: &Engine<'_>, previous: &View, changed: &FxHashSet<u32>
                     res: edge.res,
                     ref_idx: NONE,
                     meta: mid,
-                    order: 0,
+                    order: order_of(by),
                 });
             }
         }
     }
     let mut wcx = WorkerCx::new();
+    go::go_implements(e, &mut out);
+    interface_impl(e, &mut out);
     event_emitter(e, &mut out, &mut wcx, Some(&keys));
     react_render(e, &mut out, Some(changed));
     jsx_render(e, &mut out, &mut wcx, Some(changed));
+    run_global(e, &mut out, &mut wcx);
     SynthOutput { edges: out.edges, emeta: out.emeta }
 }
 

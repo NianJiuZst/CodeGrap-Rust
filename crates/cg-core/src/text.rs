@@ -63,3 +63,9 @@ pub fn truncate16(s: &str, max_units: usize) -> &str {
 pub const fn pack_pos(line: u32, col16: u32) -> u64 {
     ((line as u64) << 32) | col16 as u64
 }
+
+/// Inverse of [`pack_pos`]: (line, utf16 column).
+#[inline]
+pub const fn unpack_pos(pos: u64) -> (u32, u32) {
+    ((pos >> 32) as u32, pos as u32)
+}

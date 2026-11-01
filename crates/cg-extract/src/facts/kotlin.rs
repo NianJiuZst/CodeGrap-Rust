@@ -35,6 +35,10 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
         "class_declaration" | "object_declaration" | "companion_object" => class(cx, n, scope),
         "function_declaration" | "secondary_constructor" | "anonymous_function" => function(cx, n, scope),
         "lambda_literal" => lambda(cx, n, scope),
+        "call_expression" => {
+            super::args::kotlin_call(cx, n);
+            walk_children(cx, n, scope);
+        }
         "property_declaration" => {
             property(cx, n, scope);
             walk_children(cx, n, scope);

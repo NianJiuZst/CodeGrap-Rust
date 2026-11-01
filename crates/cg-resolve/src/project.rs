@@ -182,6 +182,12 @@ impl ProjectInfo {
         add(npm("express"), "express");
         add(npm("react") || npm("react-dom"), "react");
         add(npm("next"), "next");
+        add(self.packages.iter().any(|p| p.deps.iter().any(|d| d.starts_with("@nestjs/"))), "nestjs");
+        add(npm("react-router") || npm("react-router-dom") || npm("react-router-native"), "react-router");
+        add(
+            ["@tanstack/react-router", "@tanstack/solid-router", "@tanstack/router", "@tanstack/react-start", "@tanstack/start"].iter().any(|d| npm(d)),
+            "tanstack-router",
+        );
         add(self.py_deps.contains("fastapi"), "fastapi");
         add(self.py_deps.contains("flask"), "flask");
         add(self.py_deps.contains("django"), "django");

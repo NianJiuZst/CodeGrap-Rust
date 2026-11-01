@@ -58,28 +58,30 @@ differs from upstream; see [current limitations](#current-limitations).
 
 ## Measured performance
 
-The **2026-11-01 retest of merged main** measured a **4.95× geometric-mean full-index
-speedup** over upstream CodeGraph across four fixed repositories, with **85.9%–90.0% lower
-peak indexing RSS**. Both sides indexed identical files and source bytes; upstream's native Rust
-extraction kernel was loaded and enabled for the measured languages.
+The **2026-11-01 six-repository retest** of `cgr` **`edb403e`** and upstream
+**`d2e0389`** measured a **4.77× geometric-mean full-index speedup** and
+**78.3%–88.7% lower median peak RSS** on this machine. The corpus adds TypeScript
+Zod and Kotlin/Java OkHttp to the previous four repositories. Both sides indexed the same
+files and bytes, and upstream's native kernel was enabled.
 
 | Repository | Files | Upstream full index | `cgr` full index | Speedup | Peak RSS: upstream → `cgr` |
 |---|---:|---:|---:|---:|---:|
-| Express | 142 | 532.7 ms | 121.9 ms | **4.37×** | 225.7 → 27.9 MiB |
-| Gin | 99 | 636.6 ms | 129.6 ms | **4.91×** | 246.3 → 34.8 MiB |
-| Tokio | 814 | 2,599.3 ms | 504.6 ms | **5.15×** | 736.1 → 73.4 MiB |
-| Django | 2,984 | 10,878.0 ms | 2,002.1 ms | **5.43×** | 1,909.2 → 229.6 MiB |
+| Express | 142 | 536.2 ms | 136.0 ms | **3.94×** | 225.6 → 48.9 MiB |
+| Gin | 99 | 620.8 ms | 130.5 ms | **4.76×** | 246.9 → 37.0 MiB |
+| Tokio | 814 | 2,592.2 ms | 555.3 ms | **4.67×** | 733.6 → 83.3 MiB |
+| Django | 2,984 | 10,597.8 ms | 1,934.0 ms | **5.48×** | 1,896.8 → 237.4 MiB |
+| Zod | 523 | 2,287.0 ms | 474.1 ms | **4.82×** | 627.2 → 93.8 MiB |
+| OkHttp | 690 | 3,136.6 ms | 613.9 ms | **5.11×** | 814.2 → 109.0 MiB |
 
-Measured revisions: `cgr` **`b827b1d`**, upstream **`d2e0389`** (package 1.6.2).
-Apple M5, 10 cores, 16 GiB RAM, macOS 26.5.2, AC power, Rust 1.94.1 release and Node 24.18.0.
-This is the **restricted tier**: two parse/resolve workers per implementation and `CGR_MEMORY_MB=2048`.
-Full-index medians use three complete CLI rebuilds after one warmup, with at least 30 seconds
-between commands and warm OS file caches. Workers were configured, not pinned to two physical cores.
-The unmodified benchmark wrapper enforced memory, disk, swap and process-tree RSS guards.
+Three timed CLI rebuilds follow one warmup; the restricted tier uses two workers and
+a 2 GiB `cgr` memory budget. Commands run on AC power with at least 30 seconds between
+runs and warm OS caches. Full-graph precision and recall against upstream do not both meet
+the 97% / 95% gate in any of the six repositories; graph outputs differ and upstream is not
+semantic ground truth. See the [six-repository report](docs/BENCHMARKS-SIX-REPO-2026-11-01.md)
+and [structured evidence](docs/benchmarks/2026-11-01-six-repo-retest.json).
 
-Full timings, output sizes and measurement conditions are in the
-[benchmark report](docs/BENCHMARKS.md#full-indexing), with
-[machine-readable samples](docs/benchmarks/2026-11-01-main-retest.json).
+The sections below retain the earlier **`b827b1d`** sync and query measurements. The new
+retest completed only Express sync and did not complete query latency tests.
 
 ### Incremental CLI synchronization
 
@@ -117,7 +119,7 @@ synthesis, compressed BM25 postings, adaptive radix sorting and bounded source w
 bounded admission, cooperative cancellation and project/watcher cleanup.
 
 These changes use **snapshot format 2**; run `cgr index /path/to/project` to rebuild an old index.
-The retest above measures the merged implementation. The earlier **6.40×** result used different
+The new full-index retest is revision-pinned above. The earlier **6.40×** result used different
 worker settings and an older upstream revision; it is [archived separately](docs/BENCHMARKS-HISTORICAL.md),
 and is not a before/after estimate for this optimization. Implementation boundaries are recorded
 in the bilingual [engineering record](docs/PERFORMANCE-IMPLEMENTATION.md).
@@ -238,7 +240,8 @@ and project configuration; this is a static code graph rather than a full compil
 
 ### Framework and dynamic-dispatch rules
 
-Route hooks are implemented for **Express, Flask, FastAPI, Django, Gin, Spring, Axum and Next.js**.
+Route hooks are implemented for **Express, Flask, FastAPI, Django, Gin, Spring, Axum, Next.js,
+NestJS, React Router and TanStack Router**.
 Framework detection uses project manifests, so route coverage can differ when dependencies are
 absent or when indexing a framework's own repository. The benchmark documents observed gaps.
 
@@ -246,6 +249,44 @@ Supported synthesis passes include interface/implementation dispatch, Go structu
 event-emitter handlers, React re-render links and JSX parent/child links. These are bounded
 heuristics with recorded provenance; they cover specific patterns rather than arbitrary
 runtime behavior.
+
+For NestJS, literal `RouterModule.register` paths and a literal `setGlobalPrefix` on a
+recognizable `NestFactory.create` application are composed for HTTP-client matching, including
+statically readable exclusions. Route node names remain controller-local. For React Router,
+exported route-object arrays can be consumed across imports and re-exports, including literal
+parent routes and `children` arrays. Candidate route nodes are retained for exported arrays;
+only arrays reached from a recognized router call participate in navigation matching. Dynamic
+route configuration remains outside this cross-file rule. Go interface dispatch includes unambiguous promoted methods;
+method-set inference remains a bounded static approximation.
+
+Engine rule version 7 adds these resolution rules and synthesis passes, all bounded static rules
+that link nothing when a name is ambiguous:
+
+- **Go**: embedded standard-library types take part in interface satisfaction (the `io.Reader`,
+  `*os.File`, `error`, ... method table is ported from upstream) and other outside embeds are
+  opaque; a project embedding the kernel writes without its package binds through the written
+  qualifier; func-field dispatch (`d.refreshf()` reaches the functions put in the field, through one
+  field-to-field copy); protoc `Unimplemented*Server` stubs reach hand-written servers; Gin's
+  `Context.Next` reaches registered middleware.
+- **TS/JS**: calls through `const local = other` and `export const alias = realImpl` reach the
+  real function, as do object-literal members (`api.run()`); conditional / `??` / `||` arms of
+  module-level values (`const-alias`); ES5 constructors with `prototype` methods and
+  `util.inherits` / `Object.create` inheritance; ambient modules declared with `declare module 'x'`
+  in `.d.ts` files; Redux thunk `dispatch` chains and RTK Query generated hooks.
+- **Rust**: generic parameters resolve through their trait bounds (an unbounded parameter no longer
+  matches a project type of the same name); `impl Deref` targets, `type X = Y` aliases and
+  `Mutex` / `RwLock` lock guards are looked through; `self.field` call chains are evaluated.
+- **Python**: factories returning different classes in different branches are typed by the nearest
+  common base; `self.x = self.make()` types a field across methods; pytest fixture parameters (same
+  file or a `conftest.py` above) take the fixture's return type.
+- **Cross-language / JVM**: Spring test requests (MockMvc, WebTestClient, TestRestTemplate,
+  RestAssured) reach routes; Kotlin Multiplatform `expect` reaches each platform's `actual`; a Tauri
+  frontend's `invoke('cmd')` reaches the registered `#[tauri::command]`; React Native
+  `NativeModules.X.m()` reaches the Java / Kotlin module's `@ReactMethod`.
+
+Not covered: MyBatis XML, Angular templates, Vue / Svelte ecosystem stores and routers, React Native
+events and the Fabric / Expo native side, Tauri events, GoFrame, and Python parameter-type flow
+(upstream implements it for Ruby only).
 
 C/C++, C#, PHP, Ruby and Swift use the upstream extraction walkers with this project's own
 resolution rules (includes, namespaces, `require`, SwiftPM modules, implicit `this` members);

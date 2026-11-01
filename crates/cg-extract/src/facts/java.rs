@@ -26,6 +26,10 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
         "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration" | "annotation_type_declaration" => class(cx, n, scope),
         "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => function(cx, n, scope),
         "lambda_expression" => lambda(cx, n, scope),
+        "method_invocation" => {
+            super::args::java_call(cx, n);
+            walk_children(cx, n, scope);
+        }
         "local_variable_declaration" => {
             declare(cx, n, scope, BindKind::Local);
             walk_children(cx, n, scope);
@@ -69,9 +73,11 @@ fn java_type_name(cx: &Cx, n: Node) -> String {
     match n.kind() {
         "type_identifier" if cx.text(n) == "var" => String::new(),
         "type_identifier" | "scoped_type_identifier" => cx.text(n).to_owned(),
+        // primitives type their arguments for overload selection (`args`); they name no member
+        "integral_type" | "floating_point_type" | "boolean_type" => cx.text(n).to_owned(),
         "generic_type" => n.named_child(0).map(|c| java_type_name(cx, c)).unwrap_or_default(),
         "annotated_type" => kids(n).find(|c| !matches!(c.kind(), "annotation" | "marker_annotation")).map(|c| java_type_name(cx, c)).unwrap_or_default(),
-        _ => String::new(), // primitives, arrays, `var`, void
+        _ => String::new(), // arrays, `var`, void
     }
 }
 

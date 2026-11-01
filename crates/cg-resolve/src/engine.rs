@@ -47,6 +47,17 @@ pub struct Engine<'v> {
     /// JavaScript functions with syntax evidence that they implement an object member.
     pub member_functions: FxHashMap<&'v str, SmallVec<[NodeIdx; 2]>>,
     pub return_types: FxHashMap<NodeIdx, &'v cg_store::BindingRec>,
+    /// ES5 constructor functions: the functions given to each one's prototype
+    /// (`X.prototype.m = function m() {}`), by member name.
+    pub proto: FxHashMap<NodeIdx, SmallVec<[(&'v str, NodeIdx); 4]>>,
+    /// A prototype member's constructor (what `this` is in it).
+    pub proto_owner: FxHashMap<NodeIdx, NodeIdx>,
+    /// Rust `impl Deref` facts by the name of the type they are written for.
+    pub derefs: FxHashMap<&'v str, SmallVec<[(FileId, &'v cg_store::BindingRec); 1]>>,
+    /// pytest fixtures by name.
+    pub fixtures: FxHashMap<&'v str, SmallVec<[(FileId, &'v cg_store::BindingRec); 1]>>,
+    /// Rust `type X = Y;` targets by the alias's node.
+    pub type_aliases: FxHashMap<NodeIdx, &'v cg_store::BindingRec>,
     pub django_model: Option<NodeIdx>,
     pub n_files: usize,
 }
@@ -114,10 +125,39 @@ impl<'v> Engine<'v> {
                 .filter(|b| b.kind == BindKind::ReturnType as u8 && b.node.is_some())
                 .map(|b| (b.node, b))
                 .collect(),
+            proto: FxHashMap::default(),
+            proto_owner: FxHashMap::default(),
+            derefs: {
+                let mut m: FxHashMap<&'v str, SmallVec<[(FileId, &'v cg_store::BindingRec); 1]>> = FxHashMap::default();
+                for &f in files.iter().filter(|f| view.file(**f).lang() == Lang::Rust) {
+                    for b in view.bindings_of(f).iter().filter(|b| b.kind == BindKind::Deref as u8) {
+                        let name = view.text_str(b.name);
+                        m.entry(name.rsplit("::").next().unwrap_or(name)).or_default().push((f, b));
+                    }
+                }
+                m
+            },
+            fixtures: {
+                let mut m: FxHashMap<&'v str, SmallVec<[(FileId, &'v cg_store::BindingRec); 1]>> = FxHashMap::default();
+                for &f in files.iter().filter(|f| view.file(**f).lang() == Lang::Python) {
+                    for b in view.bindings_of(f).iter().filter(|b| b.kind == BindKind::Fixture as u8) {
+                        m.entry(view.text_str(b.name)).or_default().push((f, b));
+                    }
+                }
+                m
+            },
+            type_aliases: files
+                .iter()
+                .filter(|f| view.file(**f).lang() == Lang::Rust)
+                .flat_map(|&f| view.bindings_of(f))
+                .filter(|b| b.kind == BindKind::TypeAlias as u8 && b.node.is_some())
+                .map(|b| (b.node, b))
+                .collect(),
             django_model: None,
             n_files,
         };
         e.build_exports(&files);
+        e.build_prototypes(&files);
         if project.py_deps.contains("django") {
             if let Some(f) = files.iter().copied().find(|f| view.file(*f).lang() == Lang::Python) {
                 if let ImportTarget::File(base) = e.modules.resolve_import(Lang::Python, "django.db.models.base", f) {
@@ -131,7 +171,7 @@ impl<'v> Engine<'v> {
         e
     }
 
-    fn top_level_nodes(&self, f: FileId) -> impl Iterator<Item = NodeIdx> + '_ {
+    fn top_level_nodes(&self, f: FileId) -> impl Iterator<Item = NodeIdx> + use<'_, 'v> {
         let range = self.view.nodes_in_file(f);
         range.map(NodeIdx).filter(move |n| {
             let h = self.view.hot(*n);
@@ -171,6 +211,9 @@ impl<'v> Engine<'v> {
                 // Explicit export facts (JS re-exports, `pub use`) and default exports
                 for ex in view.exports_of(f) {
                     let name = view.text_str(ex.name);
+                    if name == cg_extract::facts::js::AMBIENT_MODULE {
+                        continue; // a `declare module` block (see `Modules::ambient`)
+                    }
                     let spec = view.text_str(ex.from_spec);
                     if name == COMMONJS_MODULE && spec.is_empty() && view.text_str(ex.from_name) == "*" {
                         map.insert(name, ExportEntry::Module(f));
@@ -267,6 +310,37 @@ impl<'v> Engine<'v> {
         }
     }
 
+    /// Prototype members by their ES5 constructor, the function of that name at the top of the
+    /// member's file.
+    fn build_prototypes(&mut self, files: &[FileId]) {
+        let view = self.view;
+        for &f in files {
+            if view.file(f).lang().family() != LangFamily::Js {
+                continue;
+            }
+            for b in view.bindings_of(f) {
+                if b.kind != BindKind::MemberFn as u8 || b.node.0 == cg_core::NONE || b.decl_type.0 == cg_core::NONE {
+                    continue;
+                }
+                let owner = view.text_str(b.decl_type);
+                if owner.is_empty() {
+                    continue;
+                }
+                let ctor = self.top_level_nodes(f).find(|n| view.node(*n).name() == owner && view.node(*n).kind() == NodeKind::Function).or_else(|| {
+                    self.top_level_nodes(f).find(|n| view.node(*n).name() == owner && matches!(view.node(*n).kind(), NodeKind::Variable | NodeKind::Constant))
+                });
+                let Some(ctor) = ctor.filter(|c| *c != b.node) else { continue };
+                self.proto.entry(ctor).or_default().push((view.text_str(b.name), b.node));
+                self.proto_owner.insert(b.node, ctor);
+            }
+        }
+    }
+
+    /// A function given to the prototype of ES5 constructor `t` under `name`.
+    pub fn proto_member(&self, t: NodeIdx, name: &str) -> Option<NodeIdx> {
+        self.proto.get(&t)?.iter().find(|(n, _)| *n == name).map(|(_, m)| *m)
+    }
+
     fn build_pkg_defs(&mut self, files: &[FileId]) {
         let view = self.view;
         let mut defs: Vec<FxHashMap<&'v str, SmallVec<[NodeIdx; 2]>>> = (0..self.modules.pkgs.len()).map(|_| FxHashMap::default()).collect();
@@ -276,10 +350,21 @@ impl<'v> Engine<'v> {
                 continue;
             }
             let namespaced = matches!(view.file(f).lang().family(), LangFamily::CSharp | LangFamily::Php);
+            let jvm = view.file(f).lang().family() == LangFamily::Jvm;
             for n in self.top_level_nodes(f) {
                 let node = view.node(n);
                 // Go methods are not package-level names; Java/Kotlin nest members under classes
                 if node.kind() == NodeKind::Method {
+                    continue;
+                }
+                // a Java / Kotlin file's declarations sit inside its `package` namespace node
+                if jvm && node.kind() == NodeKind::Namespace {
+                    for e in view.out_edges(n).filter(|e| e.kind == EdgeKind::Contains) {
+                        let child = view.node(e.dst);
+                        if child.kind().is_definition() && child.kind() != NodeKind::Method {
+                            defs[p.0 as usize].entry(child.name()).or_default().push(e.dst);
+                        }
+                    }
                     continue;
                 }
                 defs[p.0 as usize].entry(node.name()).or_default().push(n);
@@ -341,7 +426,7 @@ impl<'v> Engine<'v> {
 
     /// Module file a re-export (`export ... from 'x'`) points to, or NONE.
     pub fn export_target(&self, f: FileId, ex: &cg_store::ExportRec) -> u32 {
-        if ex.from_spec.0 == NONE {
+        if ex.from_spec.0 == NONE || self.view.text_str(ex.name) == cg_extract::facts::js::AMBIENT_MODULE {
             return NONE;
         }
         let spec = self.view.text_str(ex.from_spec);
@@ -599,15 +684,36 @@ impl<'v> Engine<'v> {
 
     /// Member lookup through the hierarchy.
     pub fn find_member(&self, t: NodeIdx, name: &str) -> Option<NodeIdx> {
-        if let Some(m) = self.direct_member(t, name) {
+        if let Some(m) = self.direct_member(t, name).or_else(|| self.proto_member(t, name)) {
             return Some(m);
         }
         for a in self.ancestors(t) {
-            if let Some(m) = self.direct_member(a, name) {
+            if let Some(m) = self.direct_member(a, name).or_else(|| self.proto_member(a, name)) {
                 return Some(m);
             }
         }
         None
+    }
+
+    /// Every callable member called `name` declared in the body of `t` or of one of its
+    /// ancestors, nearest type first and in declaration order: the overload set a call picks
+    /// from. Members declared outside a body (Go receivers, Rust impls) have no overloads.
+    pub fn member_overloads(&self, t: NodeIdx, name: &str) -> SmallVec<[NodeIdx; 4]> {
+        let mut out = SmallVec::new();
+        for ty in std::iter::once(t).chain(self.ancestors(t)) {
+            for e in self.view.out_edges(ty) {
+                if e.kind == EdgeKind::Contains {
+                    let c = self.view.node(e.dst);
+                    if c.name() == name && c.kind().is_callable() && !out.contains(&e.dst) {
+                        out.push(e.dst);
+                    }
+                }
+            }
+            if out.len() > 32 {
+                break;
+            }
+        }
+        out
     }
 
     /// Go: promoted members through embedded structs are covered by `ancestors`

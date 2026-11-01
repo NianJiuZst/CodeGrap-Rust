@@ -9,8 +9,14 @@ pub struct Cx<'a> {
     pub rows: FileRows<'a>,
     pub facts: Facts,
     pub parse_timeout: std::time::Duration,
+    /// Rust: the type parameters in scope, innermost last: (name, bounds written as
+    /// `impl A + B`, or `_` for none).
+    pub generics: Vec<Vec<(String, String)>>,
     line_starts: Vec<u32>,
     row_by_start: Option<rustc_hash::FxHashMap<u64, u32>>,
+    /// Last (row, byte, UTF-16 column) computed: positions are asked in source order, and on
+    /// a minified one-line file counting each column from the line start is quadratic.
+    last_pos: std::cell::Cell<(usize, usize, u32)>,
 }
 
 impl<'a> Cx<'a> {
@@ -18,7 +24,16 @@ impl<'a> Cx<'a> {
         let line_starts = text::line_starts(src);
         let end_line = line_starts.len() as u32;
         let facts = Facts::new(pack_pos(end_line + 1, 0));
-        Cx { src, rows, facts, parse_timeout: std::time::Duration::from_secs(5), line_starts, row_by_start: None }
+        Cx {
+            src,
+            rows,
+            facts,
+            parse_timeout: std::time::Duration::from_secs(5),
+            generics: Vec::new(),
+            line_starts,
+            row_by_start: None,
+            last_pos: std::cell::Cell::new((usize::MAX, 0, 0)),
+        }
     }
 
     /// Kernel node row whose span starts exactly at `pos` (packed line / UTF-16 column), skipping
@@ -51,9 +66,17 @@ impl<'a> Cx<'a> {
     /// Packed (1-based line, UTF-16 column) of a byte offset.
     pub fn pos_at(&self, byte: usize, row: usize) -> u64 {
         let ls = self.line_starts[row.min(self.line_starts.len() - 1)] as usize;
+        let (last_row, last_byte, last_col) = self.last_pos.get();
+        if last_row == row && last_byte <= byte && byte - last_byte < byte - ls && self.src.is_char_boundary(last_byte) && self.src.is_char_boundary(byte) {
+            let col = last_col + self.src[last_byte..byte].chars().map(|c| c.len_utf16() as u32).sum::<u32>();
+            self.last_pos.set((row, byte, col));
+            return pack_pos(row as u32 + 1, col);
+        }
         let le = self.line_starts.get(row + 1).map(|v| *v as usize).unwrap_or(self.src.len());
         let line = &self.src[ls..le];
-        pack_pos(row as u32 + 1, col16(line, byte - ls))
+        let col = col16(line, byte - ls);
+        self.last_pos.set((row, byte, col));
+        pack_pos(row as u32 + 1, col)
     }
 
     pub fn start(&self, n: Node) -> u64 {
@@ -94,13 +117,11 @@ impl<'a> Cx<'a> {
     pub fn lookup_binding(&self, mut scope: u32, name: &str) -> Option<(String, String)> {
         loop {
             if self.facts.scopes[scope as usize].kind != ScopeKind::Class {
-                if let Some(b) = self
-                    .facts
-                    .bindings
-                    .iter()
-                    .rev()
-                    .find(|b| b.scope == scope && b.name == name && !matches!(b.kind, BindKind::MemberFn | BindKind::ReturnType))
-                {
+                if let Some(b) = self.facts.bindings.iter().rev().find(|b| {
+                    b.scope == scope
+                        && b.name == name
+                        && !matches!(b.kind, BindKind::MemberFn | BindKind::ReturnType | BindKind::Deref | BindKind::Fixture | BindKind::TypeAlias)
+                }) {
                     return Some((b.decl_type.clone(), b.init_ctor.clone()));
                 }
             }

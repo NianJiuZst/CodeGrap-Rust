@@ -1,5 +1,9 @@
 # Main performance and upstream graph oracle retest
 
+A newer [six-repository retest](BENCHMARKS-SIX-REPO-2026-11-01.md) measures
+`edb403e` and adds Zod and OkHttp. This page retains the older `b827b1d` results,
+including sync and query measurements not completed in the newer retest.
+
 This report measures merged `main` on **2026-11-01**. It replaces the headline measurements
 from the [historical four-worker comparison](BENCHMARKS-HISTORICAL.md). Performance and graph
 agreement are separate results: a faster engine does not by itself establish equivalent graphs.

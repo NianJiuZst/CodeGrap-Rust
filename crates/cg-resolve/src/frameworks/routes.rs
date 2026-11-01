@@ -19,6 +19,9 @@ pub enum Framework {
     Spring,
     Axum,
     Next,
+    Nest,
+    ReactRouter,
+    TanStack,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -30,10 +33,23 @@ pub struct Handler {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Route {
+    /// HTTP method, transport verb (`EVENT`, `WS`), or empty for a page named by its path.
     pub method: String,
     pub path: String,
     pub line: u32,
     pub handlers: Vec<Handler>,
+    /// How the route reaches its handlers: a function value (`references`), or the page
+    /// component it renders (`calls`).
+    pub ref_kind: RefKind,
+    /// The router that declared a page (`next`, `react-router`, `tanstack-router`), stored as
+    /// the node's signature so the navigation pass finds its own routes.
+    pub router: Option<&'static str>,
+}
+
+impl Default for Route {
+    fn default() -> Self {
+        Route { method: String::new(), path: String::new(), line: 0, handlers: Vec::new(), ref_kind: RefKind::FunctionRef, router: None }
+    }
 }
 
 struct Lines {
@@ -68,6 +84,9 @@ macro_rules! re {
     };
 }
 
+re!(express_chain_re, r#"\b([A-Za-z_$][\w$]*)\s*\.\s*route\s*\(\s*(?:['"`])(/[^'"`\n]*)['"`]\s*\)"#);
+re!(express_link_re, r"^\s*\.\s*(get|post|put|patch|delete|all)\s*\(");
+re!(express_mount_re, r#"\b[A-Za-z_$][\w$]*\s*\.\s*use\s*\(\s*(['"`])(/[^'"`\n]*)['"`]\s*,"#);
 re!(express_re, r#"(?m)\b([A-Za-z_$][\w$]*)\s*\.\s*(get|post|put|delete|patch|options|head|all|use)\s*\(\s*(['"`])(/[^'"`\n]*)['"`]\s*,"#);
 re!(
     py_decorator_re,
@@ -89,8 +108,6 @@ re!(spring_class_re, r"(?m)^[ \t]*(?:public[ \t]+|open[ \t]+|abstract[ \t]+)*(?:
 re!(axum_route_re, r#"\.route\(\s*"([^"\n]*)"\s*,\s*"#);
 re!(axum_method_re, r"(get|post|put|delete|patch|head|options|any)\s*\(\s*([\w:]+)\s*\)");
 re!(ident_path_re, r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$");
-re!(next_default_re, r"(?m)export\s+default\s+(?:async\s+)?(?:function\s+)?([A-Za-z_$][\w$]*)");
-re!(next_method_re, r"(?m)export\s+(?:async\s+)?(?:function|const)\s+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b");
 
 /// Argument list of the call whose `(` is at/after `from`: top-level arguments as
 /// `(offset, text)`, plus the byte offset after the closing parenthesis. Strings and comments
@@ -168,17 +185,19 @@ fn handlers_in(src: &str, lines: &Lines, args: &[(usize, &str)]) -> Vec<Handler>
     out
 }
 
+fn looks_like_router(recv: &str) -> bool {
+    matches!(recv, "app" | "router" | "server" | "api" | "route" | "routes" | "r")
+        || recv.ends_with("Router")
+        || recv.ends_with("App")
+        || recv.ends_with("Api")
+        || recv.ends_with("Routes")
+}
+
 pub fn scan_express(src: &str) -> Vec<Route> {
     let lines = Lines::new(src);
     let mut out = Vec::new();
     for m in express_re().captures_iter(src) {
-        let recv = &m[1];
-        let looks_like_router = matches!(recv, "app" | "router" | "server" | "api" | "route" | "routes" | "r")
-            || recv.ends_with("Router")
-            || recv.ends_with("App")
-            || recv.ends_with("Api")
-            || recv.ends_with("Routes");
-        if !looks_like_router {
+        if !looks_like_router(&m[1]) {
             continue;
         }
         let method = m[2].to_ascii_uppercase();
@@ -188,7 +207,42 @@ pub fn scan_express(src: &str) -> Vec<Route> {
         let (line, _) = lines.at(src, whole.start());
         let Some((args, _)) = call_args(src, open) else { continue };
         let handlers = handlers_in(src, &lines, &args[1..]);
-        out.push(Route { method, path, line, handlers });
+        out.push(Route { method, path, line, handlers, ..Default::default() });
+    }
+    // the chained form: `router.route('/:id').get(getOne).put(auth, update)`, one route per
+    // method at the line of its `.method(`
+    for m in express_chain_re().captures_iter(src) {
+        if !looks_like_router(&m[1]) {
+            continue;
+        }
+        let path = m[2].to_owned();
+        let mut at = m.get(0).unwrap().end();
+        for _ in 0..8 {
+            let Some(link) = express_link_re().captures(&src[at..(at + 64).min(src.len())]) else { break };
+            let open = at + link.get(0).unwrap().end() - 1;
+            let Some((args, end)) = call_args(src, open) else { break };
+            let (line, _) = lines.at(src, open);
+            let handlers = handlers_in(src, &lines, &args);
+            out.push(Route { method: link[1].to_ascii_uppercase(), path: path.clone(), line, handlers, ..Default::default() });
+            at = end;
+        }
+    }
+    out.sort_by_key(|r| r.line);
+    out
+}
+
+/// `x.use('/prefix', …, target)`: where a router file is mounted, as (prefix, target text,
+/// line). The target is the last argument: an identifier or an inline `require('./x')`.
+pub fn express_mounts(src: &str) -> Vec<(String, String, u32)> {
+    let lines = Lines::new(src);
+    let mut out = Vec::new();
+    for m in express_mount_re().captures_iter(src) {
+        let whole = m.get(0).unwrap();
+        let Some(open) = whole.as_str().find('(').map(|i| whole.start() + i) else { continue };
+        let Some((args, _)) = call_args(src, open) else { continue };
+        let Some(last) = args.last().map(|a| a.1.trim()).filter(|a| !a.is_empty() && args.len() > 1) else { continue };
+        let (line, _) = lines.at(src, whole.start());
+        out.push((m[2].to_owned(), last.to_owned(), line));
     }
     out
 }
@@ -267,7 +321,13 @@ pub fn scan_python_decorators(src: &str) -> Vec<Route> {
         let (hline, hcol) = lines.at(src, call_end + dm.start());
         let (line, _) = lines.at(src, whole.start());
         for method in methods {
-            out.push(Route { method, path: path.clone(), line, handlers: vec![Handler { name: dm.as_str().to_owned(), line: hline, col: hcol }] });
+            out.push(Route {
+                method,
+                path: path.clone(),
+                line,
+                handlers: vec![Handler { name: dm.as_str().to_owned(), line: hline, col: hcol }],
+                ..Default::default()
+            });
         }
     }
     out
@@ -288,7 +348,7 @@ pub fn scan_django(src: &str) -> Vec<Route> {
             let mut name = h.as_str().to_owned();
             name = name.trim_end_matches(".as_view").to_owned();
             let path = if m[2].starts_with('/') { m[2].to_owned() } else { format!("/{}", &m[2]) };
-            Route { method: "ANY".into(), path, line, handlers: vec![Handler { name, line: hl, col: hc }] }
+            Route { method: "ANY".into(), path, line, handlers: vec![Handler { name, line: hl, col: hc }], ..Default::default() }
         })
         .collect()
 }
@@ -302,7 +362,7 @@ pub fn scan_gin(src: &str) -> Vec<Route> {
         let Some((args, _)) = call_args(src, open) else { continue };
         let handlers = handlers_in(src, &lines, &args[1..]);
         let (line, _) = lines.at(src, whole.start());
-        out.push(Route { method: m[2].to_ascii_uppercase(), path: m[3].to_owned(), line, handlers });
+        out.push(Route { method: m[2].to_ascii_uppercase(), path: m[3].to_owned(), line, handlers, ..Default::default() });
     }
     out
 }
@@ -338,6 +398,7 @@ pub fn scan_spring(src: &str, kotlin: bool) -> Vec<Route> {
             path: if full.is_empty() { "/".into() } else { full },
             line,
             handlers: vec![Handler { name: hm.as_str().to_owned(), line: hl, col: hc }],
+            ..Default::default()
         });
     }
     out
@@ -360,70 +421,7 @@ pub fn scan_axum(src: &str) -> Vec<Route> {
                 path: m[1].to_owned(),
                 line,
                 handlers: vec![Handler { name: h.as_str().to_owned(), line: hl, col: hc }],
-            });
-        }
-    }
-    out
-}
-
-/// Route path of a Next.js file (`pages/users/[id].tsx` -> `/users/[id]`), or `None`.
-pub fn next_route_of(rel: &str) -> Option<(String, bool)> {
-    let strip_ext = |s: &str| -> Option<String> {
-        let (stem, ext) = s.rsplit_once('.')?;
-        matches!(ext, "ts" | "tsx" | "js" | "jsx" | "mjs").then(|| stem.to_owned())
-    };
-    let parts: Vec<&str> = rel.split('/').collect();
-    let at = parts.iter().position(|p| *p == "pages" || *p == "app")?;
-    let (kind, rest) = (parts[at], &parts[at + 1..]);
-    if rest.is_empty() {
-        return None;
-    }
-    let last = strip_ext(rest[rest.len() - 1])?;
-    let mut segs: Vec<String> = rest[..rest.len() - 1].iter().filter(|s| !(s.starts_with('(') && s.ends_with(')'))).map(|s| s.to_string()).collect();
-    if kind == "pages" {
-        if last.starts_with('_') {
-            return None;
-        }
-        if last != "index" {
-            segs.push(last);
-        }
-        Some((format!("/{}", segs.join("/")), false))
-    } else {
-        match last.as_str() {
-            "page" => Some((format!("/{}", segs.join("/")), false)),
-            "route" => Some((format!("/{}", segs.join("/")), true)),
-            _ => None,
-        }
-    }
-}
-
-pub fn scan_next(rel: &str, src: &str) -> Vec<Route> {
-    let Some((path, is_handler)) = next_route_of(rel) else { return Vec::new() };
-    let lines = Lines::new(src);
-    let mut out = Vec::new();
-    let is_pages_api = rel.contains("pages/api/") || is_handler;
-    if is_handler && !rel.contains("pages/") {
-        for m in next_method_re().captures_iter(src) {
-            let g = m.get(1).unwrap();
-            let (l, c) = lines.at(src, g.start());
-            out.push(Route {
-                method: g.as_str().to_owned(),
-                path: path.clone(),
-                line: l,
-                handlers: vec![Handler { name: g.as_str().to_owned(), line: l, col: c }],
-            });
-        }
-        return out;
-    }
-    if let Some(m) = next_default_re().captures(src) {
-        let g = m.get(1).unwrap();
-        if !matches!(g.as_str(), "function" | "async" | "class") {
-            let (l, c) = lines.at(src, g.start());
-            out.push(Route {
-                method: if is_pages_api { "ANY".into() } else { "GET".into() },
-                path,
-                line: l,
-                handlers: vec![Handler { name: g.as_str().to_owned(), line: l, col: c }],
+                ..Default::default()
             });
         }
     }
@@ -434,7 +432,7 @@ pub fn scan(fw: Framework, lang: Lang, rel: &str, src: &str) -> Vec<Route> {
     // Framework repositories contain route examples in API comments. Those
     // snippets are documentation, not registrations in the program's graph.
     let code;
-    let src = if matches!(fw, Framework::Express | Framework::Gin) {
+    let src = if matches!(fw, Framework::Express | Framework::Gin | Framework::Next | Framework::Nest | Framework::ReactRouter | Framework::TanStack) {
         code = cg_extract::post::strip_js_comments(src);
         code.as_str()
     } else {
@@ -453,7 +451,10 @@ pub fn scan(fw: Framework, lang: Lang, rel: &str, src: &str) -> Vec<Route> {
         Framework::Gin => scan_gin(src),
         Framework::Spring => scan_spring(src, lang == Lang::Kotlin),
         Framework::Axum => scan_axum(src),
-        Framework::Next => scan_next(rel, src),
+        Framework::Next => super::jsroutes::scan_next(rel, src),
+        Framework::Nest => super::jsroutes::scan_nest(src),
+        Framework::ReactRouter => super::jsroutes::scan_react_router(rel, src),
+        Framework::TanStack => super::jsroutes::scan_tanstack(rel, src),
     }
 }
 
@@ -472,11 +473,15 @@ impl FileHook for RouteHook {
             Framework::Spring => "spring-routes",
             Framework::Axum => "axum-routes",
             Framework::Next => "next-routes",
+            Framework::Nest => "nest-routes",
+            Framework::ReactRouter => "react-router-routes",
+            Framework::TanStack => "tanstack-router-routes",
         }
     }
-    fn applies(&self, lang: Lang, _rel: &str) -> bool {
+    fn applies(&self, lang: Lang, rel: &str) -> bool {
         match self.fw {
-            Framework::Express | Framework::Next => lang.family() == LangFamily::Js,
+            Framework::Next => lang.family() == LangFamily::Js && super::jsroutes::next_route_of(rel).is_some(),
+            Framework::Express | Framework::Nest | Framework::ReactRouter | Framework::TanStack => lang.family() == LangFamily::Js,
             Framework::Flask | Framework::FastApi | Framework::Django => lang == Lang::Python,
             Framework::Gin => lang == Lang::Go,
             Framework::Spring => matches!(lang, Lang::Java | Lang::Kotlin),
@@ -491,30 +496,117 @@ impl FileHook for RouteHook {
             Framework::Gin => &[".GET(", ".POST(", ".PUT(", ".DELETE(", ".PATCH(", ".Any(", ".OPTIONS(", ".HEAD("],
             Framework::Spring => &["Mapping"],
             Framework::Axum => &[".route("],
-            Framework::Next => &["export"],
+            Framework::Next => &[],
+            Framework::Nest => &[
+                "@Get",
+                "@Post",
+                "@Put",
+                "@Patch",
+                "@Delete",
+                "@Head",
+                "@Options",
+                "@All",
+                "@Query",
+                "@Mutation",
+                "@Subscription",
+                "@MessagePattern",
+                "@EventPattern",
+                "@SubscribeMessage",
+            ],
+            Framework::ReactRouter => &[
+                "<Route",
+                "createBrowserRouter",
+                "createHashRouter",
+                "createMemoryRouter",
+                "createRoutesFromElements",
+                "useRoutes",
+                "const ",
+                "let ",
+                "var ",
+                "export default",
+            ],
+            Framework::TanStack => &["createFileRoute", "createLazyFileRoute", "createRoute", "createRootRoute"],
         }
     }
     fn run(&self, ctx: &HookCtx<'_>, out: &mut HookOut) {
-        let routes = scan(self.fw, ctx.lang, ctx.rel, ctx.src);
+        let mut routes: Vec<(Option<(String, bool)>, Route)> = scan(self.fw, ctx.lang, ctx.rel, ctx.src).into_iter().map(|r| (None, r)).collect();
+        if self.fw == Framework::ReactRouter {
+            let code = cg_extract::post::strip_js_comments(ctx.src);
+            let candidates = super::jsroutes::scan_react_tables(ctx.rel, &code);
+            // The ordinary scanner sees every object when the file also creates a router.
+            // Keep array declarations as candidates so only the consumed table is active.
+            routes.retain(|(_, r)| !candidates.iter().any(|(_, c, _)| c.line == r.line && c.path == r.path));
+            routes.extend(candidates.into_iter().map(|(name, r, absolute)| (Some((name, absolute)), r)));
+            for usage in super::jsroutes::react_table_uses(&code) {
+                out.sites.push(cg_extract::SiteFact {
+                    pass: crate::synth::sites::PASS_REACT_TABLE,
+                    role: 1,
+                    key_kind: 0,
+                    key_a: usage.name,
+                    key_b: usage.owner,
+                    node_row: cg_core::NONE,
+                    line: 0,
+                    payload: format!("{}{}", if usage.absolute { "a" } else { "r" }, usage.prefix),
+                });
+            }
+        }
+        if self.fw == Framework::Express && ctx.src.contains(".use(") {
+            let code = cg_extract::post::strip_js_comments(ctx.src);
+            for (prefix, target, line) in express_mounts(&code) {
+                out.sites.push(cg_extract::SiteFact {
+                    pass: crate::synth::sites::PASS_HTTP,
+                    role: crate::synth::dynamic::ROLE_HTTP_MOUNT,
+                    key_kind: 0,
+                    key_a: prefix,
+                    key_b: String::new(),
+                    node_row: cg_core::NONE,
+                    line,
+                    payload: target,
+                });
+            }
+        }
         let kcount = ctx.rows.node_count() as u32;
-        for r in routes {
-            let name = format!("{} {}", r.method, r.path);
+        for (table, mut r) in routes {
+            if self.fw == Framework::Nest {
+                r.router = Some("nestjs");
+            }
+            // a page is named by its path alone; a server route by its method and path
+            let (name, qname) = if r.method.is_empty() {
+                (r.path.clone(), format!("{}::route:{}", ctx.rel, r.path))
+            } else {
+                (format!("{} {}", r.method, r.path), format!("{}::{}:{}", ctx.rel, r.method, r.path))
+            };
+            if out.nodes.iter().any(|n| n.qname == qname && n.start_line == r.line) {
+                continue;
+            }
             let row = kcount + out.nodes.len() as u32;
             out.nodes.push(ExtraNode {
                 kind: NodeKind::Route,
-                qname: format!("{}::{}:{}", ctx.rel, r.method, r.path),
+                qname,
                 digest: node_digest(ctx.rel, NodeKind::Route, &name, r.line),
                 name,
                 start_line: r.line,
                 end_line: r.line,
                 start_col: 0,
                 end_col: 0,
-                signature: None,
+                signature: r.router.map(str::to_owned),
                 parent_row: 0,
                 exported: None,
             });
+            if let Some((table, absolute)) = table {
+                out.sites.push(cg_extract::SiteFact {
+                    pass: crate::synth::sites::PASS_REACT_TABLE,
+                    role: 0,
+                    key_kind: 0,
+                    key_a: table,
+                    key_b: String::new(),
+                    node_row: row,
+                    line: r.line,
+                    payload: if absolute { "a" } else { "r" }.to_owned(),
+                });
+            }
             for h in r.handlers {
-                out.refs.push(ExtraRef { from_row: row, kind: RefKind::FunctionRef, name: h.name, line: h.line, col: h.col });
+                out.refs.push(ExtraRef { from_row: row, kind: r.ref_kind, name: h.name, line: h.line, col: h.col });
             }
         }
     }
@@ -541,6 +633,24 @@ mod tests {
                 "GET /tpl -> tplHandler"
             ]
         );
+    }
+
+    #[test]
+    fn express_chains_and_mounts() {
+        let src = "router.route('/').get(getProducts).post(protect, admin, createProduct)\nrouter\n  .route('/:id')\n  .get(getProductById)\n  .delete(protect, deleteProduct)\napp.use('/api/products', productRoutes)\napp.use('/api/users', require('./routes/users'))\napp.use(notFound)\n";
+        assert_eq!(
+            names(&scan_express(src)),
+            vec![
+                "GET / -> getProducts",
+                "POST / -> protect|admin|createProduct",
+                "GET /:id -> getProductById",
+                "DELETE /:id -> protect|deleteProduct",
+                "USE /api/products -> productRoutes",
+                "USE /api/users -> "
+            ]
+        );
+        let mounts: Vec<_> = express_mounts(src).into_iter().map(|m| format!("{} {}", m.0, m.1)).collect();
+        assert_eq!(mounts, vec!["/api/products productRoutes", "/api/users require('./routes/users')"]);
     }
 
     #[test]
@@ -579,18 +689,5 @@ mod tests {
     fn axum() {
         let src = "let app = Router::new()\n    .route(\"/\", get(root))\n    .route(\"/users\", get(list).post(handlers::create));";
         assert_eq!(names(&scan_axum(src)), vec!["GET / -> root", "GET /users -> list", "POST /users -> handlers::create"]);
-    }
-
-    #[test]
-    fn next() {
-        assert_eq!(next_route_of("pages/users/[id].tsx"), Some(("/users/[id]".into(), false)));
-        assert_eq!(next_route_of("src/pages/index.tsx"), Some(("/".into(), false)));
-        assert_eq!(next_route_of("app/(shop)/cart/page.tsx"), Some(("/cart".into(), false)));
-        assert_eq!(next_route_of("app/api/x/route.ts"), Some(("/api/x".into(), true)));
-        assert_eq!(next_route_of("pages/_app.tsx"), None);
-        let page = "export default function Cart() { return null }";
-        assert_eq!(names(&scan_next("app/cart/page.tsx", page)), vec!["GET /cart -> Cart"]);
-        let api = "export async function GET(req) {}\nexport const POST = async () => {}";
-        assert_eq!(names(&scan_next("app/api/x/route.ts", api)), vec!["GET /api/x -> GET", "POST /api/x -> POST"]);
     }
 }
