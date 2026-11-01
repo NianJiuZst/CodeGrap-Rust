@@ -120,12 +120,103 @@ export function asserted() {
         }
         assert!(!has(&edges, &format!("{caller} -calls-> service.ts::Runner::run")), "satisfies must not replace the receiver with its constraint");
     }
-    let call_targets = |caller: &str| {
-        let prefix = format!("app.ts::{caller} -calls-> ");
-        edges.iter().filter_map(|edge| edge.strip_prefix(&prefix)).collect::<Vec<_>>()
-    };
-    assert_eq!(call_targets("factory"), call_targets("plainFactory"), "satisfies must preserve the existing factory inference behavior");
+    for caller in ["factory", "plainFactory"] {
+        assert!(has(&edges, &format!("app.ts::{caller} -calls-> service.ts::makeService")), "the factory call itself must be preserved");
+    }
+    assert!(!has(&edges, "app.ts::factory -calls-> service.ts::Runner::run"), "satisfies must not replace an unknown receiver with its constraint");
     assert!(has(&edges, "app.ts::asserted -calls-> service.ts::Runner::run"), "an inner as assertion still supplies its explicit type");
+}
+
+#[test]
+fn typescript_satisfies_preserves_bound_aliases() {
+    for ext in ["ts", "tsx"] {
+        let app = format!("app.{ext}");
+        let (_d, view) = project(&[
+            ("service.ts", "export interface Runner { run(): void }\nexport class Service { run() {} extra() {} }\nexport class Other { run() {} }\nexport const shared = new Service();\n"),
+            (
+                &app,
+                r#"import { Other, Runner, Service, shared as importedShared } from './service';
+export function direct(original: Service) {
+    const alias = original satisfies Runner;
+    alias.run();
+    alias.extra();
+}
+export function chained(original: Service) {
+    const first = original satisfies Runner;
+    const second = (first! satisfies Runner) satisfies object;
+    second.run();
+}
+export function outer(original: Service) {
+    function inner() {
+        const alias = original satisfies Runner;
+        alias.run();
+    }
+    inner();
+}
+export function imported() {
+    const alias = importedShared satisfies Runner;
+    alias.run();
+}
+export function shadowed(importedShared: Other) {
+    const alias = importedShared satisfies Runner;
+    alias.run();
+}
+export function shadowedUnknown(importedShared: any) {
+    const alias = importedShared satisfies Runner;
+    alias.run();
+}
+const localShared = new Service();
+export class Holder {
+    service = localShared satisfies Runner;
+    use() { this.service.run(); }
+}
+"#,
+            ),
+        ]);
+        let edges = dump::dump_edges(&view);
+        for caller in ["direct", "chained", "outer::inner", "imported", "Holder::use"] {
+            let expected = format!("{app}::{caller} -calls-> service.ts::Service::run");
+            assert!(has(&edges, &expected), "{expected}: {edges:#?}");
+        }
+        assert!(has(&edges, &format!("{app}::direct -calls-> service.ts::Service::extra")), "{edges:#?}");
+        assert!(has(&edges, &format!("{app}::shadowed -calls-> service.ts::Other::run")), "{edges:#?}");
+        assert!(!has(&edges, &format!("{app}::shadowedUnknown -calls-> service.ts::Service::run")), "{edges:#?}");
+    }
+}
+
+#[test]
+fn typescript_satisfies_does_not_guess_unresolved_aliases() {
+    for ext in ["ts", "tsx"] {
+        let app = format!("app.{ext}");
+        let (_d, view) = project(&[(
+            &app,
+            r#"import type { Service } from 'external-package';
+export class Unrelated { run() {} }
+export function external(original: Service) {
+    const alias = original satisfies Service;
+    alias.run();
+}
+export function untyped(original: any) {
+    const alias = original satisfies { run(): void };
+    alias.run();
+}
+function make(): any { return {}; }
+export function factory() {
+    const alias = make() satisfies Service;
+    alias.run();
+}
+export function field(original: { service: Service }) {
+    const alias = original.service satisfies Service;
+    alias.run();
+}
+"#,
+        )]);
+        let edges = dump::dump_edges(&view);
+        for caller in ["external", "untyped", "factory", "field"] {
+            let unrelated = format!("{app}::{caller} -calls-> {app}::Unrelated::run");
+            assert!(!has(&edges, &unrelated), "{unrelated}: {edges:#?}");
+        }
+    }
 }
 
 #[test]

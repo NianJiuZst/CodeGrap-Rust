@@ -8,7 +8,7 @@ use crate::engine::{Bound, Engine};
 use crate::modules::{ImportTarget, PkgId};
 use crate::shape::{parse_shape, split_head, Shape};
 use cg_core::{text::pack_pos, EdgeKind, FileId, Lang, LangFamily, NodeIdx, NodeKind, RefKind, Visibility, NONE};
-use cg_extract::facts::COMMONJS_MODULE;
+use cg_extract::facts::{COMMONJS_MODULE, JS_BINDING_ALIAS, JS_SATISFIES_VALUE};
 use cg_extract::{BindKind, ImportKind, ScopeKind};
 use cg_store::{status, BindingRec, ImportRec, RefRec, ScopeRec, View};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -603,7 +603,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
         }
         let scope = b.scope.0.wrapping_sub(self.scope_base);
         // The new variable is not in scope in its own initializer (`let rt = rt()`).
-        let shadows = init.split(['.', ':', '(']).next() == Some(self.view.text_str(b.name));
+        let root = init.strip_prefix(JS_SATISFIES_VALUE).unwrap_or(init);
+        let root = root.strip_prefix(JS_BINDING_ALIAS).unwrap_or(root);
+        let shadows = root.split(['.', ':', '(']).next() == Some(self.view.text_str(b.name));
         let line = if shadows { b.line.saturating_sub(1) } else { b.line };
         self.expression_value(wcx, init, scope, line, depth + 1)
     }
@@ -611,6 +613,23 @@ impl<'e, 'v> FileCx<'e, 'v> {
     fn expression_value(&self, wcx: &mut WorkerCx<'e, 'v>, init: &str, scope: u32, line: u32, depth: u8) -> Option<ValueType> {
         if depth >= 16 {
             return None;
+        }
+        if let Some(inner) = init.strip_prefix(JS_SATISFIES_VALUE) {
+            return self.expression_value(wcx, inner, scope, line, depth + 1);
+        }
+        if let Some(name) = init.strip_prefix(JS_BINDING_ALIAS) {
+            if let Some(binding) = self.lookup_binding(name, scope, line, false) {
+                return self.binding_value(wcx, binding, depth + 1);
+            }
+            let import = self.visible_import(name, scope)?;
+            let Bound::Node(node) = self.e.bind_import(self.file, import as usize) else { return None };
+            if self.view.node(node).kind().is_type() {
+                return Some(ValueType::plain(node));
+            }
+            let owner = self.view.hot(node).file;
+            let cx = wcx.file_cx(self.e, owner);
+            let binding = cx.file_binding(self.view.node(node).name())?;
+            return cx.binding_value(wcx, binding, depth + 1);
         }
         if let Some(inner) = init.strip_suffix('?') {
             let mut value = self.expression_value(wcx, inner, scope, line, depth + 1)?;
@@ -1230,9 +1249,13 @@ impl<'e, 'v> FileCx<'e, 'v> {
                         if !self.view.text_str(b.decl_type).is_empty() {
                             return Outcome::st(status::NO_CANDIDATE);
                         }
-                        // An initializer rooted in an explicit external import
-                        // does not justify guessing an unrelated project member.
                         let init = self.view.text_str(b.init_ctor);
+                        // Unknown satisfies operands and aliases do not justify
+                        // guessing an unrelated project member.
+                        if init.starts_with(JS_SATISFIES_VALUE) || init.starts_with(JS_BINDING_ALIAS) {
+                            return Outcome::st(status::LOCAL_BINDING);
+                        }
+                        // Neither does an initializer rooted in an external import.
                         let head = init.split(['.', ':', '(']).next().unwrap_or("");
                         if let Some(i) = self.visible_import(head, scope).filter(|_| self.lookup_binding(head, scope, r.line, false).is_none()) {
                             if self.e.bind_import(self.file, i as usize) == Bound::External {

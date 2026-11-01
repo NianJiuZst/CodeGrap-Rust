@@ -19,6 +19,13 @@ pub use util::Cx;
 /// `default` export. The leading NUL keeps it out of ordinary source identifiers.
 pub const COMMONJS_MODULE: &str = "\0cjs:module.exports";
 
+/// Marks initializer evidence collected through a TypeScript `satisfies` expression.
+pub const JS_SATISFIES_VALUE: &str = "\0js:satisfies:";
+
+/// Initializer evidence that names a JavaScript/TypeScript lexical binding.
+/// The NUL prefix distinguishes it from a constructor or call path.
+pub const JS_BINDING_ALIAS: &str = "\0js:binding:";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ImportKind {
@@ -121,7 +128,7 @@ pub struct BindingFact {
     /// Declared type, usually reduced to its head (`Foo<T>` -> `Foo`). Rust
     /// retains generic arguments to distinguish containers and pointer targets.
     pub decl_type: String,
-    /// Constructor or bounded initializer call path (`Foo::new().build()`), or empty.
+    /// Constructor, bounded initializer call path, tagged lexical alias, or empty.
     pub init_ctor: String,
     /// 1-based declaration line; the binding is visible from here on (hoisted functions
     /// are visible throughout their scope and use line 0).

@@ -121,15 +121,29 @@ fn ts_type_name(cx: &Cx, n: Node) -> String {
 /// (declared type, initialiser) of a value expression: `new Foo()` -> ("", "Foo"),
 /// `foo()` -> ("", "foo()"), `x as Foo` -> ("Foo", "").
 fn value_info(cx: &Cx, v: Node) -> (String, String) {
+    value_info_inner(cx, v, false)
+}
+
+fn value_info_inner(cx: &Cx, v: Node, allow_alias: bool) -> (String, String) {
     match v.kind() {
         "new_expression" => {
             let c = v.child_by_field_name("constructor").map(|c| cx.text(c).to_owned()).unwrap_or_default();
             (String::new(), c)
         }
-        // `satisfies` checks a constraint without replacing the operand's type.
-        "await_expression" | "parenthesized_expression" | "non_null_expression" | "satisfies_expression" => {
-            v.named_child(0).map(|c| value_info(cx, c)).unwrap_or_default()
+        "await_expression" | "parenthesized_expression" | "non_null_expression" => {
+            v.named_child(0).map(|c| value_info_inner(cx, c, allow_alias)).unwrap_or_default()
         }
+        // Preserve the operand's evidence, but mark it so an unknown receiver
+        // cannot be guessed from an unrelated global method.
+        "satisfies_expression" => {
+            let (ty, init) = v.named_child(0).map(|c| value_info_inner(cx, c, true)).unwrap_or_default();
+            if ty.is_empty() && !init.starts_with(JS_SATISFIES_VALUE) {
+                (ty, format!("{JS_SATISFIES_VALUE}{init}"))
+            } else {
+                (ty, init)
+            }
+        }
+        "identifier" if allow_alias => (String::new(), format!("{JS_BINDING_ALIAS}{}", cx.text(v))),
         "as_expression" => {
             let t = v.named_child(1).map(|c| ts_type_name(cx, c)).unwrap_or_default();
             (t, String::new())

@@ -542,11 +542,14 @@ fn typescript_satisfies_receiver_edits_match_full_rebuild() {
     for i in 0..40 {
         write(root, &format!("filler{i}.ts"), &format!("export function filler{i}() {{ helper{i}(); }}\nfunction helper{i}() {{}}\n"), 0);
     }
-    for (step, (expression, target)) in [
-        ("new First() satisfies Runner", "First"),
-        ("new Second() satisfies Runner", "Second"),
-        ("(new First() as Runner) satisfies object", "Runner"),
-        ("new First() satisfies Runner", "First"),
+    for (step, (original, expression, target)) in [
+        ("First", "new First() satisfies Runner", "First"),
+        ("First", "new Second() satisfies Runner", "Second"),
+        ("First", "(new First() as Runner) satisfies object", "Runner"),
+        ("First", "new First() satisfies Runner", "First"),
+        ("First", "original satisfies Runner", "First"),
+        ("Second", "original satisfies Runner", "Second"),
+        ("First", "(original satisfies Runner) satisfies object", "First"),
     ]
     .iter()
     .enumerate()
@@ -555,7 +558,7 @@ fn typescript_satisfies_receiver_edits_match_full_rebuild() {
             root,
             "app.ts",
             &format!(
-                "import {{ Runner, First, Second }} from './service';\nexport function main() {{\n    const service = {expression};\n    service.run();\n}}\n"
+                "import {{ Runner, First, Second }} from './service';\nexport function main() {{\n    const original = new {original}();\n    const service = {expression};\n    service.run();\n}}\n"
             ),
             step as u64 + 1,
         );
@@ -570,6 +573,60 @@ fn typescript_satisfies_receiver_edits_match_full_rebuild() {
         assert_eq!(calls, vec![format!("app.ts::main -calls-> service.ts::{target}::run")]);
         assert_eq!(canonical_of(root), full_canonical(root), "{expression}");
     }
+}
+
+#[test]
+fn typescript_satisfies_imported_alias_matches_full_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for i in 0..40 {
+        write(root, &format!("filler{i}.ts"), &format!("export function filler{i}() {{ helper{i}(); }}\nfunction helper{i}() {{}}\n"), 0);
+    }
+    write(
+        root,
+        "app.ts",
+        "import { shared, Runner } from './service';\nexport function main() {\n const alias = shared satisfies Runner;\n alias.run();\n}\n",
+        0,
+    );
+    for (step, target) in ["First", "Second", "First"].iter().enumerate() {
+        write(
+            root,
+            "service.ts",
+            &format!("export interface Runner {{ run(): void }}\nexport class First {{ run() {{}} }}\nexport class Second {{ run() {{}} }}\nexport const shared = new {target}();\n"),
+            step as u64 + 1,
+        );
+        if step == 0 {
+            index_project(root, &opts()).unwrap();
+        } else {
+            let report = sync(root, &SyncOptions { index: opts(), ..Default::default() }).unwrap();
+            assert!(report.full_rebuild.is_none(), "must exercise incremental resolution: {report:?}");
+        }
+        let snap = Store::at(root).open_snapshot().unwrap();
+        let calls: Vec<_> = dump::dump_edges(&snap.view).into_iter().filter(|edge| edge.starts_with("app.ts::main -calls-> ")).collect();
+        assert_eq!(calls, vec![format!("app.ts::main -calls-> service.ts::{target}::run")]);
+        assert_eq!(canonical_of(root), full_canonical(root), "{target}");
+    }
+}
+
+#[test]
+fn sync_rebuilds_engine_five_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "app.ts", "export class Service { run() {} }\n", 0);
+    let mut previous = cg_resolve::build_seg(root, &opts()).unwrap().seg;
+    previous.meta.engine_version = 5;
+    let store = Store::at(root);
+    let guard = store.write_lock(Duration::from_secs(1)).unwrap();
+    let mut manifest = store.publish_base(&previous, &guard).unwrap();
+    manifest.engine_version = 5;
+    fs::write(store.manifest_path(), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    drop(guard);
+
+    let report = sync(root, &SyncOptions { index: opts(), ..Default::default() }).unwrap();
+    assert_eq!(report.full_rebuild.as_deref(), Some("index built by an older engine"));
+    let snapshot = store.open_snapshot().unwrap();
+    assert_eq!(snapshot.view.base.meta.engine_version, cg_core::brand::ENGINE_VERSION);
+    assert_eq!(snapshot.manifest.engine_version, cg_core::brand::ENGINE_VERSION);
 }
 
 #[test]
