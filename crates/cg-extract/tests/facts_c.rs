@@ -915,3 +915,40 @@ fn deeply_nested_expressions_and_lambdas() {
     assert_eq!(bind(&f, "x").kind, BindKind::Local);
     assert_eq!(bind(&f, "y").kind, BindKind::Local);
 }
+
+/// Facts from the extractor alone, on a tree parsed here. The pipeline retries a file whose
+/// nesting the kernel finds too deep on a 512 MB stack, which would hide the walker's own
+/// stack use; the kernel rows only feed `row_at`, so an empty file's rows do.
+fn raw(rel: &str, src: &str, lang: Lang) -> Facts {
+    let mut p = tree_sitter::Parser::new();
+    p.set_language(&cg_kernel::hooks::language(lang.as_str()).unwrap()).unwrap();
+    let tree = p.parse(src, None).unwrap();
+    assert!(!tree.root_node().has_error(), "the input must parse cleanly");
+    let opts = cg_kernel::ExtractOptions::default();
+    let emit = cg_kernel::extract_file(rel, "", lang.as_str(), &opts).unwrap();
+    cg_extract::facts::extract(lang, &tree, src, FileRows::new(&emit))
+}
+
+#[test]
+fn deeply_nested_dependent_types() {
+    // `type_name` runs outside the depth-bounded walk (parameters, declarations, call
+    // arguments): a `typename typename ... T` chain must be unwrapped without recursing
+    let mut src = String::from("void f(");
+    src.push_str(&"typename ".repeat(20_000));
+    src.push_str("T x) {\n  ");
+    src.push_str(&"typename ".repeat(20_000));
+    src.push_str("U y;\n  Foo z;\n}\nvoid after(Bar* b) { auto w = static_cast<");
+    src.push_str(&"typename ".repeat(20_000));
+    src.push_str("V*>(b); }\n");
+    // on a thread with a modest stack, and without the pipeline's big-stack retry
+    let f = std::thread::Builder::new().stack_size(2 << 20).spawn(move || raw("a.cpp", &src, Lang::Cpp)).unwrap().join().unwrap();
+    assert_eq!(bind(&f, "x").kind, BindKind::Param);
+    assert_eq!(bind(&f, "y").kind, BindKind::Local);
+    assert_eq!(info(&f, "z"), (BindKind::Local, "Foo", ""));
+    assert_eq!(info(&f, "b"), (BindKind::Param, "Bar", ""));
+    assert_eq!(bind(&f, "w").kind, BindKind::Local);
+    // a short chain still reduces to its head
+    let f = cpp("template <class T> void g(typename T::type a, const typename T::other* c) { }\n");
+    assert_eq!(info(&f, "a"), (BindKind::Param, "T::type", ""));
+    assert_eq!(info(&f, "c"), (BindKind::Param, "T::other", ""));
+}

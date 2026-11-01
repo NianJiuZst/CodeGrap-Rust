@@ -6,6 +6,9 @@ use cg_extract::*;
 fn run(src: &str) -> Facts {
     let b = extract_bytes("a.php", src.as_bytes(), 0, Lang::Php, &ExtractConfig::new("."));
     assert_eq!(b.flags & fileflags::PANICKED, 0, "{:?}", b.errors);
+    // a panic inside the facts walker is caught and reported here, with empty facts
+    assert!(!b.errors.iter().any(|e| e.contains("panic")), "{:?}", b.errors);
+    assert!(!b.facts.scopes.is_empty(), "facts were not built");
     b.facts
 }
 
@@ -153,8 +156,9 @@ function f(Foo $a, ?Foo $b, \App\Foo $c, int $d, A|B $e, A|null $g, null|A $h, F
     assert_eq!(ty("h"), "A");
     assert_eq!(ty("i"), "");
     assert_eq!(ty("j"), "");
-    assert_eq!(ty("k"), "self");
-    assert_eq!(ty("l"), "self");
+    // `self` / `static` outside any class name nothing
+    assert_eq!(ty("k"), "");
+    assert_eq!(ty("l"), "");
     assert_eq!(ty("m"), "");
     assert_eq!(ty("rest"), "");
     assert_eq!(ty("ref"), "");
@@ -305,17 +309,68 @@ function m($other) {
     assert_eq!(local("j"), ("", "self::instance()"));
     assert_eq!(local("k"), ("", "self::instance()"));
     assert_eq!(local("l"), ("", ""));
-    assert_eq!(local("n"), ("self", ""));
+    // `new static()` in a free function names no class
+    assert_eq!(local("n"), ("", ""));
     assert_eq!(local("o"), ("Bar", ""));
     assert_eq!(local("p"), ("Bar", ""));
     assert_eq!(local("q"), ("Foo", ""));
     assert_eq!(local("r"), ("", "this.make()"));
     assert_eq!(local("s"), ("", ""));
-    // re-assignment in the same scope is ignored
-    assert_eq!(binds(&f, "a").len(), 1, "{:?}", binds(&f, "a"));
-    // `$this` is never a binding, re-assigning a parameter adds nothing
+    // a typed re-assignment in the same scope adds a later binding; the first one stays
+    let a = binds(&f, "a");
+    assert_eq!(a.len(), 2, "{a:?}");
+    assert_eq!((a[1].kind, a[1].decl_type.as_str(), a[1].line, a[1].scope), (BindKind::Local, "Other", 19, a[0].scope));
+    // `$q = $a` copied what `$a` was at that line, not what it became later
+    assert_eq!(local("q"), ("Foo", ""));
+    // `$this` is never a binding, a parameter that is only read adds nothing
     assert!(binds(&f, "this").is_empty());
     assert_eq!(binds(&f, "other").len(), 1);
+}
+
+#[test]
+fn typed_reassignment_adds_a_later_binding() {
+    let f = run(r#"<?php
+function m(Foo $p, $q) {
+    $x = new Foo();
+    $x = new Bar();
+    $x->run();
+    $y = null;
+    $y = new Bar();
+    $z = new Foo();
+    $z = 42;
+    $z = $unknown;
+    $w = make();
+    $w = Factory::build();
+    $v = null;
+    $v ??= new Lazy();
+    $p = new Bar();
+    $q = new Baz();
+    /** @var Doc $d */
+    $d = 1;
+    /** @var Doc2 $d */
+    $d = 2;
+}
+"#);
+    let local = |n: &str| binds(&f, n).into_iter().map(|b| (b.kind, b.decl_type.clone(), b.init_ctor.clone(), b.line)).collect::<Vec<_>>();
+    let l = |ty: &str, init: &str, line: u32| (BindKind::Local, ty.to_owned(), init.to_owned(), line);
+    // the resolver reads the latest binding before each use: `$x->run()` on line 5 sees `Bar`
+    assert_eq!(local("x"), [l("Foo", "", 3), l("Bar", "", 4)]);
+    // an untyped first assignment does not stop a later typed one from being recorded
+    assert_eq!(local("y"), [l("", "", 6), l("Bar", "", 7)]);
+    // untyped re-assignments add nothing
+    assert_eq!(local("z"), [l("Foo", "", 8)]);
+    // initializer paths count as evidence too
+    assert_eq!(local("w"), [l("", "make()", 11), l("", "Factory::build()", 12)]);
+    assert_eq!(local("v"), [l("", "", 13), l("Lazy", "", 14)]);
+    // a re-assigned parameter keeps its parameter binding and gains a local one
+    assert_eq!(local("p"), [(BindKind::Param, "Foo".to_owned(), String::new(), 2), l("Bar", "", 15)]);
+    assert_eq!(local("q"), [(BindKind::Param, String::new(), String::new(), 2), l("Baz", "", 16)]);
+    // a `@var` docblock is evidence
+    assert_eq!(local("d"), [l("Doc", "", 18), l("Doc2", "", 20)]);
+    // every binding of a name sits in the function scope
+    for b in f.bindings.iter().filter(|b| b.kind != BindKind::Package) {
+        assert_eq!(kind_of(&f, b.scope), ScopeKind::Function, "{b:?}");
+    }
 }
 
 #[test]
@@ -343,11 +398,13 @@ function m($xs) {
     static $st = 1, $inst = null;
 }
 "#);
-    for n in ["k", "v", "only", "r1", "r2", "ref", "l1", "l2", "l3", "l4", "id", "g", "h", "st", "inst"] {
+    for n in ["k", "v", "only", "r1", "r2", "ref", "l1", "l2", "l3", "l4", "id", "st", "inst"] {
         let b = bind(&f, n);
         assert_eq!((b.kind, b.decl_type.as_str()), (BindKind::Local, ""), "{n}");
         assert_eq!(kind_of(&f, b.scope), ScopeKind::Function, "{n}");
     }
+    // `global` of variables the file never assigns binds nothing
+    assert!(binds(&f, "g").is_empty() && binds(&f, "h").is_empty(), "{:?}", f.bindings);
     // the foreach subject is not bound
     assert_eq!(binds(&f, "xs").len(), 1);
     assert_eq!(bind(&f, "v").line, 3);
@@ -508,4 +565,157 @@ fn empty_and_trivial_files() {
         assert!(f.imports.is_empty() && f.bindings.is_empty(), "{src:?}: {f:?}");
         assert_eq!(f.scopes.len(), 1, "{src:?}");
     }
+}
+
+#[test]
+fn global_copies_the_file_scope_variable() {
+    let f = run(r#"<?php
+$app = new App();
+$made = make();
+$plain = 1;
+function f(Other $app) {
+    global $app, $made, $plain, $missing;
+    $app->run();
+}
+class C {
+    public function m() {
+        global $made;
+    }
+}
+function later() {
+    global $late;
+}
+$late = new Late();
+"#);
+    let app = binds(&f, "app");
+    assert_eq!(app.len(), 3, "{app:?}");
+    assert_eq!((app[0].scope, app[0].decl_type.as_str()), (0, "App"));
+    // the parameter, then the `global` re-declaration carrying the file's evidence
+    assert_eq!((app[1].kind, app[1].decl_type.as_str(), app[1].line), (BindKind::Param, "Other", 5));
+    assert_eq!((app[2].kind, app[2].decl_type.as_str(), app[2].init_ctor.as_str(), app[2].line), (BindKind::Local, "App", "", 6));
+    assert_eq!(app[2].scope, app[1].scope);
+    assert_eq!(kind_of(&f, app[2].scope), ScopeKind::Function);
+    // initializer paths are copied as well, into every function that declares the global
+    let made = binds(&f, "made");
+    assert_eq!(made.len(), 3, "{made:?}");
+    assert!(made.iter().all(|b| b.kind == BindKind::Local && b.init_ctor == "make()" && b.decl_type.is_empty()), "{made:?}");
+    assert_eq!(made[2].line, 11);
+    assert_eq!(kind_of(&f, made[2].scope), ScopeKind::Function);
+    assert_eq!(kind_of(&f, f.scopes[made[2].scope as usize].parent), ScopeKind::Class);
+    // an untyped file variable is still declared in the function (there is nothing to shadow)
+    let plain = binds(&f, "plain");
+    assert_eq!(plain.len(), 2, "{plain:?}");
+    assert_eq!((plain[1].decl_type.as_str(), plain[1].init_ctor.as_str(), plain[1].line), ("", "", 6));
+    // no file-scope variable: nothing is bound, so nothing shadows a later file-scope lookup
+    assert!(binds(&f, "missing").is_empty(), "{:?}", f.bindings);
+    let late = binds(&f, "late");
+    assert_eq!(late.len(), 1, "{late:?}");
+    assert_eq!((late[0].scope, late[0].decl_type.as_str(), late[0].line), (0, "Late", 17));
+}
+
+#[test]
+fn self_and_static_name_the_enclosing_class() {
+    let f = run(r#"<?php
+namespace App;
+class Foo extends Base {
+    private ?self $next = null;
+    public function make(self $other, static $st): static {
+        $a = new self();
+        $b = new static();
+        $this->me = new static();
+        $cb = fn() => new self();
+        $inner = new class {
+            public function run(self $me) { $x = new self(); $this->own = new static(); }
+        };
+        $after = new self();
+        return $a;
+    }
+}
+interface I { public function i(self $s); }
+trait T { public function t() { $u = new self(); } }
+enum E { case A; public function e(self $v) {} }
+function free(self $fs) { $ft = new static(); }
+"#);
+    let ty = |n: &str| bind(&f, n).decl_type.clone();
+    assert_eq!(bind_kind(&f, "next", BindKind::Field).decl_type, "Foo");
+    assert_eq!(bind_kind(&f, "other", BindKind::Param).decl_type, "Foo");
+    assert_eq!(bind_kind(&f, "st", BindKind::Param).decl_type, "Foo");
+    assert_eq!(ty("a"), "Foo");
+    assert_eq!(ty("b"), "Foo");
+    assert_eq!(bind_kind(&f, "me", BindKind::Field).decl_type, "Foo");
+    // a closure is not a class: `$cb` holds the closure, not a `Foo`
+    assert_eq!(bind_kind(&f, "cb", BindKind::Local).decl_type, "");
+    // an anonymous class has no name: `self` there is unknown
+    assert_eq!(bind_kind(&f, "me", BindKind::Param).decl_type, "");
+    assert_eq!(ty("x"), "");
+    assert_eq!(bind_kind(&f, "own", BindKind::Field).decl_type, "");
+    // ... and leaving it restores the outer class
+    assert_eq!(ty("after"), "Foo");
+    // interfaces, traits and enums name themselves
+    assert_eq!(ty("s"), "I");
+    assert_eq!(ty("u"), "T");
+    assert_eq!(ty("v"), "E");
+    // outside any class there is nothing to name
+    assert_eq!(ty("fs"), "");
+    assert_eq!(ty("ft"), "");
+    // the marker never leaks into a binding
+    assert!(f.bindings.iter().all(|b| b.decl_type != "self" && b.decl_type != "static"), "{:?}", f.bindings);
+    assert_eq!(package(&f), ["App"]);
+}
+
+#[test]
+fn nameless_namespace_block_is_the_global_namespace() {
+    // `A` is in the global namespace: the later named block must not become the file's package
+    let f = run("<?php\nnamespace {\n    class A {}\n}\nnamespace Foo {\n    class B {}\n}\n");
+    assert!(package(&f).is_empty(), "{:?}", f.bindings);
+    // the first block still wins when it is the named one
+    let f = run("<?php\nnamespace Foo {\n    class A {}\n}\nnamespace {\n    class B {}\n}\n");
+    assert_eq!(package(&f), ["Foo"]);
+    // declarations inside both kinds of block are still walked
+    let f = run("<?php\nnamespace {\n    use Lib\\X;\n    function f(X $x) {}\n}\nnamespace Foo {\n    function g(Y $y) {}\n}\n");
+    assert!(package(&f).is_empty(), "{:?}", f.bindings);
+    assert_eq!(imp(&f, "X").spec, "Lib\\X");
+    assert_eq!(bind(&f, "x").decl_type, "X");
+    assert_eq!(bind(&f, "y").decl_type, "Y");
+}
+
+#[test]
+fn deeply_nested_blocks() {
+    let depth = 2000;
+    let mut src = String::from("<?php\nfunction deep(Foo $top) {\n");
+    for i in 0..depth {
+        src.push_str(&format!("if (1) {{ $v{i} = new Foo();\n"));
+    }
+    for _ in 0..depth {
+        src.push('}');
+    }
+    src.push_str("\n}\nfunction after(Bar $b) {}\n");
+    // run on a thread with a modest stack: the walker must bound its recursion
+    let f = std::thread::Builder::new().stack_size(2 << 20).spawn(move || run(&src)).unwrap().join().unwrap();
+    let top = bind(&f, "top");
+    assert_eq!((top.kind, top.decl_type.as_str()), (BindKind::Param, "Foo"));
+    let v0 = bind(&f, "v0");
+    assert_eq!((v0.kind, v0.decl_type.as_str()), (BindKind::Local, "Foo"));
+    // facts after the deep region are still produced
+    let b = bind(&f, "b");
+    assert_eq!((b.kind, b.decl_type.as_str()), (BindKind::Param, "Bar"));
+    assert_eq!(kind_of(&f, b.scope), ScopeKind::Function);
+    // the deepest declarations are skipped, not crashed on
+    assert!(binds(&f, &format!("v{}", depth - 1)).is_empty());
+}
+
+#[test]
+fn deeply_nested_expressions() {
+    let mut src = String::from("<?php\nfunction f() {\n    $x = ");
+    src.push_str(&"(".repeat(3000));
+    src.push_str("new Foo()");
+    src.push_str(&")".repeat(3000));
+    src.push_str(";\n    ");
+    src.push_str(&"[".repeat(1500));
+    src.push_str("$a");
+    src.push_str(&"]".repeat(1500));
+    src.push_str(" = $x;\n    $after = new Bar();\n}\n");
+    let f = std::thread::Builder::new().stack_size(2 << 20).spawn(move || run(&src)).unwrap().join().unwrap();
+    assert_eq!(bind(&f, "x").kind, BindKind::Local);
+    assert_eq!(bind(&f, "after").decl_type, "Bar");
 }

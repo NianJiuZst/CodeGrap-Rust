@@ -102,7 +102,7 @@ pub fn parse_shape(name: &str) -> Shape<'_> {
 /// * whitespace around member operators (`a\n  .b`) is dropped;
 /// * null-conditional / forced access (`a?.b`, `a!.b`) and `->` become `.`;
 /// * PHP: `parent::m` -> `super.m`, `self::m` / `static::m` -> `this.m`, `$f` -> `f`,
-///   `\Ns\Klass::m` -> `Klass::m` (the namespace is resolved through `use` imports);
+///   `\Ns\Klass::m` -> `Ns\Klass::m` (a namespaced root is resolved as written);
 /// * C#: `base.M` -> `super.M`, verbatim identifiers `@x` -> `x`;
 /// * Ruby: `@x.m` -> `self.@x.m`, `self.class.m` -> `self.m`, `::Foo.m` -> `Foo.m`;
 /// * C/C++: a trailing arity marker (`Foo::Foo/0`) is dropped.
@@ -147,12 +147,11 @@ pub fn normalize_call_name(family: LangFamily, name: &str) -> Cow<'_, str> {
                 }
             }
             if s.contains('\\') {
-                // drop the namespace of the first segment only: `\A\B::m` -> `B::m`
-                let head_end = s.find(['.', '(']).unwrap_or(s.len());
-                let head = &s[..head_end];
-                let cut = head.find("::").map(|i| &head[..i]).unwrap_or(head).rfind('\\');
-                if let Some(i) = cut {
-                    s = Cow::Owned(s[i + 1..].to_owned());
+                // absolute and `namespace\`-relative names keep their namespace
+                let t = s.strip_prefix('\\').unwrap_or(&s);
+                let t = t.strip_prefix("namespace\\").unwrap_or(t);
+                if t.len() != s.len() {
+                    s = Cow::Owned(t.to_owned());
                 }
             }
             if let Some(rest) = s.strip_prefix('$') {
@@ -250,8 +249,10 @@ mod tests {
         assert_eq!(n(LangFamily::Php, "this->repo.find"), "this.repo.find");
         assert_eq!(n(LangFamily::Php, "parent::__construct"), "super.__construct");
         assert_eq!(n(LangFamily::Php, "static::create"), "this.create");
-        assert_eq!(n(LangFamily::Php, "\\FastRoute\\simpleDispatcher"), "simpleDispatcher");
-        assert_eq!(n(LangFamily::Php, "\\App\\Models\\User::find"), "User::find");
+        assert_eq!(n(LangFamily::Php, "\\FastRoute\\simpleDispatcher"), "FastRoute\\simpleDispatcher");
+        assert_eq!(n(LangFamily::Php, "\\App\\Models\\User::find"), "App\\Models\\User::find");
+        assert_eq!(n(LangFamily::Php, "namespace\\Sub\\helper"), "Sub\\helper");
+        assert_eq!(n(LangFamily::C, "::util::log"), "::util::log");
         assert_eq!(n(LangFamily::Php, "$callback"), "callback");
         assert_eq!(n(LangFamily::CSharp, "svc\n        ?.Run"), "svc.Run");
         assert_eq!(n(LangFamily::CSharp, "base.Dispose"), "super.Dispose");

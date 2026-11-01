@@ -18,6 +18,13 @@
   tokens blanked. Node identities and positions of everything else are unchanged; the original
   text is used again if blanking introduces a syntax error. On Tokio this adds ~740 nodes and
   ~2,200 resolved call references.
+- Self-review fixes: depth bounds (iterative helpers) in the five extractors; deterministic
+  tie-breaking for cross-file members and qualified names; C++ `::a::f` / `::f()` resolved in the
+  global namespace only (no self-links from `test::open` wrappers), `::std::..` as builtin, and
+  unqualified `get`/`swap`/`move`/.. in C++ files as standard functions; PHP `parent::__construct()`
+  and namespaced names; Ruby single-segment `require` limited to load-path roots; an explicit Swift
+  standard-type list with nested-type shadowing; Objective-C headers recorded as file nodes; the
+  `cfg_*!` pre-pass only blanks closed wrappers and only when it does not add syntax errors.
 - Fix `file_node_only` building a node row 8 bytes larger than the kernel ABI row (a debug
   assertion panic on any kernel failure in debug/test builds).
 - **Engine rules version 5**: indexes built by an older engine are rebuilt on the next sync.

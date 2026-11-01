@@ -329,3 +329,170 @@ fn synthesised_edges_for_dynamic_dispatch() {
     assert!(has("g/g.go::En -implements-> g/g.go::Greeter"), "go-implements: {edges:#?}");
     assert!(has("g/g.go::Greeter::Greet -calls-> g/g.go::En::Greet"), "go interface-impl: {edges:#?}");
 }
+
+fn edges_of(view: &View) -> Vec<String> {
+    let mut edges = dump::dump_edges(view);
+    edges.dedup();
+    for e in &edges {
+        eprintln!("{e}");
+    }
+    edges
+}
+
+#[test]
+fn php_parent_calls_namespaces_and_qualified_names() {
+    let (_d, view) = project(&[
+        ("src/Base.php", "<?php\nnamespace App;\nclass Base {\n  public function __construct() {}\n  public function go() {}\n}\n"),
+        (
+            "src/Child.php",
+            "<?php\nnamespace App;\nclass Child extends Base {\n  public function __construct() { parent::__construct(); }\n  public function go() { parent::go(); $this->run(); }\n  public function run() {}\n}\n",
+        ),
+        ("src/Logger.php", "<?php\nnamespace App;\nclass Logger {\n  public static function make() {}\n}\n"),
+        ("src/Http/Svc.php", "<?php\nnamespace App\\Http;\nclass Svc {\n  public function run() { \\Vendor\\Lib\\Logger::make(); }\n}\n"),
+        ("src/Http/Other.php", "<?php\nnamespace App\\Http;\nuse App\\Logger;\nclass Other {\n  public function run() { \\App\\Logger::make(); Logger::make(); }\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/Child.php::App::Child -extends-> src/Base.php::App::Base"));
+    assert!(has(&edges, "src/Child.php::App::Child::__construct -calls-> src/Base.php::App::Base::__construct"), "parent::__construct()");
+    assert!(!has(&edges, "src/Child.php::App::Child::__construct -calls-> src/Child.php::App::Child::__construct"), "no self-loop constructor");
+    assert!(has(&edges, "src/Child.php::App::Child::go -calls-> src/Base.php::App::Base::go"), "parent::go() from go()");
+    assert!(!has(&edges, "src/Child.php::App::Child::go -calls-> src/Child.php::App::Child::go"), "bare go inside go is parent::go, not recursion");
+    assert!(has(&edges, "src/Child.php::App::Child::go -calls-> src/Child.php::App::Child::run"), "$this->run()");
+    assert!(!edges.iter().any(|e| e.starts_with("src/Http/Svc.php::App\\Http::Svc::run -calls->")), "a vendor class is not a project class: {edges:?}");
+    assert!(
+        has(&edges, "src/Http/Other.php::App\\Http::Other::run -calls-> src/Logger.php::App::Logger::make"),
+        "\\App\\Logger::make() and the imported Logger"
+    );
+}
+
+#[test]
+fn csharp_namespaces_partial_classes_and_determinism() {
+    let files: &[(&str, &str)] = &[
+        ("src/Util1.cs", "namespace A {\n  public partial class Util {\n    public static void Go() {}\n  }\n}\n"),
+        ("src/Util2.cs", "namespace A {\n  public partial class Util {\n    public static void Stop() { Go(); }\n  }\n}\n"),
+        ("src/Helper.cs", "namespace A {\n  public class Helper {\n    public void Help() {}\n  }\n}\n"),
+        (
+            "src/Sub/User.cs",
+            "namespace A.B {\n  public class User {\n    public void Run() {\n      Util.Go();\n      var h = new Helper();\n      h.Help();\n    }\n  }\n}\n",
+        ),
+    ];
+    let (_d, view) = project(files);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/Util2.cs::A::Util::Stop -calls-> src/Util1.cs::A::Util::Go"), "member of the other partial declaration");
+    assert!(has(&edges, "src/Sub/User.cs::A.B::User::Run -calls-> src/Util1.cs::A::Util::Go"), "type of the enclosing namespace without a using");
+    assert!(has(&edges, "src/Sub/User.cs::A.B::User::Run -instantiates-> src/Helper.cs::A::Helper"));
+    assert!(has(&edges, "src/Sub/User.cs::A.B::User::Run -calls-> src/Helper.cs::A::Helper::Help"));
+    // the pick among cross-file candidates must not depend on scheduling
+    let dir = tempfile::tempdir().unwrap();
+    for (p, c) in files {
+        let path = dir.path().join(p);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, c).unwrap();
+    }
+    let a = build_seg(dir.path(), &IndexOptions { threads: Some(1), ..Default::default() }).unwrap();
+    let b = build_seg(dir.path(), &IndexOptions { threads: Some(4), ..Default::default() }).unwrap();
+    assert_eq!(a.seg.to_bytes(), b.seg.to_bytes());
+}
+
+#[test]
+fn cpp_namespace_order_and_out_of_line_members() {
+    let (_d, view) = project(&[
+        (
+            "src/a.cpp",
+            "namespace util { void log(int) {} }\nnamespace app {\n  namespace util { void log(int) {} }\n  struct S { void run(); };\n}\nvoid app::S::run() { util::log(1); ::util::log(2); }\n",
+        ),
+        ("src/foo.h", "struct Foo {\n  void bar();\n  void baz();\n};\n"),
+        ("src/foo.cpp", "#include \"foo.h\"\nvoid Foo::bar() {}\nvoid Foo::baz() { bar(); }\n"),
+        ("src/use.cpp", "#include \"foo.h\"\nvoid g() { Foo f; f.bar(); }\n"),
+        ("src/other/foo2.h", "struct Foo {\n  void bar();\n};\n"),
+        ("src/other/foo2.cpp", "#include \"foo2.h\"\nvoid Foo::bar() {}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/a.cpp::app::S::run -calls-> src/a.cpp::app::util::log"), "innermost namespace first");
+    assert!(has(&edges, "src/a.cpp::app::S::run -calls-> src/a.cpp::util::log"), "::util::log is absolute");
+    assert!(has(&edges, "src/foo.cpp -imports-> src/foo.h"));
+    assert!(has(&edges, "src/use.cpp::g -calls-> src/foo.cpp::Foo::bar"), "out-of-line definition in the file that includes the header");
+    assert!(!has(&edges, "src/use.cpp::g -calls-> src/other/foo2.cpp::Foo::bar"), "an unrelated Foo");
+}
+
+#[test]
+fn cpp_declarations_definitions_and_unknown_namespaces() {
+    let (_d, view) = project(&[
+        ("include/lib/core.h", "namespace lib { namespace detail { void vprint(int); } }\n"),
+        ("src/core.cc", "#include \"lib/core.h\"\nnamespace lib { namespace detail { void vprint(int) {} } }\n"),
+        ("src/app.cc", "#include \"lib/core.h\"\nnamespace lib { void print() { detail::vprint(1); } }\n"),
+        ("src/abort.cc", "struct Death { void Abort() {} };\nvoid g() { posix::Abort(); }\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(
+        edges.iter().any(|e| e.starts_with("src/app.cc::lib::print -calls-> ") && e.ends_with("::lib::detail::vprint")),
+        "a function declared in one file and defined in another resolves: {edges:?}"
+    );
+    assert!(!has(&edges, "src/abort.cc::g -calls-> src/abort.cc::Death::Abort"), "an unknown namespace is not a unique-name guess");
+}
+
+#[test]
+fn cpp_global_namespace_and_standard_free_functions() {
+    let (_d, view) = project(&[
+        ("test/util.h", "inline int helper() { return 1; }\n"),
+        ("test/mock.cc", "#include \"util.h\"\nnamespace test { int open(const char* p); }\nint test::open(const char* p) {\n  return ::open(p);\n}\nvoid use() {\n  ::helper();\n  auto s = ::std::string(\"x\");\n}\n"),
+        ("test/ranges.cc", "template <int N> int get(int t) { return t; }\n"),
+        ("test/other.cc", "struct File { int get() { return 0; } };\nvoid run() {\n  get();\n}\n"),
+        ("test/old.c", "int max(int a, int b) { return a > b ? a : b; }\n"),
+        ("test/use.c", "int pick(int a, int b) { return max(a, b); }\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(
+        !edges.iter().any(|e| e.starts_with("test/mock.cc::test::open -calls-> ")),
+        "::open is the global POSIX function, not the wrapper itself: {edges:?}"
+    );
+    assert!(has(&edges, "test/mock.cc::use -calls-> test/util.h::helper"), "::helper() declared in an included header: {edges:?}");
+    assert!(!edges.iter().any(|e| e.starts_with("test/mock.cc::use -") && e.contains("string")), "::std::string is the standard library: {edges:?}");
+    assert!(!has(&edges, "test/other.cc::run -calls-> test/ranges.cc::get"), "an unqualified get() in C++ is not another file's template: {edges:?}");
+    assert!(has(&edges, "test/use.c::pick -calls-> test/old.c::max"), "C keeps project functions named like std ones: {edges:?}");
+}
+
+#[test]
+fn ruby_requires_and_module_methods() {
+    let (_d, view) = project(&[
+        ("lib/mygem.rb", "require 'set'\nrequire 'logger'\nrequire_relative 'mygem/util'\nrequire 'mygem/set'\n"),
+        ("lib/mygem/util.rb", "module Mygem\n  module Util\n    def self.helper\n    end\n  end\nend\n"),
+        ("lib/mygem/set.rb", "module Mygem\n  class Set\n  end\nend\n"),
+        ("lib/mygem/logger.rb", "module Mygem\n  class Logger\n  end\nend\n"),
+        ("lib/app.rb", "require_relative 'mygem/util'\nclass App\n  def run\n    Mygem::Util.helper\n  end\nend\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "lib/mygem.rb -imports-> lib/mygem/util.rb"), "require_relative");
+    assert!(has(&edges, "lib/mygem.rb -imports-> lib/mygem/set.rb"), "require 'mygem/set'");
+    assert!(!has(&edges, "lib/mygem.rb -imports-> lib/mygem/logger.rb"), "require 'logger' is the standard library, not lib/mygem/logger.rb");
+    assert!(has(&edges, "lib/app.rb::App::run -calls-> lib/mygem/util.rb::Mygem::Util::helper"));
+}
+
+#[test]
+fn swift_standard_types_versus_project_types() {
+    let (_d, view) = project(&[
+        ("Sources/App/Task.swift", "struct Task {\n  let title: String\n}\n"),
+        ("Sources/App/Ext.swift", "import Foundation\nextension Data {\n  func asString() -> String { \"\" }\n}\n"),
+        ("Sources/App/Res.swift", "extension Result {\n  var isSuccess: Bool { false }\n}\n"),
+        ("Sources/App/Monitor.swift", "struct PathMonitor {\n  enum Result {\n    case ok\n  }\n  func check() {\n    let r = Result.ok\n    _ = r\n  }\n}\nstruct Throwing {\n  struct Error: Swift.Error {}\n  func fail() throws {\n    throw Error()\n  }\n}\n"),
+        ("Sources/App/Main.swift", "import Foundation\nfunc make() {\n  let t = Task(title: \"x\")\n  let d = Data()\n  d.asString()\n  let r = Result { try load() }\n  _ = (t, r)\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(
+        edges.iter().any(|e| e.starts_with("Sources/App/Main.swift::make -") && e.ends_with("-> Sources/App/Task.swift::Task")),
+        "a project struct named like a standard type is still the project's: {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.starts_with("Sources/App/Main.swift::make -") && e.ends_with("-> Sources/App/Ext.swift::Data")),
+        "Data() is Foundation's, not the extension"
+    );
+    assert!(
+        !edges.iter().any(|e| e.starts_with("Sources/App/Main.swift::make -") && e.ends_with("-> Sources/App/Res.swift::Result")),
+        "Result {{ .. }} is the standard library's init(catching:), not the extension, even with a nested enum Result elsewhere: {edges:?}"
+    );
+    assert!(
+        has(&edges, "Sources/App/Monitor.swift::Throwing::fail -instantiates-> Sources/App/Monitor.swift::Throwing::Error"),
+        "a nested type shadows the standard type inside its enclosing declaration: {edges:?}"
+    );
+    assert!(has(&edges, "Sources/App/Main.swift::make -calls-> Sources/App/Ext.swift::Data::asString"), "members added by the extension are reachable");
+}

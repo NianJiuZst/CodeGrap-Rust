@@ -32,6 +32,16 @@ fn info<'a>(f: &'a Facts, name: &str) -> (BindKind, &'a str, &'a str) {
     (b.kind, b.decl_type.as_str(), b.init_ctor.as_str())
 }
 
+/// (kind, decl_type, init_ctor, line) of every binding `name`, in order.
+fn infos<'a>(f: &'a Facts, name: &str) -> Vec<(BindKind, &'a str, &'a str, u32)> {
+    binds(f, name).into_iter().map(|b| (b.kind, b.decl_type.as_str(), b.init_ctor.as_str(), b.line)).collect()
+}
+
+/// Run on a thread with a modest stack: the walker must bound its own recursion.
+fn run_small_stack(src: String) -> Facts {
+    std::thread::Builder::new().stack_size(2 << 20).spawn(move || run(&src)).unwrap().join().unwrap()
+}
+
 fn scope_kind(f: &Facts, scope: u32) -> ScopeKind {
     f.scopes[scope as usize].kind
 }
@@ -296,24 +306,64 @@ fn local_binding_line_is_the_name_line() {
 }
 
 #[test]
-fn only_first_assignment_binds() {
+fn typed_reassignment_adds_a_binding_at_its_line() {
+    use BindKind::*;
     let f = run(r#"def a
   x = Foo.new
   x = Bar.new
-  x ||= Baz.new
+  x ||= Svc.create(1)
+  x.run
 end
-def b(p)
-  x = Bar.new
+def b
+  y = nil
+  y = compute
+  y = Foo.new
+  y.run
+end
+def c(p)
   p = Foo.new
 end
+def d
+  x = Bar.new
+end
 "#);
+    // the resolver takes the latest binding before a use, so `x.run` on line 5 sees `Svc.create()`
+    // and `y.run` on line 11 sees `Foo`
     let xs = binds(&f, "x");
-    assert_eq!(xs.len(), 2, "one per method: {xs:?}");
-    assert_eq!((xs[0].decl_type.as_str(), xs[0].line), ("Foo", 2));
-    assert_eq!((xs[1].decl_type.as_str(), xs[1].line), ("Bar", 7));
-    assert_ne!(xs[0].scope, xs[1].scope);
-    // reassigning a parameter does not create a second variable
-    assert_eq!(info(&f, "p"), (BindKind::Param, "", ""));
+    assert_eq!(infos(&f, "x"), [(Local, "Foo", "", 2), (Local, "Bar", "", 3), (Local, "", "Svc.create()", 4), (Local, "Bar", "", 17)]);
+    assert_eq!(xs[0].scope, xs[2].scope);
+    assert_ne!(xs[0].scope, xs[3].scope, "one variable per method");
+    // the untyped first assignment still creates the variable; `y = compute` adds nothing
+    assert_eq!(infos(&f, "y"), [(Local, "", "", 8), (Local, "Foo", "", 10)]);
+    // a parameter re-assigned with evidence gets a typed binding from that line on
+    let ps = binds(&f, "p");
+    assert_eq!(infos(&f, "p"), [(Param, "", "", 13), (Local, "Foo", "", 14)]);
+    assert_eq!(ps[0].scope, ps[1].scope);
+}
+
+#[test]
+fn untyped_reassignment_and_block_assignment_to_outer_variable_add_nothing() {
+    let f = run(r#"def m
+  x = Foo.new
+  x = compute
+  x = 1
+  x = [Bar.new]
+  x, y = Bar.new, Baz.new
+  x += 1
+  items.each do |i|
+    x = Bar.new
+    x = make(1)
+    x ||= Qux.new
+    [1].map { x = Other.new }
+  end
+  for x in xs do end
+  x = nil
+end
+"#);
+    // the block assignments change the method's `x`, not a variable of the block
+    assert_eq!(info(&f, "x"), (BindKind::Local, "Foo", ""));
+    assert_eq!(bind(&f, "x").line, 2);
+    assert_eq!(info(&f, "y"), (BindKind::Local, "", ""));
 }
 
 #[test]
@@ -329,12 +379,61 @@ fn blocks_close_over_outer_locals() {
 end
 "#);
     assert_eq!(info(&f, "x"), (BindKind::Local, "Foo", ""));
-    assert_eq!(info(&f, "i"), (BindKind::Param, "", ""));
+    // the block's own `i` is re-bound with a type inside the block
+    let is = binds(&f, "i");
+    assert_eq!(infos(&f, "i"), [(BindKind::Param, "", "", 3), (BindKind::Local, "Qux", "", 6)]);
+    assert_eq!(is[0].scope, is[1].scope);
     let ys = binds(&f, "y");
     assert_eq!(ys.len(), 2, "block-local y and method-local y are distinct: {ys:?}");
     assert_eq!(ys[0].decl_type, "Baz");
     assert_eq!(f.scopes[ys[0].scope as usize].parent, ys[1].scope);
     assert_eq!(ys[1].decl_type, "Other");
+}
+
+#[test]
+fn block_and_lambda_params_shadow_outer_variables() {
+    use BindKind::*;
+    let f = run(r#"def m
+  i = Foo.new
+  items.each { |i| i.bar }
+  l = ->(i) { i }
+  xs.each { |a; i| i }
+  pairs.each { |(i, j)| i }
+  items.each { i = Bar.new }
+  ys.each { |a, a| a }
+end
+"#);
+    // the method's `i`, then one fresh untyped variable per block / lambda that names it;
+    // the plain assignment on line 7 is to the method's `i` and adds nothing
+    let is = binds(&f, "i");
+    assert_eq!(infos(&f, "i"), [(Local, "Foo", "", 2), (Param, "", "", 3), (Param, "", "", 4), (Local, "", "", 5), (Param, "", "", 6)]);
+    assert_eq!(is[0].scope, 1);
+    for b in &is[1..] {
+        assert_ne!(b.scope, 1, "{b:?}");
+        assert_eq!(f.scopes[b.scope as usize].parent, 1, "{b:?}");
+    }
+    assert!(is.iter().map(|b| b.scope).collect::<std::collections::HashSet<_>>().len() == is.len(), "one scope each: {is:?}");
+    // a name repeated in one parameter list binds once
+    assert_eq!(infos(&f, "a"), [(Param, "", "", 5), (Param, "", "", 8)]);
+}
+
+#[test]
+fn block_params_shadow_file_and_class_locals() {
+    let f = run(r#"i = Foo.new
+items.each { |i| i.bar }
+class C
+  i = Bar.new
+  items.each { |i| i.bar }
+  def m(i)
+    i.baz
+  end
+end
+"#);
+    let is = infos(&f, "i");
+    assert_eq!(is.len(), 5, "{is:?}");
+    assert_eq!(is[1], (BindKind::Param, "", "", 2));
+    assert_eq!(is[3], (BindKind::Param, "", "", 5));
+    assert_eq!(is[4], (BindKind::Param, "", "", 6));
 }
 
 #[test]
@@ -384,6 +483,9 @@ fn rescue_binds_exception_variable() {
   rescue ::Top => e3
   rescue => e4
   rescue Other => e
+  rescue *LIST => e5
+  rescue Foo::Bar => e6
+  rescue Foo, Bar => @e7
   end
 end
 def n
@@ -391,11 +493,15 @@ def n
 rescue Err => err
 end
 "#);
-    assert_eq!(info(&f, "e"), (BindKind::Local, "Foo", ""));
-    assert_eq!(bind(&f, "e").line, 4);
-    assert_eq!(info(&f, "e2"), (BindKind::Local, "Foo::Bar", ""));
+    // a second `rescue` re-binds `e` with its own class from that line on
+    assert_eq!(infos(&f, "e"), [(BindKind::Local, "Foo", "", 4), (BindKind::Local, "Other", "", 8)]);
+    // several exception classes are ambiguous: the variable gets no type
+    assert_eq!(info(&f, "e2"), (BindKind::Local, "", ""));
     assert_eq!(info(&f, "e3"), (BindKind::Local, "Top", ""));
     assert_eq!(info(&f, "e4"), (BindKind::Local, "", ""));
+    assert_eq!(info(&f, "e5"), (BindKind::Local, "", ""), "a splat is not a class");
+    assert_eq!(info(&f, "e6"), (BindKind::Local, "Foo::Bar", ""));
+    no_bind(&f, "@e7");
     assert_eq!(info(&f, "err"), (BindKind::Local, "Err", ""));
     assert_eq!(scope_kind(&f, bind(&f, "err").scope), ScopeKind::Function);
 }
@@ -455,7 +561,7 @@ end
 }
 
 #[test]
-fn first_instance_variable_assignment_wins_per_class() {
+fn one_instance_variable_binding_per_class() {
     let f = run(r#"class A
   def x; @v = nil; end
   def y; @v = Foo.new; end
@@ -466,9 +572,58 @@ end
 "#);
     let vs = binds(&f, "@v");
     assert_eq!(vs.len(), 2, "{vs:?}");
-    assert_eq!((vs[0].decl_type.as_str(), vs[0].line), ("", 2));
+    // the binding stays at the first assignment; the later one supplies the type it lacked
+    assert_eq!((vs[0].decl_type.as_str(), vs[0].line), ("Foo", 2));
     assert_eq!((vs[1].decl_type.as_str(), vs[1].line), ("Bar", 6));
     assert_ne!(vs[0].scope, vs[1].scope);
+}
+
+#[test]
+fn later_evidence_fills_an_untyped_field_once() {
+    let f = run(r#"class Service
+  attr_reader :cache, :v
+  def initialize
+    @v = nil
+    @w = Repo.new
+    @u = compute
+    @cache = nil
+    @@n = 0
+  end
+  def setup
+    @v = Foo.new
+    @w = Other.new
+    @u = build(1)
+    @v = Bar.new
+    items.each { @cache = Cache.new }
+    @@n = Counter.new
+    @u = Third.new
+  end
+end
+class Other
+  def setup
+    @w = nil
+  end
+end
+"#);
+    let v = bind(&f, "@v");
+    assert_eq!(
+        (v.kind, v.decl_type.as_str(), v.init_ctor.as_str(), v.line),
+        (BindKind::Field, "Foo", "", 4),
+        "first evidence fills the binding, later evidence does not replace it"
+    );
+    let u = bind(&f, "@u");
+    assert_eq!((u.decl_type.as_str(), u.init_ctor.as_str(), u.line), ("", "build()", 6), "a call path is evidence too");
+    let c = bind(&f, "@cache");
+    assert_eq!((c.decl_type.as_str(), c.line), ("Cache", 7), "attr_reader adds no second binding");
+    assert_eq!(info(&f, "@@n"), (BindKind::Field, "Counter", ""));
+    // a typed binding keeps its type; the fill-in is per class, so `Other` has its own untyped `@w`
+    let ws = binds(&f, "@w");
+    assert_eq!(infos(&f, "@w"), [(BindKind::Field, "Repo", "", 5), (BindKind::Field, "", "", 22)]);
+    assert_eq!((ws[0].scope, scope_kind(&f, ws[1].scope)), (1, ScopeKind::Class));
+    assert_ne!(ws[0].scope, ws[1].scope);
+    // ... in either order
+    let f2 = run("class Other\n  def setup\n    @w = nil\n  end\nend\nclass Service\n  def setup\n    @w = Repo.new\n  end\nend\n");
+    assert_eq!(infos(&f2, "@w"), [(BindKind::Field, "", "", 3), (BindKind::Field, "Repo", "", 8)]);
 }
 
 #[test]
@@ -559,8 +714,10 @@ end
 M::OTHER = 1
 FOO = Baz.new
 "#);
-    let foo = bind(&f, "FOO");
-    assert_eq!((foo.kind, foo.decl_type.as_str(), foo.scope, foo.line), (BindKind::Local, "Bar", 0, 1));
+    // a constant re-assigned with evidence is re-bound like a local
+    let foos = binds(&f, "FOO");
+    assert_eq!(infos(&f, "FOO"), [(BindKind::Local, "Bar", "", 1), (BindKind::Local, "Baz", "", 11)]);
+    assert_eq!((foos[0].scope, foos[1].scope), (0, 0));
     let limit = bind(&f, "LIMIT");
     assert_eq!((limit.kind, limit.decl_type.as_str(), limit.scope), (BindKind::Local, "Limit::Max", 1));
     assert_eq!(info(&f, "NAME"), (BindKind::Local, "", ""));
@@ -636,7 +793,9 @@ fn partial_file_still_yields_facts() {
 
 #[test]
 fn deeply_nested_blocks() {
-    let depth = 200;
+    // each block level is three tree levels (call, do_block, body); 100 stay within the
+    // walker's recursion bound
+    let depth = 100;
     let mut src = String::new();
     for i in 0..depth {
         src.push_str(&format!("a.each do |v{i}|\n"));
@@ -649,4 +808,54 @@ fn deeply_nested_blocks() {
     assert_eq!(f.scopes.len(), depth + 1);
     assert_eq!(info(&f, "x"), (BindKind::Local, "Foo", ""));
     assert_eq!(bind(&f, "x").scope, depth as u32);
+}
+
+#[test]
+fn extreme_expression_nesting_is_skipped_not_fatal() {
+    // 5000 nested parentheses: the walker and the value unwrapping both stop at their bounds
+    let mut src = String::from("require 'before'\ndef m\n  x = ");
+    src.push_str(&"(".repeat(5000));
+    src.push('1');
+    src.push_str(&")".repeat(5000));
+    src.push_str("\n  y = Foo.new\nend\ndef after(p)\n  z = Bar.new\nend\n");
+    let f = run_small_stack(src);
+    assert_eq!(specs(&f), ["before"]);
+    assert_eq!(info(&f, "x"), (BindKind::Local, "", ""));
+    assert_eq!(bind(&f, "x").line, 3);
+    assert_eq!(info(&f, "y"), (BindKind::Local, "Foo", ""));
+    assert_eq!(info(&f, "p"), (BindKind::Param, "", ""));
+    assert_eq!(info(&f, "z"), (BindKind::Local, "Bar", ""));
+    // a constant path too long to be evidence is dropped, not recursed into
+    let mut src = String::from("def m\n  x = ");
+    src.push_str(&"A::".repeat(3000));
+    src.push_str("B.new\n  y = Foo.new\nend\n");
+    let f = run_small_stack(src);
+    assert_eq!(info(&f, "x"), (BindKind::Local, "", ""));
+    assert_eq!(info(&f, "y"), (BindKind::Local, "Foo", ""));
+}
+
+#[test]
+fn extreme_block_nesting_is_skipped_not_fatal() {
+    let depth = 4000;
+    let mut src = String::from("require 'before'\n");
+    for i in 0..depth {
+        src.push_str(&format!("a.each do |v{i}|\n"));
+    }
+    src.push_str("x = Foo.new\n");
+    for _ in 0..depth {
+        src.push_str("end\n");
+    }
+    src.push_str("def after(q)\n  z = Bar.new\nend\n");
+    let f = run_small_stack(src);
+    assert_eq!(specs(&f), ["before"]);
+    assert_eq!(info(&f, "v0"), (BindKind::Param, "", ""));
+    assert_eq!(bind(&f, "v0").scope, 1);
+    // the deepest blocks are skipped, not crashed on
+    no_bind(&f, &format!("v{}", depth - 1));
+    no_bind(&f, "x");
+    assert!(f.scopes.len() < depth, "{} scopes", f.scopes.len());
+    // what follows the deep region is still reported
+    assert_eq!(info(&f, "q"), (BindKind::Param, "", ""));
+    assert_eq!(info(&f, "z"), (BindKind::Local, "Bar", ""));
+    assert_eq!(f.scopes[bind(&f, "q").scope as usize].parent, 0);
 }

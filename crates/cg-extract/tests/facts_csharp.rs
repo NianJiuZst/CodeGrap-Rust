@@ -414,6 +414,78 @@ fn lambdas_anonymous_methods_and_local_functions() {
 }
 
 #[test]
+fn query_range_variables() {
+    let f = run(r#"class C
+{
+    void Run()
+    {
+        var joined = from x in xs
+                     join Bar y in ys on x.Id equals y.Id into g
+                     select g;
+        var plain = from a in xs
+                    join b in ys on a.Id equals b.Id
+                    select b;
+        var continued = from c in xs
+                        let n = c.Name
+                        select n into w
+                        where w != null
+                        select w;
+    }
+}
+"#);
+    assert_eq!(ty(&f, "x"), ("", ""));
+    assert_eq!(ty(&f, "y"), ("Bar", ""));
+    // a group join's `into g` is a `join_into_clause`, not a bare `into` token
+    assert_eq!((ty(&f, "g"), bind(&f, "g").line), (("", ""), 6));
+    assert_eq!(ty(&f, "b"), ("", ""));
+    assert_eq!(bind(&f, "n").line, 12);
+    assert_eq!(bind(&f, "w").line, 13);
+    for n in ["x", "y", "g", "a", "b", "c", "n", "w"] {
+        assert_eq!(bind(&f, n).kind, BindKind::Local, "{n}");
+    }
+    assert_eq!(f.bindings.iter().filter(|b| b.name == "g").count(), 1, "{:?}", f.bindings);
+}
+
+#[test]
+fn deeply_nested_blocks_and_expressions() {
+    let depth = 4000;
+    let mut src = String::from("class C\n{\n    void Deep(Foo top)\n    {\n");
+    for i in 0..depth {
+        src.push_str(&format!("{{ Foo v{i} = new Foo();\n"));
+    }
+    src.push_str(&"}".repeat(depth));
+    src.push_str("\n    }\n    void After(Bar b)\n    {\n        var x = ");
+    src.push_str(&"(".repeat(5000));
+    src.push('1');
+    src.push_str(&")".repeat(5000));
+    src.push_str(";\n        var y = ");
+    src.push_str(&"(".repeat(5000));
+    src.push_str("new Baz()");
+    src.push_str(&")".repeat(5000));
+    src.push_str(";\n        var (p, ");
+    src.push_str(&"(p, ".repeat(3000));
+    src.push_str("last");
+    src.push_str(&")".repeat(3000));
+    src.push_str(") = Pair();\n        Func<int, int> f = ");
+    src.push_str(&"a => ".repeat(3000));
+    src.push_str("a;\n        var z = new Qux();\n    }\n}\n");
+    // run on a thread with a modest stack: the walker must bound its recursion
+    let f = std::thread::Builder::new().stack_size(2 << 20).spawn(move || run(&src)).unwrap().join().unwrap();
+    assert_eq!(ty(&f, "top"), ("Foo", ""));
+    assert_eq!(ty(&f, "v0"), ("Foo", ""));
+    assert_eq!(ty(&f, "b"), ("Bar", ""));
+    assert_eq!(bind(&f, "x").kind, BindKind::Local);
+    // parentheses past the chain bound hide the constructor rather than crashing
+    assert_eq!(bind(&f, "y").kind, BindKind::Local);
+    assert_eq!(bind(&f, "f").kind, BindKind::Local);
+    assert_eq!(ty(&f, "z"), ("Qux", ""));
+    assert!(!f.bindings.iter().any(|b| b.name == format!("v{}", depth - 1)));
+    // the deepest designation is cut off, the outer ones are bound
+    assert!(f.bindings.iter().any(|b| b.name == "p"));
+    assert!(!f.bindings.iter().any(|b| b.name == "last"));
+}
+
+#[test]
 fn top_level_statements() {
     let f = run(r#"using System;
 var app = new App();

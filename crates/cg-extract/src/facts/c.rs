@@ -512,22 +512,31 @@ fn type_definition(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
 
 /// Qualified head of a named type: `const a::Foo<int>&` -> `a::Foo`, `struct node` -> `node`;
 /// empty for primitives, `auto`, `decltype(...)` and anything unnamed.
+///
+/// Wrapper chains (`typename typename ... T`) are unwrapped iteratively: this runs outside the
+/// depth-bounded walk (from parameters, declarations and call arguments), so it must not recurse.
 fn type_name(cx: &Cx, t: Node) -> String {
-    match t.kind() {
-        "type_identifier" | "identifier" | "namespace_identifier" => cx.text(t).to_owned(),
-        "qualified_identifier" | "template_type" | "nested_namespace_specifier" => path_text(cx.text(t)),
-        // `typename T::type`, a template argument / alias target `const Foo*`
-        "dependent_type" | "type_descriptor" => t
-            .child_by_field_name("type")
-            .or_else(|| kids(t).find(|c| c.is_named() && c.kind() != "type_qualifier"))
-            .map(|inner| type_name(cx, inner))
-            .unwrap_or_default(),
-        "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier" => {
-            t.child_by_field_name("name").map(|nm| path_text(cx.text(nm))).unwrap_or_default()
+    let mut t = t;
+    for _ in 0..MAX_CHAIN {
+        match t.kind() {
+            "type_identifier" | "identifier" | "namespace_identifier" => return cx.text(t).to_owned(),
+            "qualified_identifier" | "template_type" | "nested_namespace_specifier" => return path_text(cx.text(t)),
+            // `typename T::type`, a template argument / alias target `const Foo*`
+            "dependent_type" | "type_descriptor" => {
+                match t.child_by_field_name("type").or_else(|| kids(t).find(|c| c.is_named() && c.kind() != "type_qualifier")) {
+                    Some(inner) => t = inner,
+                    None => return String::new(),
+                }
+            }
+            "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier" => {
+                return t.child_by_field_name("name").map(|nm| path_text(cx.text(nm))).unwrap_or_default();
+            }
+            // primitive_type, sized_type_specifier, placeholder_type_specifier, decltype, macro types
+            _ => return String::new(),
         }
-        // primitive_type, sized_type_specifier, placeholder_type_specifier, decltype, macro types
-        _ => String::new(),
     }
+    // an absurdly long wrapper chain: no usable type
+    String::new()
 }
 
 /// `std :: vector < Foo > :: iterator` -> `std::vector::iterator`: drops template arguments,

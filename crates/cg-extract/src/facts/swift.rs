@@ -7,8 +7,13 @@
 use super::util::*;
 use super::*;
 
+/// Recursion bound: deeper subtrees are skipped rather than risking the stack.
+const MAX_DEPTH: u32 = 400;
+/// Bound for the descents through type wrapper and callee chains, which run outside the walk.
+const MAX_CHAIN: u32 = 64;
+
 pub fn extract(cx: &mut Cx, root: Node) {
-    walk(cx, root, 0);
+    walk(cx, root, 0, 0);
 }
 
 /// Children of `n` with their field names (anonymous tokens included).
@@ -34,32 +39,35 @@ fn is_comment(n: Node) -> bool {
     matches!(n.kind(), "comment" | "multiline_comment")
 }
 
-fn walk_children(cx: &mut Cx, n: Node, scope: u32) {
+fn walk_children(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
     for ch in kids(n) {
-        walk(cx, ch, scope);
+        walk(cx, ch, scope, depth + 1);
     }
 }
 
-fn walk(cx: &mut Cx, n: Node, scope: u32) {
+fn walk(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
+    if depth > MAX_DEPTH {
+        return;
+    }
     match n.kind() {
         "import_declaration" => import(cx, n),
         // class / struct / enum / actor / extension share `class_declaration`
         "class_declaration" | "protocol_declaration" => {
             let sc = cx.push_scope(ScopeKind::Class, scope, n);
-            walk_children(cx, n, sc);
+            walk_children(cx, n, sc, depth);
         }
-        "function_declaration" | "init_declaration" | "deinit_declaration" | "subscript_declaration" => function(cx, n, scope),
-        "lambda_literal" => lambda(cx, n, scope),
-        "property_declaration" | "protocol_property_declaration" => property(cx, n, scope),
-        "if_statement" | "guard_statement" | "while_statement" => conditional(cx, n, scope),
-        "for_statement" => for_in(cx, n, scope),
+        "function_declaration" | "init_declaration" | "deinit_declaration" | "subscript_declaration" => function(cx, n, scope, depth),
+        "lambda_literal" => lambda(cx, n, scope, depth),
+        "property_declaration" | "protocol_property_declaration" => property(cx, n, scope, depth),
+        "if_statement" | "guard_statement" | "while_statement" => conditional(cx, n, scope, depth),
+        "for_statement" => for_in(cx, n, scope, depth),
         // `case let .x(a)`, `case .x(let a)`, `catch let e`, `if case let ...`
         "pattern" => {
             let mut names = Vec::new();
-            pattern_names(cx, n, false, &mut names);
+            pattern_names(cx, n, false, &mut names, depth);
             add_locals(cx, scope, names, BindKind::Local);
         }
-        _ => walk_children(cx, n, scope),
+        _ => walk_children(cx, n, scope, depth),
     }
 }
 
@@ -104,6 +112,15 @@ fn import(cx: &mut Cx, n: Node) {
 /// Reduce a type node to a nominal name: optionals unwrapped, generics reduced to their head,
 /// `some P` / `any P` to `P`; collections, tuples, functions and metatypes give "".
 fn type_name(cx: &Cx, t: Node) -> String {
+    type_name_at(cx, t, 0)
+}
+
+/// `type_name` with the wrapper depth so far: `((((Foo))))` / `Foo????` chains are cut off
+/// rather than recursed through (this runs outside the depth-bounded walk).
+fn type_name_at(cx: &Cx, t: Node, depth: u32) -> String {
+    if depth > MAX_CHAIN {
+        return String::new();
+    }
     match t.kind() {
         "user_type" => {
             let parts: Vec<&str> = kids(t).filter(|c| c.kind() == "type_identifier").map(|c| cx.text(c)).collect();
@@ -115,14 +132,14 @@ fn type_name(cx: &Cx, t: Node) -> String {
                 // `Optional<Foo>` is `Foo?`
                 let args: Vec<Node> = first(t, "type_arguments").map(|a| kids(a).filter(|c| c.is_named() && !is_comment(*c)).collect()).unwrap_or_default();
                 return match args.as_slice() {
-                    [one] => type_name(cx, *one),
+                    [one] => type_name_at(cx, *one, depth + 1),
                     _ => String::new(),
                 };
             }
             name
         }
-        "optional_type" => t.child_by_field_name("wrapped").map(|w| type_name(cx, w)).unwrap_or_default(),
-        "opaque_type" | "existential_type" => kids(t).find(|c| c.is_named() && !is_comment(*c)).map(|c| type_name(cx, c)).unwrap_or_default(),
+        "optional_type" => t.child_by_field_name("wrapped").map(|w| type_name_at(cx, w, depth + 1)).unwrap_or_default(),
+        "opaque_type" | "existential_type" => kids(t).find(|c| c.is_named() && !is_comment(*c)).map(|c| type_name_at(cx, c, depth + 1)).unwrap_or_default(),
         // `(Foo)` is a parenthesized `Foo`
         "tuple_type" => {
             let items: Vec<Node> = kids(t).filter(|c| c.kind() == "tuple_type_item").collect();
@@ -130,7 +147,7 @@ fn type_name(cx: &Cx, t: Node) -> String {
                 [item] => {
                     let named: Vec<Node> = kids(*item).filter(|c| c.is_named() && !is_comment(*c)).collect();
                     match named.as_slice() {
-                        [one] => type_name(cx, *one),
+                        [one] => type_name_at(cx, *one, depth + 1),
                         _ => String::new(),
                     }
                 }
@@ -169,10 +186,14 @@ fn value_info(cx: &Cx, v: Node) -> (String, String) {
         let t = v.child_by_field_name("name").map(|t| type_name(cx, t)).unwrap_or_default();
         return (t, String::new());
     }
-    (String::new(), ctor(cx, v).unwrap_or_default())
+    (String::new(), ctor(cx, v, 0).unwrap_or_default())
 }
 
-fn ctor(cx: &Cx, v: Node) -> Option<String> {
+/// `depth` counts the nested calls unwrapped so far (`Foo { } { } ...` trailing closures).
+fn ctor(cx: &Cx, v: Node, depth: u32) -> Option<String> {
+    if depth > MAX_CHAIN {
+        return None;
+    }
     match v.kind() {
         "call_expression" => {
             let callee = v.named_child(0)?;
@@ -182,9 +203,9 @@ fn ctor(cx: &Cx, v: Node) -> Option<String> {
                 if first(suffix, "value_arguments").is_some() {
                     return None;
                 }
-                return ctor(cx, callee);
+                return ctor(cx, callee, depth + 1);
             }
-            let path = callee_path(cx, callee)?;
+            let path = callee_path(cx, callee, 0)?;
             let path = path.strip_suffix(".init").unwrap_or(&path);
             Some(format!("{path}()"))
         }
@@ -201,8 +222,12 @@ fn ctor(cx: &Cx, v: Node) -> Option<String> {
     }
 }
 
-/// Dotted path of a callee made only of identifiers (`Foo`, `Foo.make`, `self.x.build`).
-fn callee_path(cx: &Cx, n: Node) -> Option<String> {
+/// Dotted path of a callee made only of identifiers (`Foo`, `Foo.make`, `self.x.build`);
+/// `None` past `MAX_CHAIN` segments.
+fn callee_path(cx: &Cx, n: Node, depth: u32) -> Option<String> {
+    if depth > MAX_CHAIN {
+        return None;
+    }
     match n.kind() {
         "simple_identifier" => Some(cx.text(n).to_owned()),
         "self_expression" => Some("self".to_owned()),
@@ -213,7 +238,7 @@ fn callee_path(cx: &Cx, n: Node) -> Option<String> {
             if name.kind() != "simple_identifier" {
                 return None;
             }
-            Some(format!("{}.{}", callee_path(cx, target)?, cx.text(name)))
+            Some(format!("{}.{}", callee_path(cx, target, depth + 1)?, cx.text(name)))
         }
         _ => None,
     }
@@ -223,21 +248,29 @@ fn callee_path(cx: &Cx, n: Node) -> Option<String> {
 
 /// Names a pattern binds. `bind` is set inside a `let` / `var` context (declarations,
 /// `for` items, or after a `let` within a `case` pattern). `case let x as Foo` types `x`.
-fn pattern_names<'t>(cx: &Cx, p: Node<'t>, mut bind: bool, out: &mut Vec<(Node<'t>, String)>) {
+/// `depth` continues the walker's count: nested tuple patterns past `MAX_DEPTH` bind nothing.
+fn pattern_names<'t>(cx: &Cx, p: Node<'t>, mut bind: bool, out: &mut Vec<(Node<'t>, String)>, depth: u32) {
+    if depth > MAX_DEPTH {
+        return;
+    }
     let ch = fields(p);
     let named = ch.iter().filter(|(_, c)| c.is_named() && !is_comment(*c) && c.kind() != "value_binding_pattern").count();
     let start = out.len();
     let mut saw_as = false;
+    let mut after_dot = false;
     let mut cast: Option<String> = None;
     for (f, c) in &ch {
         match c.kind() {
             "value_binding_pattern" => bind = true,
+            // `.a` names an enum case (`for case .a in xs`, `case let .a:`, `case let .a?:`), not a binding
+            "simple_identifier" if after_dot => {}
             "simple_identifier" if *f == Some("bound_identifier") || (bind && named == 1) => out.push((*c, String::new())),
-            "pattern" => pattern_names(cx, *c, bind, out),
+            "pattern" => pattern_names(cx, *c, bind, out, depth + 1),
             "as" => saw_as = true,
             _ if saw_as && cast.is_none() && c.is_named() && !is_comment(*c) => cast = Some(type_name(cx, *c)),
             _ => {}
         }
+        after_dot = c.kind() == ".";
     }
     if let Some(t) = cast {
         if out.len() == start + 1 {
@@ -249,7 +282,7 @@ fn pattern_names<'t>(cx: &Cx, p: Node<'t>, mut bind: bool, out: &mut Vec<(Node<'
 // ---------------------------------------------------------------- declarations
 
 /// `let a: Foo = x, b = Foo()`, stored / computed / observed properties, protocol requirements.
-fn property(cx: &mut Cx, n: Node, scope: u32) {
+fn property(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
     let kind = binding_kind(cx, scope);
     let ch = fields(n);
     // one declarator per `name:` pattern; its type and value follow it
@@ -280,7 +313,7 @@ fn property(cx: &mut Cx, n: Node, scope: u32) {
     }
     for (pat, ty, init, _) in &decls {
         let mut names = Vec::new();
-        pattern_names(cx, *pat, true, &mut names);
+        pattern_names(cx, *pat, true, &mut names, depth);
         if let [(id, _)] = names.as_slice() {
             add_named(cx, scope, *id, kind, ty, init);
         } else {
@@ -303,46 +336,46 @@ fn property(cx: &mut Cx, n: Node, scope: u32) {
             "pattern" | "type_annotation" | "value_binding_pattern" => {}
             "computed_property" => {
                 let ty = decls.get(cur).map(|d| d.1.clone()).unwrap_or_default();
-                computed(cx, *c, scope, &ty, true);
+                computed(cx, *c, scope, &ty, true, depth);
             }
             "willset_didset_block" => {
                 let ty = decls.get(cur).map(|d| d.1.clone()).unwrap_or_default();
                 for cl in kids(*c) {
                     match cl.kind() {
-                        "willset_clause" => accessor(cx, cl, scope, &ty, Some("newValue")),
-                        "didset_clause" => accessor(cx, cl, scope, &ty, Some("oldValue")),
-                        _ => walk(cx, cl, scope),
+                        "willset_clause" => accessor(cx, cl, scope, &ty, Some("newValue"), depth),
+                        "didset_clause" => accessor(cx, cl, scope, &ty, Some("oldValue"), depth),
+                        _ => walk(cx, cl, scope, depth + 1),
                     }
                 }
             }
-            _ => walk(cx, *c, scope),
+            _ => walk(cx, *c, scope, depth + 1),
         }
     }
 }
 
 /// A computed property body: either bare statements (a getter) or explicit accessors.
 /// `own_scope` is false for a subscript body, which already has the subscript's scope.
-fn computed(cx: &mut Cx, cp: Node, scope: u32, ty: &str, own_scope: bool) {
+fn computed(cx: &mut Cx, cp: Node, scope: u32, ty: &str, own_scope: bool, depth: u32) {
     let has_accessors = kids(cp).any(|c| matches!(c.kind(), "computed_getter" | "computed_setter" | "computed_modify"));
     if has_accessors {
         for c in kids(cp) {
             match c.kind() {
-                "computed_getter" | "computed_modify" => accessor(cx, c, scope, ty, None),
-                "computed_setter" => accessor(cx, c, scope, ty, Some("newValue")),
-                _ => walk(cx, c, scope),
+                "computed_getter" | "computed_modify" => accessor(cx, c, scope, ty, None, depth),
+                "computed_setter" => accessor(cx, c, scope, ty, Some("newValue"), depth),
+                _ => walk(cx, c, scope, depth + 1),
             }
         }
     } else if own_scope {
         let sc = cx.push_scope(ScopeKind::Function, scope, cp);
-        walk_children(cx, cp, sc);
+        walk_children(cx, cp, sc, depth);
     } else {
-        walk_children(cx, cp, scope);
+        walk_children(cx, cp, scope, depth);
     }
 }
 
 /// `get { }`, `set(v) { }`, `willSet { }`, `didSet { }`: a function scope when it has a body.
 /// `implicit` names the parameter Swift provides when none is written.
-fn accessor(cx: &mut Cx, a: Node, scope: u32, ty: &str, implicit: Option<&str>) {
+fn accessor(cx: &mut Cx, a: Node, scope: u32, ty: &str, implicit: Option<&str>, depth: u32) {
     if !kids(a).any(|c| c.kind() == "{" || c.kind() == "statements") {
         return;
     }
@@ -358,13 +391,13 @@ fn accessor(cx: &mut Cx, a: Node, scope: u32, ty: &str, implicit: Option<&str>) 
     }
     for c in kids(a) {
         if c.kind() != "simple_identifier" {
-            walk(cx, c, sc);
+            walk(cx, c, sc, depth + 1);
         }
     }
 }
 
 /// `func`, `init`, `deinit`, `subscript`.
-fn function(cx: &mut Cx, n: Node, scope: u32) {
+fn function(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
     let ch = fields(n);
     if n.kind() == "function_declaration" && cx.facts.scopes[scope as usize].kind == ScopeKind::Function {
         if let Some((_, id)) = ch.iter().find(|(f, c)| *f == Some("name") && c.kind() == "simple_identifier") {
@@ -391,8 +424,8 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
     for (_, c) in &ch {
         match c.kind() {
             "parameter" => {}
-            "computed_property" => computed(cx, *c, sc, &ret, false),
-            _ => walk(cx, *c, sc),
+            "computed_property" => computed(cx, *c, sc, &ret, false, depth),
+            _ => walk(cx, *c, sc, depth + 1),
         }
     }
 }
@@ -410,7 +443,7 @@ fn param(cx: &mut Cx, p: Node, sc: u32) {
 }
 
 /// `{ (a: Foo, b) in ... }`, `{ a, b in ... }`, `{ [x = y] in ... }`; `$0` binds nothing.
-fn lambda(cx: &mut Cx, n: Node, scope: u32) {
+fn lambda(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
     let sc = cx.push_scope(ScopeKind::Function, scope, n);
     for c in kids(n) {
         match c.kind() {
@@ -429,10 +462,10 @@ fn lambda(cx: &mut Cx, n: Node, scope: u32) {
                         add_named(cx, sc, id, BindKind::Local, &ty, &init);
                     }
                     // captures are evaluated where the closure is written
-                    walk(cx, value, scope);
+                    walk(cx, value, scope, depth + 1);
                 }
             }
-            _ => walk(cx, c, sc),
+            _ => walk(cx, c, sc, depth + 1),
         }
     }
 }
@@ -442,7 +475,7 @@ fn lambda(cx: &mut Cx, n: Node, scope: u32) {
 /// `if let x = y`, `if let x`, `guard let x: Foo = y else`, `while let x = it.next()`,
 /// `if case .some(let x) = y`, `if case let .some(x) = y`. The grammar flattens each
 /// condition into the statement, so a leading `let` / `var` applies to the next pattern.
-fn conditional(cx: &mut Cx, n: Node, scope: u32) {
+fn conditional(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
     let ch = fields(n);
     let mut let_ctx = false;
     for (i, (f, c)) in ch.iter().enumerate() {
@@ -454,14 +487,14 @@ fn conditional(cx: &mut Cx, n: Node, scope: u32) {
             "," => let_ctx = false,
             "pattern" => {
                 let mut names = Vec::new();
-                pattern_names(cx, *c, let_ctx, &mut names);
+                pattern_names(cx, *c, let_ctx, &mut names, depth);
                 add_locals(cx, scope, names, BindKind::Local);
                 continue;
             }
             _ => {}
         }
         if *f != Some("bound_identifier") {
-            walk(cx, *c, scope);
+            walk(cx, *c, scope, depth + 1);
             continue;
         }
         let (mut ty, mut init, mut typed, mut eq) = (String::new(), String::new(), false, false);
@@ -529,14 +562,14 @@ fn visible_type(cx: &Cx, scope: u32, name: &str, field_only: bool) -> Option<(St
 }
 
 /// `for x in xs`, `for (k, v) in d`, `for x: Foo in xs`, `for case let x? in xs`.
-fn for_in(cx: &mut Cx, n: Node, scope: u32) {
+fn for_in(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
     let ch = fields(n);
     let ty = ch.iter().find(|(_, c)| c.kind() == "type_annotation").map(|(_, t)| annotation_type(cx, *t)).unwrap_or_default();
     for (f, c) in &ch {
         match c.kind() {
             "pattern" if *f == Some("item") => {
                 let mut names = Vec::new();
-                pattern_names(cx, *c, true, &mut names);
+                pattern_names(cx, *c, true, &mut names, depth);
                 if let [(id, cast)] = names.as_slice() {
                     let t = if ty.is_empty() { cast.clone() } else { ty.clone() };
                     add_named(cx, scope, *id, BindKind::Local, &t, "");
@@ -545,7 +578,7 @@ fn for_in(cx: &mut Cx, n: Node, scope: u32) {
                 }
             }
             "type_annotation" => {}
-            _ => walk(cx, *c, scope),
+            _ => walk(cx, *c, scope, depth + 1),
         }
     }
 }

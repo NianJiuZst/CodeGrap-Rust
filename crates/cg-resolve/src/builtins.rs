@@ -1340,19 +1340,8 @@ fn is_c_builtin(name: &str) -> bool {
             | "decltype"
             | "typeid"
             | "noexcept"
-            | "move"
-            | "forward"
             | "make_unique"
             | "make_shared"
-            | "make_pair"
-            | "make_tuple"
-            | "get"
-            | "swap"
-            | "min"
-            | "max"
-            | "declval"
-            | "addressof"
-            | "launder"
             | "__builtin_expect"
             | "__builtin_unreachable"
             | "__assume"
@@ -1361,12 +1350,13 @@ fn is_c_builtin(name: &str) -> bool {
 }
 
 fn is_php_builtin(name: &str) -> bool {
+    // Only prefixes no project helper plausibly shares; `is_`, `get_`, `set_`, `file_`, `html`,
+    // `url`, `date_`, `hash_`, `class_` and `str_` are common project-function shapes and are
+    // listed by exact name below instead.
     let prefixes = [
         "array_",
-        "str_",
         "mb_",
         "preg_",
-        "is_",
         "json_",
         "ctype_",
         "spl_",
@@ -1374,37 +1364,86 @@ fn is_php_builtin(name: &str) -> bool {
         "iterator_",
         "func_",
         "call_user_func",
-        "class_",
-        "method_",
-        "property_",
-        "function_",
-        "get_",
-        "set_",
-        "ini_",
-        "file_",
-        "stream_",
         "curl_",
-        "date_",
         "openssl_",
-        "hash_",
-        "random_",
-        "posix_",
-        "pcntl_",
-        "intdiv",
-        "html",
-        "url",
-        "base64_",
-        "bin2hex",
-        "hex2bin",
-        "gz",
         "sodium_",
+        "pcntl_",
+        "posix_",
     ];
     if prefixes.iter().any(|p| name.starts_with(p)) && !name.contains("::") {
         return true;
     }
     matches!(
         name,
-        "strlen"
+        "is_array"
+            | "is_string"
+            | "is_int"
+            | "is_integer"
+            | "is_float"
+            | "is_bool"
+            | "is_null"
+            | "is_numeric"
+            | "is_object"
+            | "is_callable"
+            | "is_iterable"
+            | "is_countable"
+            | "is_scalar"
+            | "is_resource"
+            | "is_a"
+            | "is_subclass_of"
+            | "is_dir"
+            | "is_file"
+            | "is_link"
+            | "is_readable"
+            | "is_writable"
+            | "is_writeable"
+            | "is_executable"
+            | "get_class"
+            | "get_parent_class"
+            | "get_called_class"
+            | "get_object_vars"
+            | "get_class_methods"
+            | "get_class_vars"
+            | "get_debug_type"
+            | "set_time_limit"
+            | "class_exists"
+            | "class_implements"
+            | "class_uses"
+            | "class_parents"
+            | "method_exists"
+            | "property_exists"
+            | "function_exists"
+            | "file_exists"
+            | "file_get_contents"
+            | "file_put_contents"
+            | "file"
+            | "str_replace"
+            | "str_ireplace"
+            | "str_contains"
+            | "str_starts_with"
+            | "str_ends_with"
+            | "str_word_count"
+            | "str_shuffle"
+            | "html_entity_decode"
+            | "htmlspecialchars_decode"
+            | "date_create"
+            | "date_default_timezone_set"
+            | "date_default_timezone_get"
+            | "hash_hmac"
+            | "hash_equals"
+            | "hash_algos"
+            | "ini_get"
+            | "ini_set"
+            | "stream_get_contents"
+            | "stream_context_create"
+            | "base64_encode"
+            | "base64_decode"
+            | "gzcompress"
+            | "gzuncompress"
+            | "gzencode"
+            | "gzdecode"
+            | "intdiv"
+            | "strlen"
             | "strtolower"
             | "strtoupper"
             | "ucfirst"
@@ -1894,5 +1933,110 @@ fn is_swift_builtin(name: &str) -> bool {
             | "super"
             | "self"
             | "Self"
+    )
+}
+
+/// Swift standard-library / Foundation types that a project does not declare but may extend
+/// (`extension Data { .. }` is a class node named `Data`). Constructor calls of these are
+/// builtins unless the module declares a struct, enum, protocol or alias of that name.
+/// `Task`, `Error` and `Result` are deliberately absent: projects do declare those.
+/// C++ standard free functions usually called unqualified (`using std::swap; swap(a, b)`, ADL,
+/// `using namespace std`). In a C++ file an unqualified call to one of them that no scope or
+/// same-file declaration answers is the standard one, not a same-named function found by
+/// proximity elsewhere in the project. C files keep them resolvable: C has no `std`, and `min`,
+/// `max` or `swap` there are project functions.
+pub fn is_cpp_std_free_function(name: &str) -> bool {
+    matches!(name, "move" | "forward" | "make_pair" | "make_tuple" | "get" | "swap" | "min" | "max" | "declval" | "addressof" | "launder")
+}
+
+pub fn is_swift_std_type(name: &str) -> bool {
+    matches!(
+        name,
+        "Data"
+            | "Result"
+            | "Error"
+            | "String"
+            | "Substring"
+            | "Character"
+            | "Int"
+            | "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "UInt"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "Double"
+            | "Float"
+            | "CGFloat"
+            | "Bool"
+            | "Array"
+            | "Dictionary"
+            | "Set"
+            | "Optional"
+            | "Range"
+            | "ClosedRange"
+            | "Date"
+            | "UUID"
+            | "URL"
+            | "URLRequest"
+            | "URLComponents"
+            | "URLQueryItem"
+            | "HTTPURLResponse"
+            | "URLResponse"
+            | "URLSession"
+            | "URLSessionConfiguration"
+            | "DispatchQueue"
+            | "DispatchGroup"
+            | "DispatchSemaphore"
+            | "DispatchWorkItem"
+            | "OperationQueue"
+            | "Operation"
+            | "BlockOperation"
+            | "NSLock"
+            | "NSRecursiveLock"
+            | "NSCondition"
+            | "NotificationCenter"
+            | "Notification"
+            | "JSONEncoder"
+            | "JSONDecoder"
+            | "JSONSerialization"
+            | "PropertyListEncoder"
+            | "PropertyListDecoder"
+            | "FileManager"
+            | "FileHandle"
+            | "Bundle"
+            | "ProcessInfo"
+            | "NSError"
+            | "NSObject"
+            | "Thread"
+            | "Timer"
+            | "DateFormatter"
+            | "ISO8601DateFormatter"
+            | "NumberFormatter"
+            | "Locale"
+            | "TimeZone"
+            | "Calendar"
+            | "DateComponents"
+            | "IndexPath"
+            | "IndexSet"
+            | "CharacterSet"
+            | "Scanner"
+            | "InputStream"
+            | "OutputStream"
+            | "Decimal"
+            | "NSNumber"
+            | "NSString"
+            | "NSArray"
+            | "NSDictionary"
+            | "NSMutableData"
+            | "NSMutableString"
+            | "Never"
+            | "Void"
+            | "Any"
+            | "AnyObject"
+            | "MainActor"
     )
 }

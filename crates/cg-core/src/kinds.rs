@@ -166,6 +166,8 @@ pub enum Lang {
     Lua = 18,
     Luau = 19,
     R = 20,
+    /// Detected by content in `.h` headers so they are not fed to the C walker; no walker.
+    ObjC = 21,
 }
 
 /// Languages whose symbols may reference one another by name (design doc 6.5: "same
@@ -210,6 +212,7 @@ impl Lang {
         Lang::Lua,
         Lang::Luau,
         Lang::R,
+        Lang::ObjC,
     ];
 
     /// Upstream `Language` string; also the kernel's language argument.
@@ -236,6 +239,7 @@ impl Lang {
             Lang::Lua => "lua",
             Lang::Luau => "luau",
             Lang::R => "r",
+            Lang::ObjC => "objc",
         }
     }
 
@@ -289,7 +293,7 @@ impl Lang {
             Lang::Dart => LangFamily::Dart,
             Lang::Lua | Lang::Luau => LangFamily::Lua,
             Lang::R => LangFamily::R,
-            Lang::Unknown => LangFamily::Unknown,
+            Lang::Unknown | Lang::ObjC => LangFamily::Unknown,
         }
     }
 

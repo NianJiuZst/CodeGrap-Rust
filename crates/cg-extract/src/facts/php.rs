@@ -5,65 +5,79 @@
 //!
 //! Variable names are stored without their `$` (the kernel emits `$repo->find()` as
 //! `repo.find`) and `$this` is never a binding. Type names keep their namespace backslashes
-//! but lose a leading one; scalar and pseudo types become empty except `self` / `static`,
-//! which both become `self` for the resolver to map onto the enclosing class.
+//! but lose a leading one; scalar and pseudo types become empty. `self` / `static` become the
+//! declared name of the enclosing class (the resolver cannot map `self` without a receiver),
+//! or empty inside an anonymous class and outside any class.
+//!
+//! A local is bound where it is first assigned; a later assignment in the same scope adds a
+//! binding only when it carries type evidence of its own, so the resolver (which reads the
+//! latest binding before a use) sees `$x = new Foo(); $x = new Bar();` as `Bar` from the
+//! second line on.
 
 use super::util::*;
 use super::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+/// Recursion bound of the walker: deeper syntax is skipped rather than overflowing the stack.
+const MAX_DEPTH: u32 = 400;
+
 pub fn extract(cx: &mut Cx, root: Node) {
     let mut st = St::default();
-    walk(cx, &mut st, root, 0);
+    walk(cx, &mut st, root, 0, 0);
 }
 
 #[derive(Default)]
 struct St {
-    /// `(scope, name)` of every variable bound so far: later plain assignments don't rebind.
+    /// `(scope, name)` of every variable bound so far: later untyped assignments don't rebind.
     bound: FxHashSet<(u32, String)>,
     /// `(class scope, name)` -> index of the first field binding of that name.
     fields: FxHashMap<(u32, String), usize>,
+    /// Declared name of the innermost enclosing class; empty outside classes and in anonymous ones.
+    class: String,
     package: bool,
 }
 
-fn walk_children(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
+fn walk_children(cx: &mut Cx, st: &mut St, n: Node, scope: u32, depth: u32) {
     for ch in kids(n) {
-        walk(cx, st, ch, scope);
+        walk(cx, st, ch, scope, depth + 1);
     }
 }
 
-fn walk(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
+fn walk(cx: &mut Cx, st: &mut St, n: Node, scope: u32, depth: u32) {
+    if depth > MAX_DEPTH {
+        return;
+    }
     match n.kind() {
         "namespace_definition" => {
             namespace(cx, st, n);
             if let Some(body) = n.child_by_field_name("body") {
-                walk(cx, st, body, scope);
+                walk(cx, st, body, scope, depth + 1);
             }
         }
         "namespace_use_declaration" => use_declaration(cx, n, scope),
         // trait `use Foo;` inside a class body: not an import
         "use_declaration" => {}
-        "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration" | "anonymous_class" => class(cx, st, n, scope),
-        "function_definition" | "method_declaration" => function(cx, st, n, scope),
-        "anonymous_function" | "arrow_function" => closure(cx, st, n, scope),
+        "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration" | "anonymous_class" => class(cx, st, n, scope, depth),
+        "function_definition" | "method_declaration" => function(cx, st, n, scope, depth),
+        "anonymous_function" | "arrow_function" => closure(cx, st, n, scope, depth),
         "assignment_expression" | "reference_assignment_expression" => {
-            assignment(cx, st, n, scope);
-            walk_children(cx, st, n, scope);
+            assignment(cx, st, n, scope, depth);
+            walk_children(cx, st, n, scope, depth);
         }
         "augmented_assignment_expression" => {
             // `$this->cache ??= new Cache()` / `$x ??= make()` initialise lazily
             if n.child_by_field_name("operator").is_some_and(|o| cx.text(o) == "??=") {
-                assignment(cx, st, n, scope);
+                assignment(cx, st, n, scope, depth);
             }
-            walk_children(cx, st, n, scope);
+            walk_children(cx, st, n, scope, depth);
         }
         "foreach_statement" => {
             let body = n.child_by_field_name("body").map(|b| b.id());
             // `foreach (<subject> as <target>)`: everything named after the subject binds
             for t in kids(n).filter(|c| c.is_named() && Some(c.id()) != body && c.kind() != "comment").skip(1) {
-                bind_targets(cx, st, t, scope);
+                bind_targets(cx, st, t, scope, depth);
             }
-            walk_children(cx, st, n, scope);
+            walk_children(cx, st, n, scope, depth);
         }
         "catch_clause" => {
             let ty = n.child_by_field_name("type").map(|tl| single_type(cx, tl)).unwrap_or_default();
@@ -73,21 +87,28 @@ fn walk(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
                 let line = cx.line(v);
                 bind(cx, st, scope, &name, BindKind::Local, &ty, "", line);
             }
-            walk_children(cx, st, n, scope);
+            walk_children(cx, st, n, scope, depth);
         }
         "global_declaration" => {
+            // `global $x;` names the file-scope `$x`: carry what the file knows about it into
+            // this scope, or bind nothing (and shadow nothing) when the file has no such variable
             for v in kids(n).filter(|c| c.kind() == "variable_name") {
-                local(cx, st, scope, v, "", "");
+                let name = var_name(cx, v);
+                let Some((ty, init)) = cx.lookup_binding(0, &name) else { continue };
+                let line = cx.line(v);
+                local(cx, st, scope, &name, &ty, &init, line);
             }
         }
         "static_variable_declaration" => {
             if let Some(v) = n.child_by_field_name("name") {
-                let (ty, init) = n.child_by_field_name("value").map(|r| value_info(cx, r, scope)).unwrap_or_default();
-                local(cx, st, scope, v, &ty, &init);
+                let (ty, init) = n.child_by_field_name("value").map(|r| value_info(cx, r, scope, depth)).unwrap_or_default();
+                let name = var_name(cx, v);
+                let line = cx.line(v);
+                local(cx, st, scope, &name, &ty, &init, line);
             }
-            walk_children(cx, st, n, scope);
+            walk_children(cx, st, n, scope, depth);
         }
-        _ => walk_children(cx, st, n, scope),
+        _ => walk_children(cx, st, n, scope, depth),
     }
 }
 
@@ -102,8 +123,12 @@ fn var_name(cx: &Cx, v: Node) -> String {
     cx.text(v).trim_start_matches('$').trim().to_owned()
 }
 
+/// Marker `class_name` returns for `self` / `static`; `bind` and `field` replace it with the
+/// enclosing class's name. No real class can be called this (both words are reserved).
+const SELF: &str = "self";
+
 /// A written class name reduced to what resolution looks up: no whitespace, no leading `\`,
-/// no `namespace\` prefix; scalar and pseudo types are empty, `self` / `static` are `self`.
+/// no `namespace\` prefix; scalar and pseudo types are empty, `self` / `static` are [`SELF`].
 fn class_name(raw: &str) -> String {
     let s: String = raw.split_whitespace().collect();
     let s = s.trim_start_matches('\\');
@@ -112,10 +137,19 @@ fn class_name(raw: &str) -> String {
         return String::new();
     }
     match s.to_ascii_lowercase().as_str() {
-        "self" | "static" => "self".to_owned(),
+        "self" | "static" => SELF.to_owned(),
         "int" | "integer" | "string" | "array" | "mixed" | "void" | "callable" | "iterable" | "bool" | "boolean" | "float" | "double" | "object" | "null"
         | "never" | "false" | "true" | "parent" | "resource" | "list" => String::new(),
         _ => s.to_owned(),
+    }
+}
+
+/// The type a binding stores for `ty`: [`SELF`] becomes the enclosing class's declared name.
+fn self_type<'s>(st: &'s St, ty: &'s str) -> &'s str {
+    if ty == SELF {
+        st.class.as_str()
+    } else {
+        ty
     }
 }
 
@@ -200,17 +234,17 @@ fn bind(cx: &mut Cx, st: &mut St, scope: u32, name: &str, kind: BindKind, ty: &s
         return;
     }
     st.bound.insert((scope, name.to_owned()));
-    cx.add_binding(scope, name, kind, ty, init, line);
+    cx.add_binding(scope, name, kind, self_type(st, ty), init, line);
 }
 
-/// A local variable; only the first binding of a name in a scope counts.
-fn local(cx: &mut Cx, st: &mut St, scope: u32, v: Node, ty: &str, init: &str) {
-    let name = var_name(cx, v);
-    if st.bound.contains(&(scope, name.clone())) {
+/// A local variable. Its first binding in a scope always counts; a later one is added only when
+/// it brings type evidence of its own (`$x = null; $x = new Bar();` is `Bar` from line 2 on),
+/// so an untyped re-assignment never hides what is already known.
+fn local(cx: &mut Cx, st: &mut St, scope: u32, name: &str, ty: &str, init: &str, line: u32) {
+    if ty.is_empty() && init.is_empty() && st.bound.contains(&(scope, name.to_owned())) {
         return;
     }
-    let line = cx.line(v);
-    bind(cx, st, scope, &name, BindKind::Local, ty, init, line);
+    bind(cx, st, scope, name, BindKind::Local, ty, init, line);
 }
 
 /// A field of class scope `cs`. The first field of a name stays the one the resolver reads;
@@ -219,25 +253,33 @@ fn field(cx: &mut Cx, st: &mut St, cs: u32, name: &str, ty: &str, init: &str, li
     if name.is_empty() {
         return;
     }
+    let ty = self_type(st, ty).to_owned();
     if let Some(&i) = st.fields.get(&(cs, name.to_owned())) {
         let b = &mut cx.facts.bindings[i];
         if b.decl_type.is_empty() && b.init_ctor.is_empty() {
-            b.decl_type = ty.to_owned();
+            b.decl_type = ty;
             b.init_ctor = init.to_owned();
         }
         return;
     }
     st.fields.insert((cs, name.to_owned()), cx.facts.bindings.len());
-    cx.add_binding(cs, name, BindKind::Field, ty, init, line);
+    cx.add_binding(cs, name, BindKind::Field, &ty, init, line);
 }
 
 /// Variables bound by a `foreach` target or a `list(...)` / `[...]` destructuring.
-fn bind_targets(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
+fn bind_targets(cx: &mut Cx, st: &mut St, n: Node, scope: u32, depth: u32) {
+    if depth > MAX_DEPTH {
+        return;
+    }
     match n.kind() {
-        "variable_name" => local(cx, st, scope, n, "", ""),
+        "variable_name" => {
+            let name = var_name(cx, n);
+            let line = cx.line(n);
+            local(cx, st, scope, &name, "", "", line);
+        }
         "by_ref" | "pair" | "list_literal" | "array_creation_expression" | "array_element_initializer" => {
             for ch in kids(n) {
-                bind_targets(cx, st, ch, scope);
+                bind_targets(cx, st, ch, scope, depth + 1);
             }
         }
         _ => {}
@@ -245,7 +287,10 @@ fn bind_targets(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
 }
 
 /// Type and bounded initializer path of an assigned value.
-fn value_info(cx: &Cx, v: Node, scope: u32) -> (String, String) {
+fn value_info(cx: &Cx, v: Node, scope: u32, depth: u32) -> (String, String) {
+    if depth > MAX_DEPTH {
+        return Default::default();
+    }
     match v.kind() {
         "object_creation_expression" => {
             let t = kids(v).find(|c| matches!(c.kind(), "name" | "qualified_name" | "relative_name")).map(|c| class_name(cx.text(c))).unwrap_or_default();
@@ -278,9 +323,9 @@ fn value_info(cx: &Cx, v: Node, scope: u32) -> (String, String) {
             }
             (String::new(), format!("{}.{}()", var_name(cx, o), cx.text(m)))
         }
-        "parenthesized_expression" => v.named_child(0).map(|c| value_info(cx, c, scope)).unwrap_or_default(),
+        "parenthesized_expression" => v.named_child(0).map(|c| value_info(cx, c, scope, depth + 1)).unwrap_or_default(),
         // `$a = $b = new Foo()`
-        "assignment_expression" => v.child_by_field_name("right").map(|c| value_info(cx, c, scope)).unwrap_or_default(),
+        "assignment_expression" => v.child_by_field_name("right").map(|c| value_info(cx, c, scope, depth + 1)).unwrap_or_default(),
         // alias of another variable: copy what we know about it
         "variable_name" => {
             let name = var_name(cx, v);
@@ -293,15 +338,15 @@ fn value_info(cx: &Cx, v: Node, scope: u32) -> (String, String) {
     }
 }
 
-fn assignment(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
+fn assignment(cx: &mut Cx, st: &mut St, n: Node, scope: u32, depth: u32) {
     let Some(left) = n.child_by_field_name("left") else { return };
     match left.kind() {
         "variable_name" => {
             let name = var_name(cx, left);
-            if name == "this" || st.bound.contains(&(scope, name.clone())) {
+            if name == "this" {
                 return;
             }
-            let (mut ty, init) = n.child_by_field_name("right").map(|r| value_info(cx, r, scope)).unwrap_or_default();
+            let (mut ty, init) = n.child_by_field_name("right").map(|r| value_info(cx, r, scope, depth)).unwrap_or_default();
             // `/** @var Foo $x */ $x = $container->get(...);`
             if let Some(d) =
                 n.parent().filter(|p| p.kind() == "expression_statement").and_then(|p| doc_comment(cx, p)).and_then(|d| doc_tag_type(d, "@var", &name))
@@ -309,9 +354,9 @@ fn assignment(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
                 ty = d;
             }
             let line = cx.line(left);
-            bind(cx, st, scope, &name, BindKind::Local, &ty, &init, line);
+            local(cx, st, scope, &name, &ty, &init, line);
         }
-        "list_literal" | "array_creation_expression" => bind_targets(cx, st, left, scope),
+        "list_literal" | "array_creation_expression" => bind_targets(cx, st, left, scope, depth),
         "member_access_expression" => {
             // `$this->repo = new Repo()` declares a field of the enclosing class
             let (Some(o), Some(m)) = (left.child_by_field_name("object"), left.child_by_field_name("name")) else { return };
@@ -319,7 +364,7 @@ fn assignment(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
                 return;
             }
             let Some(cs) = cx.class_scope_of(scope) else { return };
-            let (ty, mut init) = n.child_by_field_name("right").map(|r| value_info(cx, r, scope)).unwrap_or_default();
+            let (ty, mut init) = n.child_by_field_name("right").map(|r| value_info(cx, r, scope, depth)).unwrap_or_default();
             // the field lives in the class scope: a call on a method's local means nothing there
             if init.split('(').next().is_some_and(|p| p.contains('.') && !p.starts_with("this.")) {
                 init.clear();
@@ -334,12 +379,14 @@ fn assignment(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
 
 // ---------------------------------------------------------------------------- declarations
 
+/// The first namespace of the file is its package. A nameless block (`namespace { ... }`) is
+/// the global namespace: it takes the slot so that a later named block cannot claim the file.
 fn namespace(cx: &mut Cx, st: &mut St, n: Node) {
     if st.package {
         return;
     }
-    let Some(nm) = n.child_by_field_name("name") else { return };
     st.package = true;
+    let Some(nm) = n.child_by_field_name("name") else { return };
     let name: String = cx.text(nm).split_whitespace().collect();
     let name = name.trim_matches('\\').to_owned();
     let line = cx.line(n);
@@ -381,13 +428,22 @@ fn use_declaration(cx: &mut Cx, n: Node, scope: u32) {
     }
 }
 
-fn class(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
+fn class(cx: &mut Cx, st: &mut St, n: Node, scope: u32, depth: u32) {
     // `new class($a) { ... }`: the constructor arguments belong to the outer scope
     for a in kids(n).filter(|c| c.kind() == "arguments") {
-        walk(cx, st, a, scope);
+        walk(cx, st, a, scope, depth + 1);
     }
     let sc = cx.push_scope(ScopeKind::Class, scope, n);
-    let Some(body) = n.child_by_field_name("body") else { return };
+    // `self` / `static` inside the body name this class; an anonymous class has no name
+    let declared = n.child_by_field_name("name").map(|nm| cx.text(nm).trim().to_owned()).unwrap_or_default();
+    let outer = std::mem::replace(&mut st.class, declared);
+    if let Some(body) = n.child_by_field_name("body") {
+        class_body(cx, st, body, sc, depth);
+    }
+    st.class = outer;
+}
+
+fn class_body(cx: &mut Cx, st: &mut St, body: Node, sc: u32, depth: u32) {
     // Declared and promoted properties first, so `$this->x = ...` in any method knows which
     // fields already carry a type.
     for m in kids(body) {
@@ -411,7 +467,7 @@ fn class(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
     for m in kids(body) {
         match m.kind() {
             "property_declaration" | "use_declaration" | "const_declaration" | "enum_case" => {}
-            _ => walk(cx, st, m, sc),
+            _ => walk(cx, st, m, sc, depth + 1),
         }
     }
 }
@@ -457,7 +513,7 @@ fn params(cx: &mut Cx, st: &mut St, f: Node, sc: u32, doc: Option<&str>) {
     }
 }
 
-fn function(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
+fn function(cx: &mut Cx, st: &mut St, n: Node, scope: u32, depth: u32) {
     if n.kind() == "function_definition" && cx.facts.scopes[scope as usize].kind == ScopeKind::Function {
         if let Some(name) = n.child_by_field_name("name") {
             let nm = cx.text(name).trim().to_owned();
@@ -475,12 +531,12 @@ fn function(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
     let doc = doc_comment(cx, n);
     params(cx, st, n, sc, doc);
     if let Some(body) = n.child_by_field_name("body") {
-        walk(cx, st, body, sc);
+        walk(cx, st, body, sc, depth + 1);
     }
 }
 
 /// `function ($a) use ($b, &$c) { ... }` / `fn($a) => ...`.
-fn closure(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
+fn closure(cx: &mut Cx, st: &mut St, n: Node, scope: u32, depth: u32) {
     let sc = cx.push_scope(ScopeKind::Function, scope, n);
     params(cx, st, n, sc, None);
     for u in kids(n).filter(|c| c.kind() == "anonymous_function_use_clause") {
@@ -493,6 +549,6 @@ fn closure(cx: &mut Cx, st: &mut St, n: Node, scope: u32) {
         }
     }
     if let Some(body) = n.child_by_field_name("body") {
-        walk(cx, st, body, sc);
+        walk(cx, st, body, sc, depth + 1);
     }
 }

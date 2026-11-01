@@ -367,8 +367,11 @@ impl<'v> Modules<'v> {
                     p == clean || p.ends_with(&tail)
                 })
                 .collect();
-            if let Some(f) = self.best_by_proximity(&hits, from_path) {
+            if let Some(f) = self.unique_by_proximity(&hits, from_path) {
                 return ImportTarget::File(f);
+            }
+            if hits.len() > 1 {
+                return ImportTarget::NotFound;
             }
         }
         if angle {
@@ -387,7 +390,7 @@ impl<'v> Modules<'v> {
         let segs: Vec<&str> = spec.split('.').collect();
         for i in (0..segs.len()).rev() {
             let qname = if i == 0 { segs.join("::") } else { format!("{}::{}", segs[..i].join("."), segs[i..].join("::")) };
-            if let Some(n) = self.view.by_qname(&qname).find(|n| self.view.file(self.view.hot(*n).file).lang() == Lang::CSharp) {
+            if let Some(n) = self.canonical(self.view.by_qname(&qname).filter(|n| self.view.file(self.view.hot(*n).file).lang() == Lang::CSharp)) {
                 return ImportTarget::Node(n);
             }
         }
@@ -400,7 +403,7 @@ impl<'v> Modules<'v> {
         let segs: Vec<&str> = spec.split('\\').filter(|s| !s.is_empty()).collect();
         for i in (0..segs.len()).rev() {
             let qname = if i == 0 { segs.join("::") } else { format!("{}::{}", segs[..i].join("\\"), segs[i..].join("::")) };
-            if let Some(n) = self.view.by_qname(&qname).find(|n| self.view.file(self.view.hot(*n).file).lang() == Lang::Php) {
+            if let Some(n) = self.canonical(self.view.by_qname(&qname).filter(|n| self.view.file(self.view.hot(*n).file).lang() == Lang::Php)) {
                 return ImportTarget::Node(n);
             }
         }
@@ -437,19 +440,29 @@ impl<'v> Modules<'v> {
         let base = clean.rsplit('/').next().unwrap_or(&clean);
         if let Some(cands) = self.by_basename.get(base) {
             let tail = format!("/{clean}");
+            let single = !clean.contains('/');
             let hits: Vec<FileId> = cands
                 .iter()
                 .copied()
                 .filter(|f| self.view.file(*f).lang() == Lang::Ruby)
                 .filter(|f| {
                     let p = self.path_of(*f);
-                    p == clean || p.ends_with(&tail)
+                    if p != clean && !p.ends_with(&tail) {
+                        return false;
+                    }
+                    // `require 'set'` names a file directly under a load-path root; a
+                    // gem-internal `lib/mygem/set.rb` is only loadable as `mygem/set`
+                    !single || matches!(dir_of(p).rsplit('/').next().unwrap_or(""), "" | "lib" | "spec" | "test" | "app")
                 })
                 .collect();
             // the load path is usually `lib/`: prefer it over a same-named test helper
             let lib: Vec<FileId> = hits.iter().copied().filter(|f| self.path_of(*f).ends_with(&format!("lib/{clean}"))).collect();
-            if let Some(f) = self.best_by_proximity(if lib.is_empty() { &hits } else { &lib }, from_path) {
+            let pool = if lib.is_empty() { &hits } else { &lib };
+            if let Some(f) = self.unique_by_proximity(pool, from_path) {
                 return ImportTarget::File(f);
+            }
+            if pool.len() > 1 {
+                return ImportTarget::NotFound;
             }
         }
         ImportTarget::External
@@ -568,6 +581,26 @@ impl<'v> Modules<'v> {
             }
         }
         ImportTarget::External
+    }
+
+    /// The deterministic representative of same-named declarations: the one in the path-first
+    /// file, then the earliest. Posting order (base segment before delta) must never decide,
+    /// or an incremental sync would differ from a full rebuild.
+    fn canonical(&self, cands: impl Iterator<Item = NodeIdx>) -> Option<NodeIdx> {
+        cands.min_by_key(|n| (self.path_of(self.view.hot(*n).file), self.view.node(*n).start_line()))
+    }
+
+    /// `best_by_proximity` that refuses ties: two equally close candidates are an ambiguous
+    /// include / require, which gets no edge.
+    fn unique_by_proximity(&self, cands: &[FileId], from_path: &str) -> Option<FileId> {
+        let from_dir = dir_of(from_path);
+        let key = |f: FileId| {
+            let p = self.path_of(f);
+            let common = from_dir.split('/').zip(dir_of(p).split('/')).take_while(|(a, b)| a == b).count();
+            (common, std::cmp::Reverse(p.len()))
+        };
+        let best = cands.iter().copied().max_by_key(|f| key(*f))?;
+        (cands.iter().filter(|f| key(**f) == key(best)).count() == 1).then_some(best)
     }
 
     // ---- Python

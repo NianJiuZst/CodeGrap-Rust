@@ -68,9 +68,26 @@ pub fn detect(path: &str, source: Option<&str>, overrides: &BTreeMap<String, Lan
             if looks_like_cpp(src) {
                 return Lang::Cpp;
             }
+            if looks_like_objc(src) {
+                return Lang::ObjC;
+            }
         }
     }
     lang
+}
+
+/// Whether a `.h` file is an Objective-C header (upstream `looksLikeObjc`): `@interface`,
+/// `@implementation`, `@protocol` or `@synthesize` in the first 8 KiB. Such headers have no
+/// walker here and must not be fed to the C grammar's error recovery.
+pub fn looks_like_objc(source: &str) -> bool {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static OBJC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@(?:interface|implementation|protocol|synthesize)\b").expect("static regex"));
+    let mut end = source.len().min(8192);
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    OBJC.is_match(&source[..end])
 }
 
 /// Whether a `.h` file contains constructs that are C++ and never valid C (upstream
@@ -168,6 +185,8 @@ mod tests {
         assert!(!looks_like_cpp("#include <stdio.h>\nint main(void) { return 0; }\n"));
         assert_eq!(detect("a/b.h", Some("namespace x {}"), &none), Lang::Cpp);
         assert_eq!(detect("a/b.h", Some("int x;"), &none), Lang::C);
+        assert_eq!(detect("a/b.h", Some("#import <Foundation/Foundation.h>\n@interface Foo : NSObject\n@end\n"), &none), Lang::ObjC);
+        assert!(!Lang::ObjC.is_supported());
         assert_eq!(detect("a/b.c", Some("namespace x {}"), &none), Lang::C);
         let mut o = BTreeMap::new();
         o.insert(".h".to_string(), Lang::C);

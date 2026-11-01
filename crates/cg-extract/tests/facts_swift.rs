@@ -523,6 +523,84 @@ fn switch_and_catch_patterns_bind_locals() {
 }
 
 #[test]
+fn enum_case_names_in_payload_less_patterns_bind_nothing() {
+    let f = run(r#"func f(xs: [E], e: E) {
+    let a = Foo()
+    for case .a in xs { a.go() }
+    switch e {
+    case let .a:
+        a.go()
+    case .b:
+        break
+    case let .c?:
+        break
+    case let .d(x):
+        print(x)
+    case let .a(y):
+        print(y)
+    default:
+        break
+    }
+    if case .g = e { }
+    if case let .h = e { }
+    for case let .k? in xs { }
+    for case let z in xs { print(z) }
+}
+"#);
+    // `.a` is the enum case, not a rebinding of the local `a`
+    assert_eq!(ty(&f, "a"), ("", "Foo()"));
+    assert_eq!(bind(&f, "a").line, 2);
+    for name in ["b", "c", "d", "g", "h", "k"] {
+        assert!(binds(&f, name).is_empty(), "{name}: {:?}", f.bindings);
+    }
+    // payloads and plain `case let` patterns still bind
+    for name in ["x", "y", "z"] {
+        assert_eq!(bind(&f, name).kind, BindKind::Local, "{name}");
+    }
+}
+
+#[test]
+fn deeply_nested_closures_types_and_patterns() {
+    let depth = 3000;
+    let mut src = String::from("import Foundation\nfunc deep(top: Foo) {\n    let x = ");
+    src.push_str(&"{ ".repeat(depth));
+    src.push('1');
+    src.push_str(&" }".repeat(depth));
+    src.push_str("\n    let y = ");
+    src.push_str(&"(".repeat(depth));
+    src.push('1');
+    src.push_str(&")".repeat(depth));
+    src.push_str("\n    let z: ");
+    src.push_str(&"(".repeat(depth));
+    src.push_str("Foo");
+    src.push_str(&")".repeat(depth));
+    src.push_str(" = make()\n    let ");
+    src.push_str(&"(a, ".repeat(depth));
+    src.push_str("last");
+    src.push_str(&")".repeat(depth));
+    src.push_str(" = t\n");
+    for i in 0..depth {
+        src.push_str(&format!("    if let v{i} = o {{\n"));
+    }
+    src.push_str(&"    }\n".repeat(depth));
+    src.push_str("}\nfunc after(q: Bar) { let w = Baz() }\n");
+    // run on a thread with a modest stack: the walker must bound its recursion
+    let f = std::thread::Builder::new().stack_size(2 << 20).spawn(move || run(&src)).unwrap().join().unwrap();
+    assert_eq!(imp(&f, "Foundation").kind, ImportKind::Namespace);
+    assert_eq!(ty(&f, "top"), ("Foo", ""));
+    assert_eq!(bind(&f, "x").kind, BindKind::Local);
+    assert_eq!(bind(&f, "y").kind, BindKind::Local);
+    // a type nested past the chain bound reduces to nothing rather than crashing
+    assert_eq!(bind(&f, "z").kind, BindKind::Local);
+    assert_eq!(bind(&f, "v0").kind, BindKind::Local);
+    assert_eq!(ty(&f, "q"), ("Bar", ""));
+    assert_eq!(ty(&f, "w"), ("", "Baz()"));
+    // the deepest nodes are skipped, not crashed on
+    assert!(binds(&f, "last").is_empty() && binds(&f, &format!("v{}", depth - 1)).is_empty());
+    assert!(!binds(&f, "a").is_empty());
+}
+
+#[test]
 fn nested_functions_are_local_fns() {
     let f = run(r#"class C {
     func outer() {
