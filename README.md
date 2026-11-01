@@ -225,6 +225,12 @@ with watching enabled, it performs that synchronization automatically after a de
 | Java | `.java` |
 | Rust | `.rs` |
 | Kotlin | `.kt`, `.kts` |
+| C | `.c`, `.h` (a `.h` with C++ constructs is parsed as C++) |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.metal`, `.cu`, `.cuh` |
+| C# | `.cs` |
+| PHP | `.php`, `.module`, `.install`, `.theme`, `.inc` |
+| Ruby | `.rb`, `.rake` |
+| Swift | `.swift` |
 
 Extraction records source structure, symbols and references. Resolution uses available scope,
 import, receiver-type, module and package information. Coverage depends on language constructs
@@ -241,8 +247,11 @@ event-emitter handlers, React re-render links and JSX parent/child links. These 
 heuristics with recorded provenance; they cover specific patterns rather than arbitrary
 runtime behavior.
 
-C/C++, C#, PHP, Ruby, Swift and the other upstream language families are outside this version's
-supported extraction set. Vue/Svelte-specific extraction is also outside the current scope.
+C/C++, C#, PHP, Ruby and Swift use the upstream extraction walkers with this project's own
+resolution rules (includes, namespaces, `require`, SwiftPM modules, implicit `this` members);
+their resolution has been checked on sample repositories, not against the upstream oracle, and
+has no framework route rules yet. Dart, Scala, Lua, Luau and R are detected but not extracted.
+Vue/Svelte-specific extraction is also outside the current scope.
 
 ## Command-line reference
 

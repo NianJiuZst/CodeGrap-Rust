@@ -1342,9 +1342,16 @@ impl<'e, 'v> FileCx<'e, 'v> {
             TypeRes::Node(t) => {
                 if self.holds_members(view.node(t).kind()) {
                     let o = self.member_of(wcx, t, path, method, 90);
-                    if o.status == status::RESOLVED || !matches!(self.family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby) {
-                        return o;
+                    if o.status != status::RESOLVED && matches!(self.family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby) {
+                        // `Mod::Klass.m` / `ns::f`: the root may be a namespace-like node whose
+                        // members are only reachable by qualified name
+                        if let Some(n) = self.qualified_callable(r.from, root, path, method) {
+                            return Outcome::found(n, by::QUALIFIED, 90);
+                        }
                     }
+                    // A known receiver constrains the lookup to its own hierarchy: no
+                    // unique-name fallback when the member is missing.
+                    return o;
                 }
             }
             TypeRes::External => return Outcome::st(status::EXTERNAL),
@@ -1463,6 +1470,17 @@ impl<'e, 'v> FileCx<'e, 'v> {
         None
     }
 
+    /// Swift: `Data()`, `String(x)`, `URL(string:)` construct standard-library types. A
+    /// project `extension Data { .. }` is emitted as a class node named `Data`, but it does not
+    /// declare the type, so the call is a builtin rather than an edge to the extension. Member
+    /// lookups through the extension (`d.projectMethod()`) are unaffected.
+    fn swift_extended_builtin(&self, name: &str, r: &RefRec) -> bool {
+        self.family == LangFamily::Swift
+            && name.starts_with(|c: char| c.is_ascii_uppercase())
+            && is_builtin(self.family, name)
+            && self.lookup_binding(name, self.scope_at(r.line, r.col), r.line, false).is_none()
+    }
+
     pub fn resolve_call_name(&self, wcx: &mut WorkerCx<'e, 'v>, r: &RefRec, name: &str) -> Outcome {
         let normalized = normalize_call_name(self.family, name);
         let name = normalized.as_ref();
@@ -1471,6 +1489,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             return Outcome::st(status::LOCAL_BINDING);
         }
         let outcome = match parse_shape(name) {
+            Shape::Bare(n) if self.swift_extended_builtin(n, r) => Outcome::st(status::BUILTIN),
             Shape::Bare(n) => self.call_bare(wcx, r, n, Accept::Callable),
             Shape::Member { root, path, method } => self.call_member(wcx, r, root, &path, method),
             Shape::This { kw, fields, method } => self.call_this(wcx, r, kw, &fields, method),
@@ -1607,6 +1626,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
         match kind {
             RefKind::Edge(EdgeKind::Imports) => self.resolve_import_ref(name, r),
             RefKind::Edge(EdgeKind::Extends | EdgeKind::Implements | EdgeKind::TypeOf | EdgeKind::Returns) => self.resolve_type_ref(wcx, r, name, Accept::Type),
+            RefKind::Edge(EdgeKind::Instantiates) if self.swift_extended_builtin(name, r) => Outcome::st(status::BUILTIN),
             RefKind::Edge(EdgeKind::Instantiates) => {
                 let o = self.resolve_type_ref(wcx, r, name, Accept::Type);
                 if o.status == status::NO_CANDIDATE {

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — language coverage and Rust macro items
+
+- Vendor the upstream C/C++, C#, PHP, Ruby and Swift walkers and the Swift grammar through
+  kernel patch P5 (`scripts/sync-kernel.sh` re-vendors them; each language has a cargo feature).
+  A `.h` header with C++ constructs is parsed with the C++ grammar, as upstream does.
+- Facts extractors for the five languages (scopes, typed parameters/locals/fields, imports,
+  namespaces), and resolution rules: `#include` by relative path and path suffix, C# namespaces
+  including the enclosing ones, PHP namespaced `use` names, Ruby `require`/`require_relative`,
+  Swift modules per SwiftPM target; implicit-`this` member calls, call-name normalisation
+  (PHP `->`/`parent::`/`self::`, C# `?.`/`base.`, Ruby `@ivar`, C++ arity suffixes), nested type
+  paths, qualified callables, and members declared in other files (partial classes, extensions,
+  reopened classes, out-of-line C++ definitions). Per-family builtin and common-method lists
+  keep untyped receivers from linking to same-named project methods.
+- Rust: items inside conditional wrapper macros (`cfg_rt! { pub struct X; impl X { .. } }`,
+  Tokio's `cfg_*!` family) are extracted from a position-preserving view with only the wrapper
+  tokens blanked. Node identities and positions of everything else are unchanged; the original
+  text is used again if blanking introduces a syntax error. On Tokio this adds ~740 nodes and
+  ~2,200 resolved call references.
+- Fix `file_node_only` building a node row 8 bytes larger than the kernel ABI row (a debug
+  assertion panic on any kernel failure in debug/test builds).
+- **Engine rules version 5**: indexes built by an older engine are rebuilt on the next sync.
+
 ## Unreleased — engine performance follow-through
 
 - Add event-path sync, bounded watcher events and source-free snapshot compaction after a

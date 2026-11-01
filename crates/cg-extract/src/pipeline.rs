@@ -107,7 +107,8 @@ pub fn file_node_only(rel: &str, line_count: u32) -> EmitOut {
         node.extend_from_slice(&o.to_le_bytes());
         node.extend_from_slice(&l.to_le_bytes());
     }
-    for _ in 0..6 {
+    // docstring, signature, decorators, type_parameters, return_type
+    for _ in 0..5 {
         node.extend_from_slice(&NONE.to_le_bytes());
         node.extend_from_slice(&0u32.to_le_bytes());
     }
@@ -386,4 +387,19 @@ pub fn extract_all(entries: &[FileEntry], cfg: &ExtractConfig) -> Vec<Option<Fil
     let mut out = Vec::with_capacity(entries.len());
     extract_stream(entries, cfg, |_, b| out.push(b));
     out
+}
+
+#[cfg(test)]
+mod file_node_tests {
+    use super::*;
+
+    #[test]
+    fn file_node_only_row_has_the_abi_size() {
+        let out = file_node_only("src/a/b.rs", 12);
+        assert_eq!(out.nodes.len(), cg_kernel::NODE_ROW_SIZE);
+        let rows = FileRows::new(&out);
+        let n = rows.nodes().next().expect("the file node");
+        assert_eq!((n.name(), n.qname(), n.start_line(), n.end_line()), ("b.rs", "src/a/b.rs", 1, 12));
+        assert_eq!(rows.nodes().count(), 1);
+    }
 }

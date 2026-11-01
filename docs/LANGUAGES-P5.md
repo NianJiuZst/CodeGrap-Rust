@@ -1,0 +1,108 @@
+# Second-phase languages and Rust macro items / 新增语言与 Rust 宏内 item
+
+运行时代码：本分支（引擎规则版本 **5**，存储格式仍为 **2**）。基线为 `890912c`（规则版本 4）。
+本页记录的是**样例仓库上的自测数字**，不是与上游 oracle 的对比；上游 oracle 在本轮环境中
+无法构建（见"验证范围"）。精确率只做了随机抽样人工核对，没有做到可以声明 ≥97% 的程度。
+
+## 做了什么
+
+### C/C++、C#、PHP、Ruby、Swift
+
+- 通过新的内核补丁 **P5** 直接 vendor 上游的五个 walker 和 Swift 语法（`scripts/sync-kernel.sh`
+  会重新 vendor；每种语言各有一个 cargo feature）。walker 本身没有改动，只接入了 P2（允许错误树）
+  和 P4（解析钩子）。
+- `.h` 头文件按上游 `looksLikeCpp` 的规则做内容检测：含命名空间、class、模板、访问区段、
+  `virtual`、`using` 或基类子句的头文件按 C++ 语法解析。
+- 为每种语言新增 facts 提取器（作用域、带类型的参数/局部变量/字段、导入、命名空间），各自带定向测试
+  （C/C++ 27 项、C# 12 项、PHP 23 项、Ruby 32 项、Swift 15 项）。
+- 解析规则：
+  - `#include "a/b.h"` 先按包含者所在目录解析，再按路径后缀解析；`<...>` 只按后缀，找不到视为外部。
+  - C# 命名空间作为 package；同命名空间和**外层命名空间**的类型无需 `using` 即可见；`using X = A.B.C`
+    和 `using static` 解析到具体声明。
+  - PHP `use A\B\C` 解析到类/接口/trait/函数或命名空间；`$this->m()`（内核输出为裸名）按隐式 `this` 成员查找；
+    `parent::`、`self::`、`static::`、`->`、`?->` 归一化为通用形状。
+  - Ruby `require`/`require_relative` 按 `lib/` 优先的路径后缀解析；`@ivar.m` 视为 `self.@ivar.m`；
+    `self.class.m` 视为 `self.m`；module 也作为成员持有者。
+  - Swift 按 SwiftPM target（`Sources/<T>/`、`Tests/<T>/`）划分模块，模块内声明无需导入可见；
+    `Data()`、`String(..)` 等标准类型的构造调用判为 builtin，即使项目里有 `extension Data`。
+  - 其他文件中声明的成员（C# partial class、Swift extension、Ruby 重开类、C++ 类外定义）可被成员查找命中。
+  - 有已知接收者类型但找不到成员时**不再**退化为全局唯一同名方法（保持"宁缺毋错"）。
+  - 每个语言族各有 builtin 与常见方法名列表，避免无类型接收者连到同名项目方法。
+
+### Rust：条件 item 包装宏
+
+Tokio 的 `cfg_rt! { pub struct X; impl X { .. } }` 这类宏体对 tree-sitter 是不透明的 token 树，
+内核既不提取里面的声明也不提取调用。现在在内核运行前，用一个**保持位置不变**的视图把包装宏的
+`name! {` 和闭合 `}` 替换成空格（换行保留，其他字节不动），其余所有节点的行列与 id 不变。
+若替换后出现语法错误，回退到原文。`cfg_if!`、宏定义和任意其他宏保持不透明，不展开任何宏。
+
+## 样例仓库结果
+
+同一台机器，同一个二进制，`cgr index` 后 `export --sqlite` 统计 `refs` 表中 `kind='calls'` 的状态。
+"仅 walker"一列是只有内核 walker、没有 facts 和解析规则时的数字，用来说明本轮规则带来的变化；
+它不是上游的数字。
+
+| 仓库 | 语言 | 文件 | 调用引用 | 仅 walker：已解析 | 本轮：已解析 | 本轮：NoCandidate | 本轮：Ambiguous |
+|---|---|---:|---:|---:|---:|---:|---:|
+| cJSON | C（+Ruby 脚本） | 68 | 3,743 | 2,552 | 2,637 | 208 | 2 |
+| fmt | C++ | 80 | 19,835¹ | 7,689 | 9,661 | 4,386 | 2,253 |
+| MediatR | C# | 159 | 3,381 | 303 | 572 | 1,833 | 27 |
+| Slim | PHP | 125 | 5,183 | 344 | 1,061 | 2,316 | 3 |
+| Sinatra | Ruby | 147 | 2,794 | 389 | 589 | 914 | 39 |
+| Alamofire | Swift | 111 | 18,060 | 1,026 | 4,712 | 3,781 | 398 |
+
+¹ fmt 的调用引用数在 `.h` 按 C++ 解析后由 18,905 增加到 19,835。
+
+未解析（NoCandidate）的大头是外部库调用（.NET BCL、PSR 接口、Foundation、标准库）和无类型接收者，
+按设计不连边。Ambiguous 在 fmt 上仍然很多：重载与模板特化在同一限定名下有多个声明。
+
+每个仓库各抽 14 条已解析调用人工核对源码行，发现并修复了两类误连：Ruby 已知模块上缺失成员时的全局回退
+（`Delegator.target` 连到测试类方法），以及 Swift 对标准类型 extension 的构造调用（Alamofire 中 164 条）。
+修复后对应计数为 0。这只是抽样，不是精确率估计。
+
+`cgr bench sync --edits 40 --verify` 在六个仓库上均满足 **incremental == full rebuild**
+（随机编辑规则已扩展到新语言的注释、新增函数、重命名和导入）。
+
+### Tokio（Rust）
+
+| | 基线 | 本轮 |
+|---|---:|---:|
+| 节点 | 14,460 | 15,199 |
+| 边 | 39,114 | 44,231 |
+| 已解析引用 | 21,520 / 62,945 | 25,301 / 65,414 |
+| 已解析调用 | 11,608 | 13,824 |
+| 调用 NoCandidate | 11,636 | 10,886 |
+| 调用 Ambiguous | 1,076 | 607 |
+
+与基线逐引用对比：共同引用 36,425 条，新增解析 1,973 条，丢失 74 条，目标变化 69 条。丢失的 74 条
+多为 `reader.read_exact()` 这类此前靠全局唯一名连到 `tokio-util` 的 `SyncIoBridge::read_exact`
+的边；它们本就与接收者类型无关，现在接收者有了类型信息后不再误连。Express、Gin、Django 的图逐引用
+与基线**完全一致**（0 变化）。
+
+## 验证范围
+
+- 工作区 `cargo test --workspace`：全部通过（含随机编辑序列 6 × 100）；`cargo clippy --workspace
+  --exclude cg-kernel --all-targets -- -D warnings` 与 `cargo fmt --check` 通过。
+- Windows：`x86_64-pc-windows-gnu`（mingw-w64）交叉编译通过，包括 vendor 的 Kotlin 与 Swift C 语法；
+  本环境没有 Wine，未能运行生成的 `cgr.exe`，msvc 目标与 `install.ps1` 需要在真实 Windows 上验证。
+- **上游 oracle 未重跑**：本环境不允许执行上游仓库的构建脚本，因此本页没有 v4 文档中那种
+  P*/R 对比数字。Express 的全图 P、Django 路由等 v4 遗留问题本轮没有处理。
+
+## English summary
+
+Kernel patch P5 vendors the upstream C/C++, C#, PHP, Ruby and Swift walkers and the Swift
+grammar; `.h` headers with C++ constructs use the C++ grammar. Each language gets a facts
+extractor with focused tests and resolution rules (includes, namespaces incl. enclosing C#
+namespaces, PHP `use`, Ruby `require`, SwiftPM modules, implicit-`this` members, call-name
+normalisation, members declared in other files, per-family builtins). A known receiver type with
+no such member no longer falls back to a unique global name, and Swift constructor calls of
+standard types are builtins even when the project extends them.
+
+Rust items inside conditional wrapper macros (`cfg_rt! { .. }`) are extracted from a
+position-preserving view with only the wrapper tokens blanked; on Tokio this adds 739 nodes and
+2,216 resolved call references while Express, Gin and Django are unchanged reference-for-reference.
+
+The numbers above are self-measurements on sample repositories with random spot checks, not an
+upstream-oracle comparison and not a precision estimate. `incremental == full rebuild` holds on
+all six repositories over 40 random edits each. Windows: a mingw cross-build succeeds; the binary
+was not executed here.
