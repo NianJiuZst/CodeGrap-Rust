@@ -109,29 +109,34 @@ enum StdWrapper {
     Pointer,
 }
 
-/// A known project type, possibly still inside a standard Rust container.
+/// A project type, possibly still inside a standard Rust container, or an
+/// explicit return annotation whose receiver we cannot model.
 /// Keep the container until an operation such as `unwrap` actually removes it.
 struct ValueType {
-    node: NodeIdx,
+    node: Option<NodeIdx>,
     wrappers: SmallVec<[StdWrapper; 2]>,
 }
 
 impl ValueType {
     fn plain(node: NodeIdx) -> Self {
-        Self { node, wrappers: SmallVec::new() }
+        Self { node: Some(node), wrappers: SmallVec::new() }
+    }
+
+    fn unknown() -> Self {
+        Self { node: None, wrappers: SmallVec::new() }
     }
 
     fn receiver(self) -> Option<NodeIdx> {
         // The field cache stores one node, so it cannot preserve wrapper
         // methods such as Arc::clone. Only method_receiver may autoderef.
-        self.wrappers.is_empty().then_some(self.node)
+        self.wrappers.is_empty().then_some(self.node).flatten()
     }
 
     fn method_receiver(&self, method: &str) -> Option<NodeIdx> {
         if self.wrappers.contains(&StdWrapper::Pointer) && pointer_method(method) {
             return None;
         }
-        self.wrappers.iter().all(|w| *w == StdWrapper::Pointer).then_some(self.node)
+        self.wrappers.iter().all(|w| *w == StdWrapper::Pointer).then_some(self.node).flatten()
     }
 }
 
@@ -739,12 +744,49 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let cx = wcx.file_cx(self.e, node.file());
         if let Some(b) = self.e.return_types.get(&n) {
             let rt = self.view.text_str(b.decl_type);
+            if cx.family == LangFamily::Js {
+                // TS facts also retain unsupported annotations. Failure to
+                // resolve one must not enable the unique-member fallback.
+                return Some(cx.ts_return_value(n, rt).unwrap_or_else(ValueType::unknown));
+            }
             if !rt.is_empty() {
                 return cx.type_value(wcx, rt, receiver, depth + 1);
             }
             return cx.expression_value(wcx, self.view.text_str(b.init_ctor), b.scope.0.wrapping_sub(cx.scope_base), u32::MAX, depth + 1);
         }
         cx.type_value(wcx, node.return_type()?, receiver, depth + 1)
+    }
+
+    /// TS return facts contain only nominal names. Look in the declaration's
+    /// enclosing scopes and explicit imports, never another file's same-named
+    /// class or an unrelated nested declaration.
+    fn ts_return_value(&self, function: NodeIdx, name: &str) -> Option<ValueType> {
+        if name.is_empty() || name.len() > 4096 {
+            return None;
+        }
+        let (head, tail) = name.split_once('.').unwrap_or((name, ""));
+        let mut owner = Some(function);
+        let mut bound = None;
+        while let Some(scope) = owner {
+            let mut candidates = self.view.by_name(head).filter(|n| {
+                let node = self.view.node(*n);
+                node.file() == self.file && node.parent() == Some(scope) && Accept::Type.ok(node.kind())
+            });
+            if let Some(n) = candidates.next() {
+                if candidates.next().is_some() {
+                    return None;
+                }
+                bound = Some(Bound::Node(n));
+                break;
+            }
+            owner = self.view.node(scope).parent();
+        }
+        let bound = bound.or_else(|| self.visible_import(head, 0).map(|i| self.e.bind_import(self.file, i as usize)))?;
+        let target = if tail.is_empty() { bound } else { self.walk_path(bound, &tail.split('.').collect::<Vec<_>>())? };
+        match target {
+            Bound::Node(n) if self.view.node(n).kind().is_type() => Some(ValueType::plain(n)),
+            _ => None,
+        }
     }
 
     /// Follow declared return types through a bounded chain. Static methods do
@@ -809,9 +851,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 _ => {}
             }
         }
-        receiver.method_receiver(method)?;
-        let m = self.e.find_member(receiver.node, method)?;
-        self.returned_value(wcx, m, Some(receiver.node), depth + 1)
+        let node = receiver.method_receiver(method)?;
+        let m = self.e.find_member(node, method)?;
+        self.returned_value(wcx, m, Some(node), depth + 1)
     }
 
     /// Declared type of field `name` of type `t` (through the hierarchy).
@@ -1430,7 +1472,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             if b.kind != BindKind::LocalFn as u8 {
                 return match self.binding_value(wcx, b, 0) {
                     Some(t) if t.method_receiver(method).is_some() => {
-                        let o = self.member_call(wcx, t.node, path, method, 90, call);
+                        let o = self.member_call(wcx, t.method_receiver(method).unwrap(), path, method, 90, call);
                         if o.status == status::RESOLVED {
                             o
                         } else {

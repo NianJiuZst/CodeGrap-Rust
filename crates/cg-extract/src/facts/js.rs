@@ -370,6 +370,49 @@ fn commonjs_value(cx: &mut Cx, name: &str, value: Node) {
     cx.facts.exports.push(ExportFact { name: name.to_owned(), node_row, from_spec, from_name, star: false });
 }
 
+/// Only nominal return annotations can currently identify a receiver. In
+/// particular, do not reuse ts_type_name's union selection or generic erasure.
+fn return_type_name(cx: &Cx, n: Node) -> String {
+    match n.kind() {
+        "type_annotation" | "parenthesized_type" => n.named_child(0).map(|c| return_type_name(cx, c)).unwrap_or_default(),
+        "type_identifier" | "nested_type_identifier" => cx.text(n).to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn return_annotation(cx: &mut Cx, n: Node, scope: u32) {
+    let (Some(annotation), Some(row)) = (n.child_by_field_name("return_type"), cx.row_at(cx.start(n))) else { return };
+    let mut ty = return_type_name(cx, annotation);
+    // Calling an async/generator function produces a wrapper, regardless of a
+    // malformed annotation. Generic parameters must not resolve to a project
+    // class with the same name, including parameters on an enclosing class.
+    if kids(n).any(|c| matches!(c.kind(), "async" | "*")) {
+        ty.clear();
+    }
+    let head = ty.split('.').next().unwrap_or("");
+    let mut ancestor = Some(n);
+    while let Some(node) = ancestor {
+        if let Some(params) = node.child_by_field_name("type_parameters") {
+            if kids(params).filter_map(|p| p.child_by_field_name("name")).any(|name| cx.text(name) == head) {
+                ty.clear();
+                break;
+            }
+        }
+        ancestor = node.parent();
+    }
+    cx.facts.bindings.push(BindingFact {
+        scope,
+        name: cx.rows.node(row as usize).name().to_owned(),
+        kind: BindKind::ReturnType,
+        // Keep an empty fact for unsupported annotations: the resolver must
+        // distinguish explicit but unknown returns from absent evidence.
+        decl_type: ty,
+        init_ctor: String::new(),
+        line: cx.line(n),
+        node_row: row,
+    });
+}
+
 fn function(cx: &mut Cx, n: Node, scope: u32) {
     // The kernel labels `obj.method = function method() {}` as a Function. Keep
     // evidence of the member assignment so an unknown receiver cannot match an
@@ -399,6 +442,7 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
         }
     }
     let sc = cx.push_scope(ScopeKind::Function, scope, n);
+    return_annotation(cx, n, sc);
     let line = cx.line(n);
     if let Some(p) = n.child_by_field_name("parameter") {
         bind_pattern(cx, p, sc, BindKind::Param, "", ""); // single-identifier arrow parameter
@@ -533,6 +577,8 @@ fn var_decl(cx: &mut Cx, n: Node, scope: u32) {
                 let nm = cx.text(name).to_owned();
                 let line = cx.line(d);
                 cx.add_binding(scope, &nm, BindKind::LocalFn, "", "", line);
+                let row = cx.row_at(cx.start(v));
+                cx.facts.bindings.last_mut().unwrap().node_row = row.unwrap_or(NONE);
             } else {
                 let (vt, init) = value_info(cx, v);
                 let dt = if ty.is_empty() { vt } else { ty };

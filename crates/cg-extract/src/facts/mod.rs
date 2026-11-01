@@ -110,7 +110,8 @@ pub enum BindKind {
     /// This is declaration metadata and must not participate in lexical lookup.
     MemberFn = 5,
     /// Return annotation or a bounded inferred return expression, keyed by the
-    /// function's node. Metadata only; not a lexical binding.
+    /// function's node. An empty TS fact records an unsupported explicit
+    /// annotation. Metadata only; not a lexical binding.
     ReturnType = 6,
 }
 
