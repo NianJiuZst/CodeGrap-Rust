@@ -74,6 +74,9 @@ Tokio 的 `cfg_rt! { pub struct X; impl X { .. } }` 这类宏体对 tree-sitter 
 | 调用 NoCandidate | 11,636 | 10,886 |
 | 调用 Ambiguous | 1,076 | 607 |
 
+`cgr bench sync --edits 60 --verify` 满足 incremental == full rebuild（50 次增量、10 次完整重建），
+`cgr debug diff` 一致，`CGR_THREADS=1` 与多线程得到相同的规范图。
+
 与基线逐引用对比：共同引用 36,425 条，新增解析 1,973 条，丢失 74 条，目标变化 69 条。丢失的 74 条
 多为 `reader.read_exact()` 这类此前靠全局唯一名连到 `tokio-util` 的 `SyncIoBridge::read_exact`
 的边；它们本就与接收者类型无关，现在接收者有了类型信息后不再误连。Express、Gin、Django 的图逐引用
