@@ -1,8 +1,48 @@
 # Second-phase languages and Rust macro items / 新增语言与 Rust 宏内 item
 
-运行时代码：本分支（引擎规则版本 **5**，存储格式仍为 **2**）。基线为 `890912c`（规则版本 4）。
-本页记录的是**样例仓库上的自测数字**，不是与上游 oracle 的对比；上游 oracle 在本轮环境中
-无法构建（见"验证范围"）。精确率只做了随机抽样人工核对，没有做到可以声明 ≥97% 的程度。
+运行时代码：本分支（引擎规则版本 **10**，存储格式仍为 **2**）。"按 README 方式与上游 oracle 对比"
+一节是最新一轮的结果；其后各节保留了更早一轮（规则版本 5，基线 `890912c`）的样例仓库自测记录。
+
+## 按 README 方式与上游 oracle 对比
+
+上游 `colbymchenry/codegraph` @ `d2e0389` 作为 oracle，两边索引同一组文件，按严格边键
+（源、目标、类型、行、列）计算精确率 P 与召回率 R，门槛 P ≥ 97%、R ≥ 95%。
+
+| 仓库 | 语言 | P | R | cgr / 上游 / 共同 | 门槛 |
+|---|---|---:|---:|---|---|
+| cJSON | C | 99.84 | 99.60 | 3,757 / 3,766 / 3,751 | 通过 |
+| MediatR | C# | 98.17 | 97.28 | 5,685 / 5,737 / 5,581 | 通过 |
+| Slim | PHP | 98.21 | 95.39 | 4,527 / 4,661 / 4,446 | 通过 |
+| Sinatra | Ruby | 98.62 | 96.30 | 2,613 / 2,676 / 2,577 | 通过 |
+| fmt | C++ | 94.07 | 92.79 | 20,638 / 20,923 / 19,414 | 未通过 |
+| Alamofire | Swift（+文档里的 JS） | 96.46 | 93.78 | 12,164 / 12,512 / 11,734 | 未通过 |
+
+未通过的两个仓库，剩余差距主要是两边在同一调用位置选了不同目标，抽查到的多为上游的选择有误。
+为了对齐而照搬这些选择会引入错边，所以没有这样做：
+
+- **fmt**：cgr 独有的 1,224 条边里，680 条是同一位置的不同选择：
+  - 470 条同名不同重载。上游常取第一个声明的构造函数而不看参数个数，如 `bigint(42)` 连到
+    `bigint()`，`uint128()` 连到 `uint128(hi, lo)`，`basic_string_view(s, n)` 连到无参构造。
+  - 210 条 `fmt::format(..)` / `fmt::print(..)`，上游连到 `color.h` 的 `text_style` 重载。
+  - 门槛下 cgr 独有边最多约 615 条，所以不照搬这些错误就无法通过。
+- **Alamofire**：
+  - 只看 Swift 是 P 97.41 / R 96.29，单独可以通过。
+  - 差距在 `docs/` 自带的 `jquery.min.js` 与 `typeahead.jquery.js`。压缩代码里嵌套作用域的同名单字母函数，
+    本项目按词法作用域选，上游按名字选（约 256 条）。
+  - 同一文件有多个同名方法时，`this.m()` 上游取行号最近的一个。
+
+本轮新增的规则：
+- C++：宏打开的命名空间里的基类（`fmt::detail::buffer<T>`）按限定名解析；
+  多级成员调用（`pipe.write_end.close()`）保留字段链再按类型解析。
+- JS：对象字面量方法里的 `this.m()`，在该文件恰有一个名为 `m` 的函数时连到它。
+  具名接收者仍不按唯一名猜测。
+
+对照当前 main（`2c35e7a`）：
+- Express、Gin、Zod 与 main 逐边一致，只差上面这条 JS 规则带来的边：Express +6 条共同边、
+  +2 条上游没有但核对正确的 getter 边；Zod +13 条共同边、+2 条正确的方法引用。
+- Tokio 精确率 87.40 → 78.84、召回 86.52 → 88.30。原因是本分支提取了 `cfg_*!` 包装宏里的 Rust 条目
+  （见下文），上游不提取它们，所以多出的边不在 oracle 里。
+- OkHttp、Django 的差别在 0.05 个百分点以内。
 
 ## 做了什么
 
@@ -126,8 +166,8 @@ cJSON、MediatR、Sinatra 不变。
   （只作用于 C++ 与 Swift 代码路径）之后，重跑了全部测试、clippy，以及 fmt 与 Alamofire 的 40 次随机编辑校验。
 - Windows：`x86_64-pc-windows-gnu`（mingw-w64）交叉编译通过，包括 vendor 的 Kotlin 与 Swift C 语法；
   本环境没有 Wine，未能运行生成的 `cgr.exe`，msvc 目标与 `install.ps1` 需要在真实 Windows 上验证。
-- **上游 oracle 未重跑**：本环境不允许执行上游仓库的构建脚本，因此本页没有 v4 文档中那种
-  P*/R 对比数字。Express 的全图 P、Django 路由等 v4 遗留问题本轮没有处理。
+- 上游 oracle 对比见本页开头一节（最新一轮）；更早一轮的环境无法构建 oracle，那一轮的数字只是自测。
+  Express 的全图 P、Django 路由等 v4 遗留问题没有处理。
 
 ## English summary
 
@@ -143,8 +183,12 @@ Rust items inside conditional wrapper macros (`cfg_rt! { .. }`) are extracted fr
 position-preserving view with only the wrapper tokens blanked; on Tokio this adds 739 nodes and
 2,216 resolved call references while Express, Gin and Django are unchanged reference-for-reference.
 
-The numbers above are self-measurements on sample repositories with random spot checks, not an
-upstream-oracle comparison and not a precision estimate. `incremental == full rebuild` holds on
+Against the upstream oracle (`d2e0389`, strict edge keys), cJSON, MediatR, Slim and Sinatra meet
+the P ≥ 97% / R ≥ 95% gate; fmt (94.07 / 92.79) and Alamofire (96.46 / 93.78) do not, mainly where
+the two pick different overloads or scopes at the same call site (upstream often takes the first
+declared constructor regardless of arity). Tokio's oracle precision drops from 87.40 to 78.84
+because the `cfg_*!` items extracted here are absent upstream. The earlier-round sample-repository
+numbers above are self-measurements with random spot checks, not a precision estimate. `incremental == full rebuild` holds on
 all six repositories over 40 random edits each. A self-review pass (34 candidates) added depth
 bounds to the extractors, deterministic tie-breaking, C++ global-namespace and `::std` handling,
 PHP `parent::` and namespaces, narrower Ruby `require` and an explicit Swift standard-type list; the

@@ -2531,7 +2531,8 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 // `this.m()` in an object literal's method (`_.mixin(Input.prototype, Emitter, {..})`):
                 // `this` is no arbitrary receiver, and the file defines one function `m`
                 let view = self.view;
-                let mut own = view.by_name(method).filter(|&n| view.hot(n).file == self.file && matches!(kind_of(view, n), NodeKind::Function | NodeKind::Method));
+                let mut own =
+                    view.by_name(method).filter(|&n| view.hot(n).file == self.file && matches!(kind_of(view, n), NodeKind::Function | NodeKind::Method));
                 if let (Some(n), None) = (own.next(), own.next()) {
                     return Outcome::found(n, by::LEXICAL, 50);
                 }
@@ -2961,7 +2962,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
             .by_name(node.name())
             .filter(|&n| {
                 let m = view.node(n);
-                view.hot(n).file == self.file && matches!(m.kind(), NodeKind::Method | NodeKind::Function) && m.qname().rsplit_once("::").map_or("", |(p, _)| p) == owner
+                view.hot(n).file == self.file
+                    && matches!(m.kind(), NodeKind::Method | NodeKind::Function)
+                    && m.qname().rsplit_once("::").map_or("", |(p, _)| p) == owner
             })
             .collect();
         sibs.sort_by_key(|&n| view.node(n).start_line());
@@ -3124,7 +3127,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 TypeRes::External => NameRes::External,
                 TypeRes::Builtin => NameRes::Builtin,
                 // `fmt::detail::buffer<T>` with `fmt` opened by a macro
-                TypeRes::Unknown if self.family == LangFamily::C => self.cpp_scoped(name, true).map_or(NameRes::NotFound, |n| NameRes::Found(n, by::QUALIFIED, 90)),
+                TypeRes::Unknown if self.family == LangFamily::C => {
+                    self.cpp_scoped(name, true).map_or(NameRes::NotFound, |n| NameRes::Found(n, by::QUALIFIED, 90))
+                }
                 TypeRes::Unknown => NameRes::NotFound,
             }
         } else if let Some(n) = self.cpp_nested_type(r.from, name) {

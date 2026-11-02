@@ -7,7 +7,7 @@
 #    (read straight from the object database, the working tree is not touched);
 # 2. applies crates/cg-kernel/patches/*.patch in lexical order (P1 no napi + MVP
 #    language subset, P2 allow error trees, P4 parse hook with timeout/tree stash,
-#    P5 second-phase languages behind cargo features);
+#    P5 JS/TS graph fixes, then P5 second-phase languages behind cargo features);
 # 3. replaces crates/cg-kernel/{src,grammars,build.rs,Cargo.toml} and records
 #    the commit in crates/cg-kernel/UPSTREAM_COMMIT.
 #
