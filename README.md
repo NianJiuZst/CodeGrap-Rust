@@ -291,8 +291,8 @@ events and the Fabric / Expo native side, Tauri events, GoFrame, and Python para
 C/C++, C#, PHP, Ruby and Swift use the upstream extraction walkers with this project's own
 resolution rules (includes, namespaces, `require`, SwiftPM modules, implicit `this` members).
 Against upstream `d2e0389` on strict edge keys, cJSON, MediatR, Slim and Sinatra meet the
-97% / 95% gate; fmt (94.1% / 92.8%) and Alamofire (96.5% / 93.8%) do not, mostly where the two
-pick different overloads or scopes (see [docs/LANGUAGES-P5.md](docs/LANGUAGES-P5.md)). These
+97% / 95% gate; fmt (94.1% / 92.8%) and Alamofire (96.5% / 93.8%) do not; much of the gap is
+call sites where the two pick different overloads or scopes (see [docs/LANGUAGES-P5.md](docs/LANGUAGES-P5.md)). These
 languages have no framework route rules yet. Dart, Scala, Lua, Luau and R are detected but not extracted.
 Vue/Svelte-specific extraction is also outside the current scope.
 

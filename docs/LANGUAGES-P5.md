@@ -17,24 +17,28 @@
 | fmt | C++ | 94.07 | 92.79 | 20,638 / 20,923 / 19,414 | 未通过 |
 | Alamofire | Swift（+文档里的 JS） | 96.46 | 93.78 | 12,164 / 12,512 / 11,734 | 未通过 |
 
-未通过的两个仓库，剩余差距主要是两边在同一调用位置选了不同目标，抽查到的多为上游的选择有误。
-为了对齐而照搬这些选择会引入错边，所以没有这样做：
+未通过的两个仓库，差距有相当一部分是两边在同一调用位置选了不同目标。其中明确是上游选错的，
+没有为了对齐去照搬：
 
 - **fmt**：cgr 独有的 1,224 条边里，680 条是同一位置的不同选择：
-  - 470 条同名不同重载。上游常取第一个声明的构造函数而不看参数个数，如 `bigint(42)` 连到
-    `bigint()`，`uint128()` 连到 `uint128(hi, lo)`，`basic_string_view(s, n)` 连到无参构造。
-  - 210 条 `fmt::format(..)` / `fmt::print(..)`，上游连到 `color.h` 的 `text_style` 重载。
-  - 门槛下 cgr 独有边最多约 615 条，所以不照搬这些错误就无法通过。
+  - 约 340 条明确是上游的错误：
+    - 210 条 `fmt::format(..)` / `fmt::print(..)` 被上游连到 `color.h` 的 `text_style` 重载；
+    - 约 130 条构造调用，上游取第一个声明的构造函数而不看参数个数，如 `bigint(42)` 连到
+      `bigint()`，`uint128()` 连到 `uint128(hi, lo)`，`basic_string_view(s, n)` 连到无参构造。
+  - 另约 340 条是模板重载的不同选择（`fill_n`、`format_decimal`、`write2digits` 等），两边都可能对。
+  - 门槛下 cgr 独有边最多约 615 条。即使只把那约 340 条明确错误算作无法避免，也要在共同边 +463 的同时，
+    把其余 cgr 独有边从约 884 条降到约 275 条。
 - **Alamofire**：
   - 只看 Swift 是 P 97.41 / R 96.29，单独可以通过。
-  - 差距在 `docs/` 自带的 `jquery.min.js` 与 `typeahead.jquery.js`。压缩代码里嵌套作用域的同名单字母函数，
-    本项目按词法作用域选，上游按名字选（约 256 条）。
+  - 差距在 `docs/` 自带的 `jquery.min.js` 与 `typeahead.jquery.js`。压缩代码里有大量嵌套作用域的同名函数：
+    约 126 条是两边在同一位置选了不同目标（没有逐条核对谁对），约 130 条是上游连了、本项目没有解析。
   - 同一文件有多个同名方法时，`this.m()` 上游取行号最近的一个。
 
 本轮新增的规则：
 - C++：宏打开的命名空间里的基类（`fmt::detail::buffer<T>`）按限定名解析；
   多级成员调用（`pipe.write_end.close()`）保留字段链再按类型解析。
-- JS：对象字面量方法里的 `this.m()`，在该文件恰有一个名为 `m` 的函数时连到它。
+- JS：`this.m()` 所在的函数既不在类里、也没有 prototype 归属时（如 `_.mixin(X.prototype, {..})` 的
+  对象字面量方法、传给 `defineGetter` 的 getter），若该文件恰有一个名为 `m` 的函数就连到它。
   具名接收者仍不按唯一名猜测。
 
 对照当前 main（`2c35e7a`）：
@@ -184,9 +188,9 @@ position-preserving view with only the wrapper tokens blanked; on Tokio this add
 2,216 resolved call references while Express, Gin and Django are unchanged reference-for-reference.
 
 Against the upstream oracle (`d2e0389`, strict edge keys), cJSON, MediatR, Slim and Sinatra meet
-the P ≥ 97% / R ≥ 95% gate; fmt (94.07 / 92.79) and Alamofire (96.46 / 93.78) do not, mainly where
-the two pick different overloads or scopes at the same call site (upstream often takes the first
-declared constructor regardless of arity). Tokio's oracle precision drops from 87.40 to 78.84
+the P ≥ 97% / R ≥ 95% gate; fmt (94.07 / 92.79) and Alamofire (96.46 / 93.78) do not. Much of the
+gap is call sites where the two pick different overloads or scopes; in fmt about 340 of those are
+clear upstream errors (the first declared constructor regardless of arity, `color.h` overloads). Tokio's oracle precision drops from 87.40 to 78.84
 because the `cfg_*!` items extracted here are absent upstream. The earlier-round sample-repository
 numbers above are self-measurements with random spot checks, not a precision estimate. `incremental == full rebuild` holds on
 all six repositories over 40 random edits each. A self-review pass (34 candidates) added depth
