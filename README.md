@@ -231,7 +231,7 @@ in the bilingual [engineering record](docs/PERFORMANCE-IMPLEMENTATION.md).
 
 ### Build and install from source
 
-Source installation is the currently available path. Requirements are **Rust 1.89 or newer**,
+Building from source requires **Rust 1.89 or newer**,
 Cargo, Git and a C compiler toolchain for the Tree-sitter grammars.
 
 ```sh
@@ -260,12 +260,12 @@ Download scripts verify SHA-256 checksums for the archives on the
 [Releases page](https://github.com/NianJiuZst/CodeGraph-Rust/releases).
 
 ```sh
-# Linux / macOS — requires a published release
+# Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/NianJiuZst/CodeGraph-Rust/main/scripts/install.sh | sh
 ```
 
 ```powershell
-# Windows, PowerShell 7+ — requires a published release
+# Windows, PowerShell 7+
 irm https://raw.githubusercontent.com/NianJiuZst/CodeGraph-Rust/main/scripts/install.ps1 | iex
 ```
 

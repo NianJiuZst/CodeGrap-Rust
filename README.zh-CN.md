@@ -200,7 +200,7 @@ MCP 增加排队上限、协作取消及项目/监听资源回收。
 
 ### 从源码构建并安装
 
-目前可用的安装方式是源码安装。需要 **Rust 1.89 或更新版本**、Cargo、Git，以及用于编译 Tree-sitter 语法的 C 编译工具链。
+从源码构建需要 **Rust 1.89 或更新版本**、Cargo、Git，以及用于编译 Tree-sitter 语法的 C 编译工具链。
 
 ```sh
 git clone https://github.com/NianJiuZst/CodeGraph-Rust.git
@@ -226,12 +226,12 @@ Windows 下的可执行文件为 `target\release\cgr.exe`。
 下载脚本会校验 [Releases 页面](https://github.com/NianJiuZst/CodeGraph-Rust/releases)上发布的归档文件的 SHA-256。
 
 ```sh
-# Linux / macOS：需要已有发布包
+# Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/NianJiuZst/CodeGraph-Rust/main/scripts/install.sh | sh
 ```
 
 ```powershell
-# Windows，PowerShell 7+：需要已有发布包
+# Windows，PowerShell 7+
 irm https://raw.githubusercontent.com/NianJiuZst/CodeGraph-Rust/main/scripts/install.ps1 | iex
 ```
 
