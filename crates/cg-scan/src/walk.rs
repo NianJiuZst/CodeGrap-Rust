@@ -232,6 +232,7 @@ pub fn find_config_files(root: &Path, config: &ProjectConfig, max_depth: usize) 
             || (name.starts_with("requirements") && name.ends_with(".txt"))
     };
     let mut out = Vec::new();
+    let mut ignored_candidates = FxHashSet::default();
     let walker = WalkBuilder::new(root).standard_filters(false).follow_links(false).max_depth(Some(max_depth)).build();
     for e in walker.flatten() {
         let Some(rel) = rel_string(root, e.path()) else { continue };
@@ -239,14 +240,31 @@ pub fn find_config_files(root: &Path, config: &ProjectConfig, max_depth: usize) 
             continue;
         }
         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if rules.is_ignored(&rel, is_dir) {
-            continue;
+        if !is_dir && !e.file_type().is_some_and(|t| t.is_symlink()) && is_config(e.file_name().to_str().unwrap_or("")) {
+            if !rules.is_ignored(&rel, false) {
+                out.push(rel);
+            } else if !rules.builtin_ignored(&rel, false) {
+                ignored_candidates.insert(rel);
+            }
         }
-        if !is_dir && is_config(e.file_name().to_str().unwrap_or("")) {
-            out.push(rel);
+    }
+    // A checked-in manifest can be covered by a broad .gitignore intended for
+    // generated files (for example, `**/package.json`). Source scanning already
+    // revives tracked-but-ignored files; apply the same policy to configuration.
+    // Built-in exclusions and explicit cgr excludes still win. Avoid a Git
+    // subprocess when there are no ignored candidate manifests.
+    if !ignored_candidates.is_empty() {
+        for rel in git_tracked_ignored(root) {
+            if !ignored_candidates.contains(&rel) {
+                continue;
+            }
+            if std::fs::symlink_metadata(root.join(&rel)).is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink()) {
+                out.push(rel);
+            }
         }
     }
     out.sort();
+    out.dedup();
     out
 }
 

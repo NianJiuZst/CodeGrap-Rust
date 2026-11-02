@@ -21,6 +21,9 @@ pub enum ExportEntry {
     Module(FileId),
 }
 
+type ExportMap<'v> = FxHashMap<&'v str, ExportEntry>;
+type FileExports<'v> = (usize, ExportMap<'v>, ExportMap<'v>, Vec<FileId>);
+
 /// Result of binding a local name through an import.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bound {
@@ -39,6 +42,8 @@ pub struct Engine<'v> {
     /// Per file (indexed by `FileId`): targets aligned with `view.imports_of(file)`.
     pub imp_targets: Vec<Vec<ImportTarget>>,
     pub exports: Vec<FxHashMap<&'v str, ExportEntry>>,
+    /// JS/TS type declarations sharing an exported name with a runtime value.
+    pub type_exports: Vec<FxHashMap<&'v str, ExportEntry>>,
     pub stars: Vec<Vec<FileId>>,
     /// Per package: top-level definitions by name.
     pub pkg_defs: Vec<FxHashMap<&'v str, SmallVec<[NodeIdx; 2]>>>,
@@ -115,6 +120,7 @@ impl<'v> Engine<'v> {
             modules,
             imp_targets,
             exports: vec![FxHashMap::default(); n_files],
+            type_exports: vec![FxHashMap::default(); n_files],
             stars: vec![Vec::new(); n_files],
             pkg_defs: Vec::new(),
             supers: FxHashMap::default(),
@@ -182,11 +188,12 @@ impl<'v> Engine<'v> {
 
     fn build_exports(&mut self, files: &[FileId]) {
         let view = self.view;
-        let results: Vec<(usize, FxHashMap<&'v str, ExportEntry>, Vec<FileId>)> = files
+        let results: Vec<FileExports<'v>> = files
             .par_iter()
             .map(|&f| {
                 let lang = view.file(f).lang();
                 let mut map: FxHashMap<&'v str, ExportEntry> = FxHashMap::default();
+                let mut types: FxHashMap<&'v str, ExportEntry> = FxHashMap::default();
                 let mut stars = Vec::new();
                 let family = lang.family();
                 // Local definitions
@@ -198,9 +205,26 @@ impl<'v> Engine<'v> {
                     };
                     if exported {
                         let name = node.name();
+                        if family == LangFamily::Js && node.kind().is_type() {
+                            match types.get(name) {
+                                Some(ExportEntry::Node(prev)) if node.kind() == NodeKind::Class && view.node(*prev).kind() != NodeKind::Class => {
+                                    types.insert(name, ExportEntry::Node(n));
+                                }
+                                Some(_) => {}
+                                None => {
+                                    types.insert(name, ExportEntry::Node(n));
+                                }
+                            }
+                        }
                         match map.get(name) {
                             // class beats interface/type alias for merged declarations
-                            Some(ExportEntry::Node(prev)) if view.node(*prev).kind().is_type() && !node.kind().is_type() => {}
+                            Some(ExportEntry::Node(prev))
+                                if family == LangFamily::Js
+                                    && matches!(view.node(*prev).kind(), NodeKind::Interface | NodeKind::TypeAlias)
+                                    && !node.kind().is_type() =>
+                            {
+                                map.insert(name, ExportEntry::Node(n));
+                            }
                             Some(ExportEntry::Node(prev)) if !(node.kind() == NodeKind::Class && view.node(*prev).kind() != NodeKind::Class) => {}
                             _ => {
                                 map.insert(name, ExportEntry::Node(n));
@@ -238,7 +262,34 @@ impl<'v> Engine<'v> {
                     } else {
                         // `export { a as b }` / `export default a`: alias of a local definition
                         let local = view.text_str(ex.from_name);
-                        if let Some(n) = self.top_level_nodes(f).find(|n| view.node(*n).name() == local) {
+                        if family == LangFamily::Js {
+                            if let Some(n) = self.top_level_nodes(f).find(|n| view.node(*n).name() == local && view.node(*n).kind().is_type()) {
+                                types.insert(name, ExportEntry::Node(n));
+                            }
+                        }
+                        let imported = (family == LangFamily::Js)
+                            .then(|| {
+                                view.imports_of(f).iter().enumerate().find(|(_, imp)| view.text_str(imp.local) == local && imp.scope.0 == view.scope_base(f))
+                            })
+                            .flatten();
+                        if let Some((i, imp)) = imported {
+                            if let Some(ImportTarget::File(tf)) = self.imp_targets[f.idx()].get(i).copied() {
+                                let from = view.text_str(imp.imported);
+                                let entry = if imp.kind == ImportKind::Namespace as u8 || from == "*" {
+                                    ExportEntry::Module(tf)
+                                } else {
+                                    ExportEntry::Re(tf, imp.imported)
+                                };
+                                map.insert(name, entry);
+                            }
+                        } else if let Some(n) = (family == LangFamily::Js)
+                            .then(|| {
+                                self.top_level_nodes(f)
+                                    .find(|n| view.node(*n).name() == local && !matches!(view.node(*n).kind(), NodeKind::Interface | NodeKind::TypeAlias))
+                            })
+                            .flatten()
+                            .or_else(|| self.top_level_nodes(f).find(|n| view.node(*n).name() == local))
+                        {
                             map.insert(name, ExportEntry::Node(n));
                         }
                     }
@@ -263,11 +314,12 @@ impl<'v> Engine<'v> {
                         }
                     }
                 }
-                (f.idx(), map, stars)
+                (f.idx(), map, types, stars)
             })
             .collect();
-        for (i, m, s) in results {
+        for (i, m, t, s) in results {
             self.exports[i] = m;
+            self.type_exports[i] = t;
             self.stars[i] = s;
         }
         // Rust child modules (`mod x;` -> x.rs) are exports of their parent module
@@ -389,15 +441,28 @@ impl<'v> Engine<'v> {
 
     // ---------------------------------------------------------------- lookups
     pub fn lookup_export(&self, f: FileId, name: &str, depth: u8) -> Option<Bound> {
+        self.lookup_export_in_space(f, name, depth, false)
+    }
+
+    pub fn lookup_type_export(&self, f: FileId, name: &str, depth: u8) -> Option<Bound> {
+        self.lookup_export_in_space(f, name, depth, true)
+    }
+
+    fn lookup_export_in_space(&self, f: FileId, name: &str, depth: u8, type_space: bool) -> Option<Bound> {
         if depth > 8 || f.idx() >= self.exports.len() {
             return None;
+        }
+        if type_space {
+            if let Some(ExportEntry::Node(n)) = self.type_exports[f.idx()].get(name) {
+                return Some(Bound::Node(*n));
+            }
         }
         if let Some(e) = self.exports[f.idx()].get(name) {
             match *e {
                 ExportEntry::Node(n) => return Some(Bound::Node(n)),
                 ExportEntry::Module(m) => return Some(Bound::Module(m)),
                 ExportEntry::Re(tf, from) => {
-                    if let Some(b) = self.lookup_export(tf, self.view.text_str(from), depth + 1) {
+                    if let Some(b) = self.lookup_export_in_space(tf, self.view.text_str(from), depth + 1, type_space) {
                         return Some(b);
                     }
                 }
@@ -405,7 +470,7 @@ impl<'v> Engine<'v> {
         }
         if name != "default" {
             for &tf in &self.stars[f.idx()] {
-                if let Some(b) = self.lookup_export(tf, name, depth + 1) {
+                if let Some(b) = self.lookup_export_in_space(tf, name, depth + 1, type_space) {
                     return Some(b);
                 }
             }
@@ -441,6 +506,14 @@ impl<'v> Engine<'v> {
 
     /// Bind the name introduced by an import record.
     pub fn bind_import(&self, f: FileId, idx: usize) -> Bound {
+        self.bind_import_in_space(f, idx, false)
+    }
+
+    pub fn bind_type_import(&self, f: FileId, idx: usize) -> Bound {
+        self.bind_import_in_space(f, idx, true)
+    }
+
+    fn bind_import_in_space(&self, f: FileId, idx: usize, type_space: bool) -> Bound {
         let imp = &self.view.imports_of(f)[idx];
         let tgt = self.imp_targets[f.idx()].get(idx).copied().unwrap_or(ImportTarget::External);
         let imported = self.view.text_str(imp.imported);
@@ -463,7 +536,7 @@ impl<'v> Engine<'v> {
                     }
                     return Bound::Unknown;
                 }
-                if let Some(b) = self.lookup_export(tf, imported, 0) {
+                if let Some(b) = self.lookup_export_in_space(tf, imported, 0, type_space) {
                     return b;
                 }
                 if let Some(sm) = self.submodule(tf, imported) {

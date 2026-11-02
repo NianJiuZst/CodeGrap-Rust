@@ -73,6 +73,42 @@ pub(crate) fn parse(parser: &mut Parser, source: &str) -> Option<Tree> {
     tree
 }
 
+/// Retry a completed error tree with an equal-byte-length lexical rewrite. The walker and facts
+/// still read the original source. Accept the retry only when it removes every parse error and
+/// preserve the original result if the bounded optional retry fails.
+pub(crate) fn parse_with_rewrite(
+    parser: &mut Parser,
+    source: &str,
+    rewrite: impl FnOnce(&Tree, &str) -> Option<String>,
+) -> Option<Tree> {
+    let start = Instant::now();
+    let original = parse(parser, source)?;
+    if !original.root_node().has_error() {
+        return Some(original);
+    }
+    let Some(masked) = rewrite(&original, source) else { return Some(original) };
+    if masked.len() != source.len() {
+        return Some(original);
+    }
+    let limit = TIMEOUT.with(|c| c.get());
+    let remaining = match limit {
+        Some(limit) => match limit.checked_sub(start.elapsed()) {
+            Some(left) if !left.is_zero() => Some(left),
+            _ => return Some(original),
+        },
+        None => None,
+    };
+    TIMEOUT.with(|c| c.set(remaining));
+    let retry = parse(parser, &masked);
+    TIMEOUT.with(|c| c.set(limit));
+    if let Some(tree) = retry.filter(|t| !t.root_node().has_error()) {
+        return Some(tree);
+    }
+    TIMED_OUT.with(|c| c.set(false));
+    STASH.with(|s| *s.borrow_mut() = Some(original.clone()));
+    Some(original)
+}
+
 /// The tree-sitter grammar the kernel uses for `lang` (tests and dev tools; the facts
 /// extractor never needs it because it reuses the kernel's tree).
 pub fn language(lang: &str) -> Option<tree_sitter::Language> {

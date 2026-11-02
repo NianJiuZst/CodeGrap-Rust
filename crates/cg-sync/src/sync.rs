@@ -282,9 +282,12 @@ fn resolver_fact_sig(view: &View, f: FileId) -> ResolverFactSig {
             ((b.kind == BindKind::MemberFn as u8
                 || b.kind == BindKind::ReturnType as u8
                 || b.kind == BindKind::Fixture as u8
-                || b.kind == BindKind::TypeAlias as u8)
+                || b.kind == BindKind::TypeAlias as u8
+                || b.kind == BindKind::FactoryMixin as u8)
                 && b.node.is_some())
                 || b.kind == BindKind::Deref as u8
+                || b.kind == BindKind::Mutation as u8
+                || b.kind == BindKind::CommonJsObject as u8
         })
         .map(|b| {
             (
@@ -308,6 +311,18 @@ fn export_sig(view: &View, f: FileId) -> ExportSig {
         .collect();
     v.sort();
     v
+}
+
+/// A local export can forward an imported binding (`import * as z ...; export { z }`).
+/// Changing that import changes the exported module even when the export syntax is unchanged.
+fn reexported_import_sig(view: &View, f: FileId) -> BTreeSet<(String, String, String, u8, u8)> {
+    let locals: FxHashSet<&str> =
+        view.exports_of(f).iter().filter(|e| view.text_str(e.from_spec).is_empty() && e.node.is_none()).map(|e| view.text_str(e.from_name)).collect();
+    view.imports_of(f)
+        .iter()
+        .filter(|i| i.scope.0 == view.scope_base(f) && locals.contains(view.text_str(i.local)))
+        .map(|i| (view.text_str(i.local).to_owned(), view.text_str(i.spec).to_owned(), view.text_str(i.imported).to_owned(), i.kind, i.type_only))
+        .collect()
 }
 
 /// Pair the nodes of a replaced file before and after the edit by identity (kind + qualified
@@ -593,7 +608,7 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
         }
         if states[i] == DeltaState::Replaced {
             pair_nodes(&base_view, &view1, *f, &mut remap);
-            if export_sig(&base_view, *f) != export_sig(&view1, *f) {
+            if export_sig(&base_view, *f) != export_sig(&view1, *f) || reexported_import_sig(&base_view, *f) != reexported_import_sig(&view1, *f) {
                 export_changed.push(*f);
             }
         }
