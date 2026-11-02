@@ -2528,6 +2528,13 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 if let Some(n) = self.assigned_this_member(r, method) {
                     return Outcome::found(n, by::RECEIVER, 90);
                 }
+                // `this.m()` in an object literal's method (`_.mixin(Input.prototype, Emitter, {..})`):
+                // `this` is no arbitrary receiver, and the file defines one function `m`
+                let view = self.view;
+                let mut own = view.by_name(method).filter(|&n| view.hot(n).file == self.file && matches!(kind_of(view, n), NodeKind::Function | NodeKind::Method));
+                if let (Some(n), None) = (own.next(), own.next()) {
+                    return Outcome::found(n, by::LEXICAL, 50);
+                }
             }
             return if fields.is_empty() { self.fallback_method(method) } else { Outcome::st(status::NO_CANDIDATE) };
         };

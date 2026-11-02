@@ -710,6 +710,22 @@ fn cpp_bases_in_macro_namespaces_and_calls_through_field_chains_are_typed() {
 }
 
 #[test]
+fn js_this_calls_in_object_literal_methods_reach_the_one_function_of_their_file() {
+    let (_d, view) = project(&[
+        (
+            "src/typeahead.js",
+            "var EventEmitter = (function () {\n  function trigger(types) { return types; }\n  return { trigger: trigger };\n})();\nfunction Input() {}\nfunction dup() {}\nvar Other = { dup: function dup() {} };\n_.mixin(Input.prototype, EventEmitter, {\n  _onBlur: function onBlur() {\n    this.trigger('blurred');\n    this.dup();\n    this.elsewhere();\n  },\n});\n",
+        ),
+        ("src/other.js", "function elsewhere() {}\n"),
+    ]);
+    let edges = edges_of(&view);
+    let from_blur = |to: &str| edges.iter().any(|e| e.contains("onBlur -calls->") && e.ends_with(to));
+    assert!(from_blur("-calls-> src/typeahead.js::EventEmitter::trigger"), "{edges:?}");
+    assert!(!edges.iter().any(|e| e.contains("onBlur -calls->") && e.contains("::dup")), "two `dup` in the file: {edges:?}");
+    assert!(!from_blur("-calls-> src/other.js::elsewhere"), "another file's function: {edges:?}");
+}
+
+#[test]
 fn ruby_bare_calls_are_method_calls_and_modules_reach_by_name() {
     let (_d, view) = project(&[(
         "lib/app.rb",
