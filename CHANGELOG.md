@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased — language coverage and Rust macro items
+## 0.1.0 — first release
+
+### Language coverage and Rust macro items
 
 - Vendor the upstream C/C++, C#, PHP, Ruby and Swift walkers and the Swift grammar through
   kernel patch P5 (`scripts/sync-kernel.sh` re-vendors them; each language has a cargo feature).
@@ -29,7 +31,7 @@
   assertion panic on any kernel failure in debug/test builds).
 - **Engine rules version 5**: indexes built by an older engine are rebuilt on the next sync.
 
-## Unreleased — engine performance follow-through
+### Engine performance follow-through
 
 - Add event-path sync, bounded watcher events and source-free snapshot compaction after a
   quiet period. Keep full scanning/rebuild fallbacks for broad or structural changes.
@@ -51,11 +53,11 @@
   unchanged; a new benchmark was refused by the resource preflight, so no additional speedup
   is claimed.
 
-## 0.1.0 — first release (milestones M0–M4)
+### Initial milestones M0–M4
 
 **Engine**
 - Static single binary `cgr`; vendored upstream tree-sitter kernel (TypeScript/JavaScript, Python,
-  Go, Java, Rust, Kotlin) with three small patches, re-vendorable with `scripts/sync-kernel.sh`.
+  Go, Java, Rust, Kotlin, C/C++, C#, PHP, Ruby, Swift), re-vendorable with `scripts/sync-kernel.sh`.
 - Immutable, memory-mapped snapshot format (header, checksummed partitions, CSR edges, FST name
   indexes, trigram and BM25 indexes), published atomically; readers never block the writer.
 - Reference resolution in rounds (module tables, export closure, scope/import/receiver/qualified
@@ -82,5 +84,5 @@
 - CI: rustfmt, clippy `-D warnings`, kernel re-vendoring check, tests on Linux/macOS/Windows,
   smoke test, static musl build. Release workflow for six targets with checksums; install scripts.
 
-Not in this release: C/C++, C#, PHP, Ruby, Swift and the other upstream languages; Vue/Svelte;
+Not in this release: other upstream languages; Vue/Svelte;
 code signing and notarisation; npm/PyPI wrappers; Homebrew tap. See the README's current limitations.

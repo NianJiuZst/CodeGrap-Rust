@@ -68,12 +68,12 @@ jobs:
           echo "bin=target/${{ matrix.target }}/release/$exe" >> "$GITHUB_OUTPUT"
           ls -l "$archive"
 
-      - name: binary size is within the budget (MVP <= 35 MB)
+      - name: binary size is within the budget (<= 45 MiB)
         shell: bash
         run: |
           size=$(wc -c < "${{ steps.pack.outputs.bin }}")
           echo "binary: $size bytes"
-          test "$size" -le 36700160
+          test "$size" -le 47185920
 
       - name: static Linux executable
         if: matrix.zig

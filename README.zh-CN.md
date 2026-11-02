@@ -223,9 +223,7 @@ Windows 下的可执行文件为 `target\release\cgr.exe`。
 
 ### Release 下载脚本
 
-仓库已包含发布打包流程和校验 SHA-256 的下载脚本。**截至 2026-11-01，尚未发布 GitHub Release。**
-以下命令需要 [Releases 页面](https://github.com/NianJiuZst/CodeGraph-Rust/releases)已有对应平台的归档与校验文件；
-这些文件发布前，请使用上面的源码安装方式。
+下载脚本会校验 [Releases 页面](https://github.com/NianJiuZst/CodeGraph-Rust/releases)上发布的归档文件的 SHA-256。
 
 ```sh
 # Linux / macOS：需要已有发布包

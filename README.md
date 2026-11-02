@@ -256,10 +256,8 @@ On Windows, the executable is `target\release\cgr.exe`.
 
 ### Release installers
 
-The repository includes release packaging and checksum-verifying download scripts. **As of
-2026-11-01, no GitHub Release has been published.** The following commands require published
-archives and checksum files on the [Releases page](https://github.com/NianJiuZst/CodeGraph-Rust/releases).
-Until those assets are available, use the source installation above.
+Download scripts verify SHA-256 checksums for the archives on the
+[Releases page](https://github.com/NianJiuZst/CodeGraph-Rust/releases).
 
 ```sh
 # Linux / macOS — requires a published release
