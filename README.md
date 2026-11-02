@@ -58,89 +58,161 @@ differs from upstream; see [current limitations](#current-limitations).
 
 ## Measured performance
 
-The **2026-11-01 six-repository retest** of `cgr` **`edb403e`** and upstream
-**`d2e0389`** measured a **4.77× geometric-mean full-index speedup** and
-**78.3%–88.7% lower median peak RSS** on this machine. The corpus adds TypeScript
-Zod and Kotlin/Java OkHttp to the previous four repositories. Both sides indexed the same
-files and bytes, and upstream's native kernel was enabled.
+Measured on **2026-11-02** with merged `main` **`cd69b83`** against upstream
+[colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) **`d2e0389`** with its native
+kernel loaded, on twelve repositories covering JavaScript, Go, Rust, Python, TypeScript,
+Kotlin/Java, C, C++, C#, PHP, Ruby and Swift. Every row comes from the same machine and
+configuration. Equal-weight geometric-mean speedups are **6.63×** for full indexing,
+**9.23× / 7.04× / 3.14×** for incremental CLI sync (no changes / comment edit /
+single-file rename), **3.92×** for warm explore P50 and **13.12×** for a new-process `explore`.
+Median peak RSS during full indexing is **55.2%–87.6%** lower. `cgr` is not faster in every
+cell: the Tokio rename sync is slower (0.84×) because it falls back to a full rebuild, and warm
+P95 is slightly slower in cJSON and MediatR. Strict graph agreement with upstream meets the
+97% precision / 95% recall gate in **4 of 12** repositories; upstream is a reference rather
+than semantic ground truth, and faster runs do not imply equal graphs. All samples, queries,
+sync reports and per-kind graph counts are in the
+[structured evidence](docs/benchmarks/2026-11-02-twelve-repo.json).
 
-| Repository | Files | Upstream full index | `cgr` full index | Speedup | Peak RSS: upstream → `cgr` |
-|---|---:|---:|---:|---:|---:|
-| Express | 142 | 536.2 ms | 136.0 ms | **3.94×** | 225.6 → 48.9 MiB |
-| Gin | 99 | 620.8 ms | 130.5 ms | **4.76×** | 246.9 → 37.0 MiB |
-| Tokio | 814 | 2,592.2 ms | 555.3 ms | **4.67×** | 733.6 → 83.3 MiB |
-| Django | 2,984 | 10,597.8 ms | 1,934.0 ms | **5.48×** | 1,896.8 → 237.4 MiB |
-| Zod | 523 | 2,287.0 ms | 474.1 ms | **4.82×** | 627.2 → 93.8 MiB |
-| OkHttp | 690 | 3,136.6 ms | 613.9 ms | **5.11×** | 814.2 → 109.0 MiB |
+| Setting | Value |
+|---|---|
+| Machine | AMD Ryzen 9 8940HX (16 cores, 32 threads), Windows 11 on AC power; WSL2 Ubuntu 24.04 (Linux 6.18.33.2) with 15 GiB RAM |
+| `cgr` | `cd69b83`, `cargo build --release --locked -p cgr` (fat LTO, one codegen unit), rustc 1.99.1 |
+| Upstream | `d2e0389` production `dist/` with the `linux-x64` native kernel prebuild; Node v24.18.0 launched as `node --liftoff-only --disable-warning=ExperimentalWarning` |
+| Workers | `CGR_THREADS=2`, `CGR_MEMORY_MB=2048`; `CODEGRAPH_PARSE_WORKERS=2`, `CODEGRAPH_RESOLVE_WORKERS=2`; telemetry off |
+| Timing | one command at a time, at least 30 s between timed commands, at least 6 GiB available memory before each, warm OS caches; wall time includes process start and exit, peak RSS comes from `wait4` |
+| Corpus | the pinned commits below; both sides index the same files with identical SHA-256 source digests (files only one side would index are excluded on both through `codegraph.json`) |
 
-Three timed CLI rebuilds follow one warmup; the restricted tier uses two workers and
-a 2 GiB `cgr` memory budget. Commands run on AC power with at least 30 seconds between
-runs and warm OS caches. Full-graph precision and recall against upstream do not both meet
-the 97% / 95% gate in any of the six repositories; graph outputs differ and upstream is not
-semantic ground truth. See the [six-repository report](docs/BENCHMARKS-SIX-REPO-2026-11-01.md)
-and [structured evidence](docs/benchmarks/2026-11-01-six-repo-retest.json).
+### Full indexing
 
-### Second-phase languages
+One untimed warmup and three timed complete CLI rebuilds per side, in alternating order.
+Upstream's empty database is created first with its `CodeGraph.initSync`; its `index` command
+then recreates the database, and `cgr index` rebuilds the complete snapshot. These samples were
+taken with `f4b9685`, whose source matches `cd69b83` apart from this README.
 
-The **2026-11-02 twelve-repository run** of `cgr` **`f4b9685`** and upstream **`d2e0389`**
-measured a **6.63× geometric-mean full-index speedup** (6.66× on the six C, C++, C#, PHP, Ruby
-and Swift repositories) and **55.2%–87.6% lower median peak RSS** on a second machine (AMD
-Ryzen 9 8940HX, 32 threads, 15 GiB, WSL2 Ubuntu 24.04, Node v24.18.0). The six repositories
-above are re-measured here so that every row shares one machine; absolute times are not
-comparable with the table above, where upstream itself is about 1.7–1.9× faster.
-
-| Repository | Files | Upstream full index | `cgr` full index | Speedup | Peak RSS: upstream → `cgr` |
-|---|---:|---:|---:|---:|---:|
-| Express | 142 | 990.8 ms | 162.3 ms | **6.10×** | 218.7 → 97.9 MiB |
-| Gin | 99 | 1,242.5 ms | 165.0 ms | **7.53×** | 235.1 → 67.8 MiB |
-| Tokio | 814 | 4,637.9 ms | 882.0 ms | **5.26×** | 701.3 → 108.7 MiB |
-| Django | 2,984 | 18,467.9 ms | 2,392.8 ms | **7.72×** | 1,936.6 → 239.4 MiB |
-| Zod | 522 | 4,276.2 ms | 689.2 ms | **6.20×** | 598.2 → 142.0 MiB |
-| OkHttp | 690 | 6,677.3 ms | 939.8 ms | **7.10×** | 823.0 → 151.1 MiB |
-| cJSON (C) | 68 | 1,046.5 ms | 125.5 ms | **8.34×** | 307.3 → 66.5 MiB |
-| fmt (C++) | 80 | 4,731.2 ms | 497.9 ms | **9.50×** | 542.0 → 107.3 MiB |
-| MediatR (C#) | 159 | 1,046.3 ms | 171.3 ms | **6.11×** | 228.0 → 98.0 MiB |
-| Slim (PHP) | 125 | 831.1 ms | 122.9 ms | **6.76×** | 209.2 → 61.6 MiB |
-| Sinatra (Ruby) | 147 | 806.5 ms | 137.9 ms | **5.85×** | 206.3 → 70.8 MiB |
-| Alamofire (Swift) | 111 | 2,048.6 ms | 450.4 ms | **4.55×** | 403.9 → 107.3 MiB |
-
-Same method as above: one warmup and three timed CLI rebuilds per side, two workers, a 2 GiB
-`cgr` memory budget, at least 30 seconds between runs, warm OS caches, the same files and bytes
-on both sides, and upstream's native kernel loaded (`linux-x64` prebuild). On this machine `main`
-(`2c35e7a`) indexes Express, Gin, Django, Zod and OkHttp within the three-sample spread of this
-branch; Tokio is 669.5 → 882.0 ms because this branch also extracts the items inside `cfg_*!`
-wrapper macros (739 more nodes). Sync and query latency were not re-measured.
-
-The sections below retain the earlier **`b827b1d`** sync and query measurements. The new
-retest completed only Express sync and did not complete query latency tests.
+| Repository | Language | Commit | Files | Upstream full index | `cgr` full index | Speedup | Peak RSS: upstream → `cgr` |
+|---|---|---|---:|---:|---:|---:|---:|
+| Express | JavaScript | [`1c6f1b0`](https://github.com/expressjs/express/tree/1c6f1b0fe4000977b9a7b4f34097e4d527dd9824) | 142 | 990.8 ms | 162.3 ms | **6.10×** | 218.7 → 97.9 MiB |
+| Gin | Go | [`0f09c3a`](https://github.com/gin-gonic/gin/tree/0f09c3a9b4626d9fe9979cf4d0521d6ae32ab646) | 99 | 1,242.5 ms | 165.0 ms | **7.53×** | 235.1 → 67.8 MiB |
+| Tokio | Rust | [`b499257`](https://github.com/tokio-rs/tokio/tree/b499257ef62bd631b83a988d371f4330f545670c) | 814 | 4,637.9 ms | 882.0 ms | **5.26×** | 701.3 → 108.7 MiB |
+| Django | Python | [`a05e16a`](https://github.com/django/django/tree/a05e16a7230fe33d3f43f4a3aaed103cebb42efc) | 2,984 | 18,467.9 ms | 2,392.8 ms | **7.72×** | 1,936.6 → 239.4 MiB |
+| Zod | TypeScript | [`2554b70`](https://github.com/colinhacks/zod/tree/2554b70c3d4a80273381e61d527d820720626440) | 522 | 4,276.2 ms | 689.2 ms | **6.20×** | 598.2 → 142.0 MiB |
+| OkHttp | Kotlin/Java | [`16fb6ae`](https://github.com/square/okhttp/tree/16fb6aef3aee1c4645fc8d24af01f8a4dc128ebf) | 690 | 6,677.3 ms | 939.8 ms | **7.10×** | 823.0 → 151.1 MiB |
+| cJSON | C | [`6d9f244`](https://github.com/DaveGamble/cJSON/tree/6d9f2443ab071f86e5d9b43025a40929ec41c46c) | 68 | 1,046.5 ms | 125.5 ms | **8.34×** | 307.3 → 66.5 MiB |
+| fmt | C++ | [`4ed3535`](https://github.com/fmtlib/fmt/tree/4ed3535092a96ac9f56fab80df83416d51bcc78e) | 80 | 4,731.2 ms | 497.9 ms | **9.50×** | 542.0 → 107.3 MiB |
+| MediatR | C# | [`62010ba`](https://github.com/jbogard/MediatR/tree/62010baf12851770553f275ce4047e93f4471e79) | 159 | 1,046.3 ms | 171.3 ms | **6.11×** | 228.0 → 98.0 MiB |
+| Slim | PHP | [`3675bf6`](https://github.com/slimphp/Slim/tree/3675bf6baac66b07032575b7bef4200b60b7974b) | 125 | 831.1 ms | 122.9 ms | **6.76×** | 209.2 → 61.6 MiB |
+| Sinatra | Ruby | [`cb22afd`](https://github.com/sinatra/sinatra/tree/cb22afd7902b566b6eaba6c4ea89739494a65d12) | 147 | 806.5 ms | 137.9 ms | **5.85×** | 206.3 → 70.8 MiB |
+| Alamofire | Swift | [`6c2892e`](https://github.com/Alamofire/Alamofire/tree/6c2892ea5adb5a03fa81c510933dd782c5ddd9cb) | 111 | 2,048.6 ms | 450.4 ms | **4.55×** | 403.9 → 107.3 MiB |
 
 ### Incremental CLI synchronization
 
-CLI medians below are upstream → `cgr` (speedup), with three timed commands per category and
-implementation. Both sides receive the same edit; original source is restored after each category.
-Symbol renames are within one file and do not measure repository-wide refactoring.
+Medians of three timed `sync` commands per category and side, upstream → `cgr` (speedup). Both
+copies receive the same edit to one central source file: comment edits append a distinct
+comment, and rename edits alternate a symbol and its references within that file. The original
+bytes are restored and synced after each category. After restoration both sides return exactly
+to their initial strict edge sets, and `cgr status --verify --strict` and `cgr debug diff` pass,
+in all twelve repositories. These CLI runs include the filesystem scan; they measure neither
+watcher latency nor repository-wide refactoring.
 
 | Repository | No changes | Comment edit | Single-file symbol rename |
 |---|---:|---:|---:|
-| Express | 183.2 → 37.6 ms (4.87×) | 311.8 → 56.7 ms (5.50×) | 312.5 → 53.0 ms (5.89×) |
-| Gin | 165.6 → 32.1 ms (5.16×) | 317.3 → 54.7 ms (5.80×) | 327.5 → 157.4 ms (2.08×) |
-| Tokio | 196.8 → 50.4 ms (3.90×) | 492.8 → 70.4 ms (7.00×) | 499.4 → 71.4 ms (7.00×) |
-| Django | 451.7 → 235.5 ms (1.92×) | 1925.9 → 270.2 ms (7.13×) | 1951.0 → 279.5 ms (6.98×) |
+| Express | 258.3 → 22.2 ms (11.65×) | 478.2 → 69.6 ms (6.87×) | 481.1 → 198.9 ms (2.42×)† |
+| Gin | 255.3 → 20.0 ms (12.74×) | 539.9 → 85.7 ms (6.30×) | 546.7 → 188.2 ms (2.90×)† |
+| Tokio | 286.8 → 32.2 ms (8.91×) | 762.8 → 95.2 ms (8.01×) | 753.5 → 897.4 ms (0.84×)† |
+| Django | 672.5 → 201.7 ms (3.33×) | 3,054.4 → 281.7 ms (10.84×) | 3,145.5 → 274.0 ms (11.48×) |
+| Zod | 273.0 → 37.8 ms (7.21×) | 910.3 → 86.6 ms (10.52×) | 1,517.7 → 760.3 ms (2.00×)† |
+| OkHttp | 364.9 → 55.6 ms (6.56×) | 1,158.1 → 141.2 ms (8.20×) | 1,265.5 → 1,037.9 ms (1.22×)† |
+| cJSON | 271.6 → 22.7 ms (11.97×) | 601.1 → 99.3 ms (6.05×) | 607.9 → 76.0 ms (7.99×) |
+| fmt | 278.2 → 23.1 ms (12.05×) | 1,445.0 → 155.1 ms (9.32×) | 1,405.3 → 552.9 ms (2.54×)† |
+| MediatR | 256.3 → 24.3 ms (10.56×) | 467.7 → 79.8 ms (5.86×) | 480.8 → 197.3 ms (2.44×)† |
+| Slim | 253.0 → 20.7 ms (12.25×) | 398.6 → 81.3 ms (4.90×) | 409.9 → 146.0 ms (2.81×)† |
+| Sinatra | 245.6 → 23.4 ms (10.49×) | 516.0 → 109.3 ms (4.72×) | 508.9 → 81.0 ms (6.28×) |
+| Alamofire | 298.7 → 32.0 ms (9.33×) | 702.0 → 116.7 ms (6.02×) | 657.4 → 103.6 ms (6.34×) |
 
+† `cgr sync` rebuilt the full index instead of re-resolving incrementally: the rename marked
+more references as affected than its 30% limit (for example 62,419 of 65,414 in Tokio and
+10,294 of 10,492 in Express), so these cells time a full rebuild plus the change scan. An untimed
+replay of the same edits reported this mode; all twelve comment edits re-resolved one file, and
+the Django, cJSON, Sinatra and Alamofire renames re-resolved 1–23 files.
+
+<details>
+<summary>Edited file and renamed symbol per repository</summary>
+
+| Repository | File | Symbol |
+|---|---|---|
+| Express | `lib/application.js` | `handle` |
+| Gin | `gin.go` | `Default` |
+| Tokio | `tokio/src/runtime/builder.rs` | `new_current_thread` |
+| Django | `django/core/handlers/base.py` | `get_response` |
+| Zod | `packages/zod/src/v4/core/parse.ts` | `_parse` |
+| OkHttp | `okhttp/src/commonJvmAndroid/kotlin/okhttp3/OkHttpClient.kt` | `newCall` |
+| cJSON | `cJSON.c` | `cJSON_ParseWithOpts` |
+| fmt | `include/fmt/format.h` | `format_decimal` |
+| MediatR | `src/MediatR/Mediator.cs` | `Send` |
+| Slim | `Slim/App.php` | `handle` |
+| Sinatra | `lib/sinatra/base.rb` | `invoke` |
+| Alamofire | `Source/Core/Session.swift` | `perform` |
+
+</details>
 
 ### Query latency
 
+Warm latency calls the production in-process explore handlers (`cgr bench explore`; upstream
+`ToolHandler.executeReadTool("codegraph_explore")`) with the same 20 fixed queries on both
+sides: eight warm-up queries, then 20 queries × 3 passes, giving 60 observations with
+nearest-rank percentiles. MCP transport and queueing are excluded. The new-process column runs
+the CLI `explore` for the first query three times per side, including startup. Express, Gin,
+Tokio and Django keep their earlier query lists; the other repositories use queries of the same
+shape (single names, pairs, "how does A work with B") drawn with a fixed seed from production
+function, method and type names. Returned content differs, and the sizes are not directly
+comparable: across the twelve repositories upstream answers average 17,370 UTF-16 code units
+and `cgr` answers 14,247 UTF-8 bytes.
+
 | Repository | Warm P50: upstream → `cgr` | P50 speedup | Warm P95: upstream → `cgr` | New-process CLI median |
 |---|---:|---:|---:|---:|
-| Express | 3.74 → 1.15 ms | 3.25× | 9.76 → 2.81 ms | 132.2 → 21.5 ms (6.14×) |
-| Gin | 8.47 → 0.95 ms | 8.92× | 11.73 → 3.08 ms | 140.3 → 20.5 ms (6.84×) |
-| Tokio | 16.49 → 3.27 ms | 5.03× | 21.78 → 5.99 ms | 162.6 → 17.9 ms (9.06×) |
-| Django | 33.25 → 4.50 ms | 7.39× | 51.87 → 11.30 ms | 301.0 → 14.8 ms (20.30×) |
+| Express | 7.32 → 2.13 ms | 3.43× | 19.39 → 6.30 ms | 241.5 → 22.7 ms (10.62×) |
+| Gin | 13.71 → 1.22 ms | 11.27× | 19.04 → 6.31 ms | 219.9 → 19.8 ms (11.10×) |
+| Tokio | 32.55 → 6.83 ms | 4.77× | 44.41 → 16.82 ms | 323.6 → 18.8 ms (17.25×) |
+| Django | 59.04 → 10.42 ms | 5.67× | 82.90 → 20.83 ms | 605.5 → 19.9 ms (30.37×) |
+| Zod | 42.48 → 7.65 ms | 5.55× | 58.70 → 12.81 ms | 352.0 → 24.1 ms (14.62×) |
+| OkHttp | 33.22 → 6.03 ms | 5.50× | 53.18 → 23.41 ms | 354.1 → 24.7 ms (14.34×) |
+| cJSON | 14.36 → 9.40 ms | 1.53× | 19.60 → 21.37 ms | 256.2 → 17.8 ms (14.41×) |
+| fmt | 23.36 → 5.03 ms | 4.64× | 34.04 → 9.68 ms | 263.4 → 22.3 ms (11.81×) |
+| MediatR | 12.95 → 9.27 ms | 1.40× | 17.99 → 19.20 ms | 237.1 → 31.2 ms (7.61×) |
+| Slim | 14.00 → 5.27 ms | 2.66× | 18.08 → 16.66 ms | 210.7 → 20.3 ms (10.39×) |
+| Sinatra | 11.06 → 2.39 ms | 4.63× | 15.48 → 4.94 ms | 238.0 → 20.1 ms (11.85×) |
+| Alamofire | 17.15 → 5.10 ms | 3.36× | 24.90 → 11.14 ms | 261.4 → 20.7 ms (12.65×) |
 
-Warm measurements use the same 20 fixed queries × 3 passes after warming eight queries, calling
-production in-process handlers. They exclude MCP transport and queueing; CLI medians include
-startup for one fixed query repeated three times. Warm P50 speedup geometric mean: **5.73×**.
-Returned content and output lengths differ. No LLM or token-savings benchmark was run.
+### Graph agreement with upstream
+
+Edges are compared by `(source stable ID, target stable ID, kind, line, UTF-16 column)`, with
+NULL distinct from zero; precision = shared / `cgr` edges and recall = shared / upstream edges.
+All edge kinds, route nodes and files with syntax errors stay in the denominators.
+
+| Repository | Language | Precision | Recall | Call-edge precision | Call-edge recall | Edges: `cgr` / upstream / shared | 97% / 95% gate |
+|---|---|---:|---:|---:|---:|---:|---|
+| Express | JavaScript | 64.18% | 87.75% | 56.76% | 84.61% | 3,191 / 2,334 / 2,048 | fail |
+| Gin | Go | 93.58% | 96.53% | 99.75% | 94.12% | 8,328 / 8,073 / 7,793 | fail |
+| Tokio | Rust | 78.84% | 88.30% | 81.95% | 73.46% | 44,445 / 39,682 / 35,040 | fail |
+| Django | Python | 94.21% | 89.82% | 91.38% | 77.43% | 185,067 / 194,105 / 174,351 | fail |
+| Zod | TypeScript | 92.18% | 92.86% | 91.53% | 93.35% | 35,954 / 35,693 / 33,144 | fail |
+| OkHttp | Kotlin/Java | 88.47% | 82.24% | 80.44% | 64.58% | 49,204 / 52,935 / 43,532 | fail |
+| cJSON | C | 99.84% | 99.60% | 99.94% | 99.59% | 3,757 / 3,766 / 3,751 | pass |
+| fmt | C++ | 94.07% | 92.79% | 90.33% | 87.37% | 20,638 / 20,923 / 19,414 | fail |
+| MediatR | C# | 98.17% | 97.28% | 95.91% | 91.42% | 5,685 / 5,737 / 5,581 | pass |
+| Slim | PHP | 98.21% | 95.39% | 92.98% | 83.31% | 4,527 / 4,661 / 4,446 | pass |
+| Sinatra | Ruby | 98.62% | 96.30% | 98.27% | 89.29% | 2,613 / 2,676 / 2,577 | pass |
+| Alamofire | Swift | 96.46% | 93.78% | 91.91% | 86.74% | 12,164 / 12,512 / 11,734 | fail |
+
+In every repository that misses the gate except Gin, calls are the largest share of differing
+edges (47%–87%); in Gin, containment, reference and call differences are about equal. Upstream
+has known mistakes of its own ([method notes](docs/BENCHMARKS.md)), so the gap is not a count of
+`cgr` errors and is not closed by copying upstream's choices. Express has the lowest precision:
+of its 1,143 `cgr`-only edges, 805 are file-level calls such as `app.use` (557), `app.set` (84)
+and `app.listen` (40) linked to Express's own methods, and 279 are file-to-route containment
+edges. Details:
+[second-phase languages](docs/LANGUAGES-P5.md) and the
+[JavaScript/TypeScript diagnostics](docs/GRAPH-DIAGNOSTICS-2026-11-01.md).
 
 ### Performance engineering update
 
@@ -583,9 +655,10 @@ The performance implementation update passed **137 tests, with one ignored**, on
 plus release compilation, Clippy, formatting and the CLI/MCP/hook smoke test. All four real
 projects passed full/edit/restore graph equivalence and matched the prior engine's graph dumps.
 The historical benchmark revision passed 116 tests. Implementation checks are recorded in
-[the engineering record](docs/PERFORMANCE-IMPLEMENTATION.md). The subsequent main retest added
-128 timed commands and successful checksum/incremental-full checks in all four repositories;
-see [the performance report](docs/BENCHMARKS.md#full-indexing).
+[the engineering record](docs/PERFORMANCE-IMPLEMENTATION.md). The twelve-repository retest of
+`cd69b83` passed restoration, `cgr status --verify --strict` and `cgr debug diff` checks in all
+twelve repositories; see [Measured performance](#measured-performance) and the
+[structured evidence](docs/benchmarks/2026-11-02-twelve-repo.json).
 Local measurements and hosted CI results are separate evidence.
 
 Code revision `f82506e` passed all nine [hosted CI checks](https://github.com/NianJiuZst/CodeGraph-Rust/actions/runs/41286327676),
@@ -612,7 +685,7 @@ formatting checks.
   resolution/synthesis; background compaction with delta rebasing remains M6 work.
 - **Execution deadlines:** query/hook cancellation is cooperative; a blocking filesystem call
   cannot be forcibly interrupted by the worker deadline.
-- **Performance scope:** current timings cover four restricted-tier repositories. Standard-tier
+- **Performance scope:** current timings cover twelve restricted-tier repositories. Standard-tier
   workloads, concurrent-reader latency, large-repository RSS and agent-task outcomes remain
   outside this measurement.
 
