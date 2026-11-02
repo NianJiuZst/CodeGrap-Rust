@@ -647,9 +647,10 @@ The performance implementation update passed **137 tests, with one ignored**, on
 plus release compilation, Clippy, formatting and the CLI/MCP/hook smoke test. All four real
 projects passed full/edit/restore graph equivalence and matched the prior engine's graph dumps.
 The historical benchmark revision passed 116 tests. Implementation checks are recorded in
-[the engineering record](docs/PERFORMANCE-IMPLEMENTATION.md). The subsequent main retest added
-128 timed commands and successful checksum/incremental-full checks in all four repositories;
-see [the performance report](docs/BENCHMARKS.md#full-indexing).
+[the engineering record](docs/PERFORMANCE-IMPLEMENTATION.md). The twelve-repository retest of
+`cd69b83` passed restoration, `cgr status --verify --strict` and `cgr debug diff` checks in all
+twelve repositories; see [Measured performance](#measured-performance) and the
+[structured evidence](docs/benchmarks/2026-11-02-twelve-repo.json).
 Local measurements and hosted CI results are separate evidence.
 
 Code revision `f82506e` passed all nine [hosted CI checks](https://github.com/NianJiuZst/CodeGraph-Rust/actions/runs/41286327676),

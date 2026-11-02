@@ -570,8 +570,9 @@ scripts/bench-local.sh --help
 
 本轮性能实现已在 macOS 通过 **137 项测试、1 项忽略**，以及 release 编译、Clippy、格式和 CLI/MCP/提示钩子 smoke 检查。
 四个真实项目的初始/编辑/恢复图谱均与全量一致，图谱输出也与旧引擎相同。历史 benchmark 版本曾通过 116 项测试。
-实现验证细节见[优化记录](docs/PERFORMANCE-IMPLEMENTATION.md)。合并后的 main 已完成 128 次计时，
-四个仓库的校验和及增量/全量检查全部通过，详见[性能复测报告](docs/BENCHMARKS.md#full-indexing)。
+实现验证细节见[优化记录](docs/PERFORMANCE-IMPLEMENTATION.md)。`cd69b83` 的十二仓库复测中，
+十二个仓库的恢复、`cgr status --verify --strict` 和 `cgr debug diff` 检查全部通过，详见[实测性能](#实测性能)
+和[机器可读结果](docs/benchmarks/2026-11-02-twelve-repo.json)。
 本机测量与远程 CI 属于不同验证证据。
 
 代码版本 `f82506e` 已通过全部 9 项[远程 CI 检查](https://github.com/NianJiuZst/CodeGraph-Rust/actions/runs/41286327676)：
