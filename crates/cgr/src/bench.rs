@@ -343,7 +343,8 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<u64> {
 fn comment_prefix(ext: &str) -> Option<&'static str> {
     match ext {
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "go" | "java" | "rs" | "kt" | "kts" => Some("//"),
-        "py" => Some("#"),
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "cs" | "php" | "swift" => Some("//"),
+        "py" | "rb" | "rake" => Some("#"),
         _ => None,
     }
 }
@@ -355,6 +356,10 @@ fn add_function(ext: &str, n: u64) -> Option<String> {
         "go" => format!("\nfunc CgrBench{n}() int {{ return {n} }}\n"),
         "rs" => format!("\npub fn cgr_bench_{n}() -> u64 {{ {n} }}\n"),
         "kt" | "kts" => format!("\nfun cgrBench{n}(): Int = {n}\n"),
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => format!("\nstatic int cgr_bench_{n}(void) {{ return {n}; }}\n"),
+        "php" => format!("\nfunction cgr_bench_{n}() {{ return {n}; }}\n"),
+        "rb" | "rake" => format!("\ndef cgr_bench_{n}\n  {n}\nend\n"),
+        "swift" => format!("\nfunc cgrBench{n}() -> Int {{ {n} }}\n"),
         _ => return None,
     })
 }
@@ -366,9 +371,49 @@ fn rename_regex(ext: &str) -> Option<regex::Regex> {
         "go" => r"\bfunc\s+([A-Za-z_][A-Za-z0-9_]{3,})\s*\(",
         "rs" => r"\bfn\s+([A-Za-z_][A-Za-z0-9_]{3,})",
         "kt" | "kts" => r"\bfun\s+([A-Za-z_][A-Za-z0-9_]{3,})",
+        "php" => r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]{3,})",
+        "rb" | "rake" => r"\bdef\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_]{3,})",
+        "swift" => r"\bfunc\s+([A-Za-z_][A-Za-z0-9_]{3,})",
+        // definitions `name(params) {` (keywords such as `while (..) {` are filtered out)
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "cs" => r"\b([A-Za-z_][A-Za-z0-9_]{3,})\s*\([^;{}()]*\)\s*(?:const\s*)?\{",
         _ => return None,
     };
     regex::Regex::new(pat).ok()
+}
+
+/// Names the C-family / C# rename rule may capture that are not declarations.
+fn rename_excluded(name: &str) -> bool {
+    matches!(
+        name,
+        "while"
+            | "switch"
+            | "return"
+            | "sizeof"
+            | "catch"
+            | "defined"
+            | "alignof"
+            | "decltype"
+            | "typeid"
+            | "noexcept"
+            | "static_assert"
+            | "foreach"
+            | "using"
+            | "lock"
+            | "fixed"
+            | "checked"
+            | "unchecked"
+            | "else"
+            | "operator"
+            | "throw"
+            | "delete"
+            | "typeof"
+            | "nameof"
+            | "default"
+            | "await"
+            | "unsafe"
+            | "when"
+            | "with"
+    )
 }
 
 fn import_line(ext: &str, n: u64) -> Option<String> {
@@ -376,6 +421,10 @@ fn import_line(ext: &str, n: u64) -> Option<String> {
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => format!("import {{ cgrBench{n} }} from './cgr_bench_{n}';\n"),
         "py" => format!("import cgr_bench_{n}\n"),
         "rs" => "use std::fmt::Debug as _;\n".to_owned(),
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "#include <stdint.h>\n".to_owned(),
+        "cs" => "using System.Text;\n".to_owned(),
+        "rb" | "rake" => "require 'set'\n".to_owned(),
+        "swift" => "import Foundation\n".to_owned(),
         _ => return None,
     })
 }
@@ -418,7 +467,7 @@ fn random_edit(root: &Path, files: &[(String, String)], rng: &mut Rng, n: u64, c
         }
     } else if kind < 85 {
         let re = rename_regex(ext).ok_or_else(|| anyhow!("no rename rule for .{ext}"))?;
-        let names: Vec<String> = re.captures_iter(&text).map(|c| c[1].to_owned()).collect();
+        let names: Vec<String> = re.captures_iter(&text).map(|c| c[1].to_owned()).filter(|n| !rename_excluded(n)).collect();
         if names.is_empty() {
             return random_edit(root, files, rng, n, counts);
         }

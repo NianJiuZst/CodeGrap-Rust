@@ -52,7 +52,8 @@ pub fn detect_from_path(path: &str, overrides: &BTreeMap<String, Lang>) -> Lang 
 }
 
 /// Detect with the file's text available: a `.js`/`.jsx` file carrying Flow's `@flow`
-/// pragma is parsed with the TSX grammar, as upstream does.
+/// pragma is parsed with the TSX grammar, and a `.h` header with C++ constructs with the
+/// C++ grammar, as upstream does.
 pub fn detect(path: &str, source: Option<&str>, overrides: &BTreeMap<String, Lang>) -> Lang {
     let lang = detect_from_path(path, overrides);
     if matches!(lang, Lang::JavaScript | Lang::Jsx) {
@@ -62,7 +63,59 @@ pub fn detect(path: &str, source: Option<&str>, overrides: &BTreeMap<String, Lan
             }
         }
     }
+    if lang == Lang::C && extension_of(path) == ".h" && !overrides.contains_key(".h") {
+        if let Some(src) = source {
+            if looks_like_cpp(src) {
+                return Lang::Cpp;
+            }
+            if looks_like_objc(src) {
+                return Lang::ObjC;
+            }
+        }
+    }
     lang
+}
+
+/// Whether a `.h` file is an Objective-C header (upstream `looksLikeObjc`): `@interface`,
+/// `@implementation`, `@protocol` or `@synthesize` in the first 8 KiB. Such headers have no
+/// walker here and must not be fed to the C grammar's error recovery.
+pub fn looks_like_objc(source: &str) -> bool {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static OBJC: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@(?:interface|implementation|protocol|synthesize)\b").expect("static regex"));
+    let mut end = source.len().min(8192);
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    OBJC.is_match(&source[..end])
+}
+
+/// Whether a `.h` file contains constructs that are C++ and never valid C (upstream
+/// `looksLikeCpp`): the first 8 KiB are checked for namespaces, classes, templates, access
+/// sections, `virtual` and `using`; the whole file (comments removed) for a class/struct
+/// base clause (`struct D : Base {`), whose only C++ signal may sit past a long C preamble.
+pub fn looks_like_cpp(source: &str) -> bool {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static SAMPLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)",
+        )
+        .expect("static regex")
+    });
+    static BASE_CLAUSE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b(?:class|struct)\s+\w+\s*(?:final\s*)?:\s*(?:(?:public|protected|private|virtual)\s+)*[A-Za-z_][\w:]*(?:\s*<[^{};]*>)?\s*[{,]")
+            .expect("static regex")
+    });
+    static COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)/\*.*?\*/|//[^\n]*").expect("static regex"));
+    let mut end = source.len().min(8192);
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    if SAMPLE.is_match(&source[..end]) {
+        return true;
+    }
+    BASE_CLAUSE.is_match(&COMMENT.replace_all(source, " "))
 }
 
 /// Whether leading comments carry `@flow` (and not `@noflow`).
@@ -116,6 +169,28 @@ mod tests {
         let mut o = BTreeMap::new();
         o.insert(".tpl".to_string(), Lang::Php);
         assert_eq!(detect_from_path("a.tpl", &o), Lang::Php);
+    }
+
+    #[test]
+    fn cpp_headers() {
+        let none = BTreeMap::new();
+        assert!(looks_like_cpp("#pragma once\nnamespace a { int f(); }\n"));
+        assert!(looks_like_cpp("class Foo {\npublic:\n  void f();\n};\n"));
+        assert!(looks_like_cpp("template <typename T> T id(T t);\n"));
+        assert!(looks_like_cpp("struct MYLIB_API Thing : Base {};\n"));
+        // the only signal is a base clause past the 8 KiB sample
+        let long = format!("{}\nstruct Derived : public ns::Base<int> {{ int x; }};\n", "#define X 1\n".repeat(1000));
+        assert!(looks_like_cpp(&long));
+        assert!(!looks_like_cpp("/* struct foo: x, y */\nstruct foo { int x : 3; };\nint g(struct foo *p);\n"));
+        assert!(!looks_like_cpp("#include <stdio.h>\nint main(void) { return 0; }\n"));
+        assert_eq!(detect("a/b.h", Some("namespace x {}"), &none), Lang::Cpp);
+        assert_eq!(detect("a/b.h", Some("int x;"), &none), Lang::C);
+        assert_eq!(detect("a/b.h", Some("#import <Foundation/Foundation.h>\n@interface Foo : NSObject\n@end\n"), &none), Lang::ObjC);
+        assert!(!Lang::ObjC.is_supported());
+        assert_eq!(detect("a/b.c", Some("namespace x {}"), &none), Lang::C);
+        let mut o = BTreeMap::new();
+        o.insert(".h".to_string(), Lang::C);
+        assert_eq!(detect("a/b.h", Some("namespace x {}"), &o), Lang::C);
     }
 
     #[test]

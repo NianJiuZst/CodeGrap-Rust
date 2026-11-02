@@ -51,10 +51,17 @@ pub struct Modules<'v> {
     rs_mod_to_file: FxHashMap<(u32, String), FileId>,
     /// Rust: per file (crate index, module path).
     rs_file_mod: FxHashMap<FileId, (u32, String)>,
+    /// C/C++ and Ruby: file name -> files, for `#include "a/b.h"` / `require 'a/b'` lookups.
+    by_basename: FxHashMap<&'v str, Vec<FileId>>,
     /// TypeScript: the declaration file a `declare module 'name' { ... }` block declares each
     /// module in (upstream `ambient-modules.ts`), first by path.
     ambient: FxHashMap<&'v str, FileId>,
 }
+
+/// Package key prefixes of the namespace-based languages (Java/Kotlin use the bare name).
+pub const CS_PKG: &str = "cs:";
+pub const PHP_PKG: &str = "php:";
+pub const SWIFT_PKG: &str = "swift:";
 
 fn dir_of(p: &str) -> &str {
     parent_dir(p)
@@ -80,6 +87,7 @@ impl<'v> Modules<'v> {
             go_dir_pkgs: FxHashMap::default(),
             rs_mod_to_file: FxHashMap::default(),
             rs_file_mod: FxHashMap::default(),
+            by_basename: FxHashMap::default(),
             ambient: FxHashMap::default(),
         };
         let mut files: Vec<FileId> = view.files().collect();
@@ -91,6 +99,9 @@ impl<'v> Modules<'v> {
             let path = fr.path();
             m.path_to_file.insert(path, f);
             m.dir_files.entry(dir_of(path)).or_default().push(f);
+            if matches!(fr.lang().family(), LangFamily::C | LangFamily::Ruby) {
+                m.by_basename.entry(path.rsplit('/').next().unwrap_or(path)).or_default().push(f);
+            }
         }
         for &f in &files {
             let fr = view.file(f);
@@ -100,6 +111,9 @@ impl<'v> Modules<'v> {
                 Lang::Java | Lang::Kotlin => m.index_jvm(f),
                 Lang::Go => m.index_go(f, path),
                 Lang::Rust => m.index_rust(f, path),
+                Lang::CSharp => m.index_namespace(f, CS_PKG),
+                Lang::Php => m.index_namespace(f, PHP_PKG),
+                Lang::Swift => m.index_swift(f, path),
                 Lang::TypeScript if is_declaration_file(path) => {
                     // a script declaration file (no top-level import or export) declares its modules
                     for ex in view.exports_of(f) {
@@ -190,6 +204,19 @@ impl<'v> Modules<'v> {
     fn index_jvm(&mut self, f: FileId) {
         let name = self.package_name(f).unwrap_or_default();
         self.add_pkg(name, f);
+    }
+
+    /// C# / PHP: the file's (first) namespace is its package; files without one share the
+    /// global namespace.
+    fn index_namespace(&mut self, f: FileId, prefix: &str) {
+        let name = self.package_name(f).unwrap_or_default();
+        self.add_pkg(format!("{prefix}{name}"), f);
+    }
+
+    /// Swift: one module per SwiftPM target (`Sources/<Target>/`, `Tests/<Target>/`), else
+    /// per top-level directory. Declarations are visible module-wide without imports.
+    fn index_swift(&mut self, f: FileId, path: &str) {
+        self.add_pkg(format!("{SWIFT_PKG}{}", swift_module_of(path)), f);
     }
 
     fn index_go(&mut self, f: FileId, path: &str) {
@@ -298,8 +325,188 @@ impl<'v> Modules<'v> {
             LangFamily::Go => self.resolve_go(spec, from_path),
             LangFamily::Jvm => self.resolve_jvm(spec),
             LangFamily::Rust => self.resolve_rust(spec, from),
+            LangFamily::C => self.resolve_c(spec, from_path),
+            LangFamily::CSharp => self.resolve_csharp(spec),
+            LangFamily::Php => self.resolve_php(spec),
+            LangFamily::Ruby => self.resolve_ruby(spec, from_path),
+            LangFamily::Swift => match self.pkg_by_key.get(format!("{SWIFT_PKG}{spec}").as_str()) {
+                Some(p) => ImportTarget::Pkg(*p),
+                None => ImportTarget::External,
+            },
             _ => ImportTarget::External,
         }
+    }
+
+    /// Package keys of the namespaces enclosing a C# namespace package (`A.B.C` -> `A.B`, `A`):
+    /// code in a namespace sees its parents' types without a `using`.
+    pub fn parent_namespaces(&self, p: PkgId) -> impl Iterator<Item = PkgId> + '_ {
+        let key = if p.is_none() { "" } else { self.pkgs[p.0 as usize].key.as_str() };
+        let name = key.strip_prefix(CS_PKG).unwrap_or("");
+        let mut cur = if key.starts_with(CS_PKG) && !name.is_empty() { Some(name) } else { None };
+        std::iter::from_fn(move || loop {
+            let c = cur?;
+            let parent = c.rfind('.').map(|i| &c[..i]);
+            cur = parent;
+            // the global namespace is shared by files without a namespace declaration
+            let k = format!("{CS_PKG}{}", parent.unwrap_or(""));
+            if let Some(id) = self.pkg_by_key.get(k.as_str()) {
+                return Some(*id);
+            }
+            parent?;
+        })
+    }
+
+    // ---- C / C++: `#include "a/b.h"` relative to the includer, then by path suffix
+    fn resolve_c(&self, spec: &str, from_path: &str) -> ImportTarget {
+        if spec.contains("::") {
+            return self.resolve_cpp_using(spec);
+        }
+        let (angle, inc) = match spec.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+            Some(inner) => (true, inner.trim()),
+            None => (false, spec.trim()),
+        };
+        if inc.is_empty() {
+            return ImportTarget::External;
+        }
+        if !angle {
+            let cand = normalize(&format!("{}/{inc}", dir_of(from_path)));
+            if let Some(f) = self.path_to_file.get(cand.as_str()) {
+                return ImportTarget::File(*f);
+            }
+        }
+        let clean = normalize(inc);
+        let base = clean.rsplit('/').next().unwrap_or(&clean);
+        if let Some(cands) = self.by_basename.get(base) {
+            let tail = format!("/{clean}");
+            let hits: Vec<FileId> = cands
+                .iter()
+                .copied()
+                .filter(|f| self.view.file(*f).lang().family() == LangFamily::C)
+                .filter(|f| {
+                    let p = self.path_of(*f);
+                    p == clean || p.ends_with(&tail)
+                })
+                .collect();
+            if let Some(f) = self.unique_by_proximity(&hits, from_path) {
+                return ImportTarget::File(f);
+            }
+            if hits.len() > 1 {
+                return ImportTarget::NotFound;
+            }
+        }
+        if angle {
+            ImportTarget::External
+        } else {
+            ImportTarget::NotFound
+        }
+    }
+
+    /// `using a::b::f;` names a declaration, with its outer namespaces possibly opened by a macro
+    /// and so missing from the qualified name.
+    // ponytail: only `std` is known to be foreign, so `using dep::f;` can reach a project's global
+    // `f`; checking the macro bodies for `namespace dep` needs the sources at resolution.
+    fn resolve_cpp_using(&self, spec: &str) -> ImportTarget {
+        let spec = spec.trim_start_matches("::");
+        if spec.starts_with("std::") {
+            return ImportTarget::External;
+        }
+        let mut rest = spec;
+        loop {
+            if let Some(n) = self.canonical(self.view.by_qname(rest).filter(|n| self.view.file(self.view.hot(*n).file).lang().family() == LangFamily::C)) {
+                return ImportTarget::Node(n);
+            }
+            match rest.split_once("::") {
+                Some((_, tail)) => rest = tail,
+                None => return ImportTarget::External,
+            }
+        }
+    }
+
+    // ---- C#: `using A.B;` names a namespace, `using X = A.B.C;` / `using static` a type
+    fn resolve_csharp(&self, spec: &str) -> ImportTarget {
+        let spec = spec.strip_prefix("global::").unwrap_or(spec);
+        if let Some(p) = self.pkg_by_key.get(format!("{CS_PKG}{spec}").as_str()) {
+            return ImportTarget::Pkg(*p);
+        }
+        let segs: Vec<&str> = spec.split('.').collect();
+        for i in (0..segs.len()).rev() {
+            let qname = if i == 0 { segs.join("::") } else { format!("{}::{}", segs[..i].join("."), segs[i..].join("::")) };
+            if let Some(n) = self.canonical(self.view.by_qname(&qname).filter(|n| self.view.file(self.view.hot(*n).file).lang() == Lang::CSharp)) {
+                return ImportTarget::Node(n);
+            }
+        }
+        self.namespace_miss(CS_PKG, spec, '.')
+    }
+
+    // ---- PHP: `use A\B\C;` names a class, interface, trait, function or namespace
+    fn resolve_php(&self, spec: &str) -> ImportTarget {
+        let spec = spec.trim_start_matches('\\');
+        let segs: Vec<&str> = spec.split('\\').filter(|s| !s.is_empty()).collect();
+        for i in (0..segs.len()).rev() {
+            let qname = if i == 0 { segs.join("::") } else { format!("{}::{}", segs[..i].join("\\"), segs[i..].join("::")) };
+            if let Some(n) = self.canonical(self.view.by_qname(&qname).filter(|n| self.view.file(self.view.hot(*n).file).lang() == Lang::Php)) {
+                return ImportTarget::Node(n);
+            }
+        }
+        if let Some(p) = self.pkg_by_key.get(format!("{PHP_PKG}{spec}").as_str()) {
+            return ImportTarget::Pkg(*p);
+        }
+        self.namespace_miss(PHP_PKG, spec, '\\')
+    }
+
+    /// A namespaced name that matched nothing: internal (`NotFound`) when it shares its root
+    /// namespace with a project namespace, otherwise a dependency.
+    fn namespace_miss(&self, prefix: &str, spec: &str, sep: char) -> ImportTarget {
+        let root = spec.split(sep).next().unwrap_or(spec);
+        let internal =
+            !root.is_empty() && self.pkg_by_key.keys().any(|k| k.strip_prefix(prefix).is_some_and(|ns| ns == root || ns.starts_with(&format!("{root}{sep}"))));
+        if internal {
+            ImportTarget::NotFound
+        } else {
+            ImportTarget::External
+        }
+    }
+
+    // ---- Ruby: `require_relative` from the requiring file, `require` by load-path suffix
+    fn resolve_ruby(&self, spec: &str, from_path: &str) -> ImportTarget {
+        let with_ext = |p: &str| if p.ends_with(".rb") { p.to_owned() } else { format!("{p}.rb") };
+        if spec.starts_with('.') {
+            let cand = normalize(&with_ext(&format!("{}/{spec}", dir_of(from_path))));
+            return match self.path_to_file.get(cand.as_str()) {
+                Some(f) => ImportTarget::File(*f),
+                None => ImportTarget::NotFound,
+            };
+        }
+        let clean = normalize(&with_ext(spec));
+        let base = clean.rsplit('/').next().unwrap_or(&clean);
+        if let Some(cands) = self.by_basename.get(base) {
+            let tail = format!("/{clean}");
+            let single = !clean.contains('/');
+            let hits: Vec<FileId> = cands
+                .iter()
+                .copied()
+                .filter(|f| self.view.file(*f).lang() == Lang::Ruby)
+                .filter(|f| {
+                    let p = self.path_of(*f);
+                    if p != clean && !p.ends_with(&tail) {
+                        return false;
+                    }
+                    // `require 'set'` names a file directly under a load-path root; a
+                    // gem-internal `lib/mygem/set.rb` is only loadable as `mygem/set`
+                    !single || matches!(dir_of(p).rsplit('/').next().unwrap_or(""), "" | "lib" | "spec" | "test" | "app")
+                })
+                .collect();
+            // the load path is usually `lib/`: prefer it over a same-named test helper
+            let lib: Vec<FileId> = hits.iter().copied().filter(|f| self.path_of(*f).ends_with(&format!("lib/{clean}"))).collect();
+            let pool = if lib.is_empty() { &hits } else { &lib };
+            if let Some(f) = self.unique_by_proximity(pool, from_path) {
+                return ImportTarget::File(f);
+            }
+            if pool.len() > 1 {
+                return ImportTarget::NotFound;
+            }
+        }
+        ImportTarget::External
     }
 
     // ---- JS / TS
@@ -422,6 +629,26 @@ impl<'v> Modules<'v> {
             }
         }
         ImportTarget::External
+    }
+
+    /// The deterministic representative of same-named declarations: the one in the path-first
+    /// file, then the earliest. Posting order (base segment before delta) must never decide,
+    /// or an incremental sync would differ from a full rebuild.
+    fn canonical(&self, cands: impl Iterator<Item = NodeIdx>) -> Option<NodeIdx> {
+        cands.min_by_key(|n| (self.path_of(self.view.hot(*n).file), self.view.node(*n).start_line()))
+    }
+
+    /// `best_by_proximity` that refuses ties: two equally close candidates are an ambiguous
+    /// include / require, which gets no edge.
+    fn unique_by_proximity(&self, cands: &[FileId], from_path: &str) -> Option<FileId> {
+        let from_dir = dir_of(from_path);
+        let key = |f: FileId| {
+            let p = self.path_of(f);
+            let common = from_dir.split('/').zip(dir_of(p).split('/')).take_while(|(a, b)| a == b).count();
+            (common, std::cmp::Reverse(p.len()))
+        };
+        let best = cands.iter().copied().max_by_key(|f| key(*f))?;
+        (cands.iter().filter(|f| key(**f) == key(best)).count() == 1).then_some(best)
     }
 
     // ---- Python
@@ -563,5 +790,21 @@ impl<'v> Modules<'v> {
             }
         }
         (ImportTarget::NotFound, 0)
+    }
+}
+
+/// Swift module of a file: the SwiftPM target directory after `Sources/` or `Tests/`, else
+/// the top-level directory (`""` for files at the root).
+pub fn swift_module_of(path: &str) -> &str {
+    let segs: Vec<&str> = path.split('/').collect();
+    for i in 0..segs.len().saturating_sub(2) {
+        if matches!(segs[i], "Sources" | "Tests") {
+            return segs[i + 1];
+        }
+    }
+    if segs.len() > 1 {
+        segs[0]
+    } else {
+        ""
     }
 }

@@ -346,7 +346,7 @@ pub fn version(verbose: bool) -> Result<i32> {
         println!("engine version: {}", brand::ENGINE_VERSION);
         println!("format version: {}", brand::FORMAT_VERSION);
         println!("upstream kernel commit: {}", brand::UPSTREAM_KERNEL_COMMIT.trim());
-        println!("languages:      typescript, javascript, python, go, java, rust, kotlin");
+        println!("languages:      typescript, javascript, python, go, java, rust, kotlin, c, cpp, csharp, php, ruby, swift");
     }
     Ok(0)
 }

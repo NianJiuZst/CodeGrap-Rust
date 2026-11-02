@@ -49,6 +49,8 @@ pub struct Engine<'v> {
     pub pkg_defs: Vec<FxHashMap<&'v str, SmallVec<[NodeIdx; 2]>>>,
     /// Direct supertypes (`extends` / `implements` resolved in round 1).
     pub supers: FxHashMap<NodeIdx, SmallVec<[NodeIdx; 3]>>,
+    /// C++ namespaces opened by a `#define` anywhere in the project.
+    pub macro_namespaces: rustc_hash::FxHashSet<&'v str>,
     /// JavaScript functions with syntax evidence that they implement an object member.
     pub member_functions: FxHashMap<&'v str, SmallVec<[NodeIdx; 2]>>,
     pub return_types: FxHashMap<NodeIdx, &'v cg_store::BindingRec>,
@@ -124,6 +126,13 @@ impl<'v> Engine<'v> {
             stars: vec![Vec::new(); n_files],
             pkg_defs: Vec::new(),
             supers: FxHashMap::default(),
+            macro_namespaces: files
+                .iter()
+                .filter(|f| view.file(**f).lang() == Lang::Cpp)
+                .flat_map(|&f| view.bindings_of(f))
+                .filter(|b| b.kind == BindKind::MacroNamespace as u8)
+                .map(|b| view.text_str(b.name))
+                .collect(),
             member_functions,
             return_types: files
                 .iter()
@@ -154,7 +163,7 @@ impl<'v> Engine<'v> {
             },
             type_aliases: files
                 .iter()
-                .filter(|f| view.file(**f).lang() == Lang::Rust)
+                .filter(|f| matches!(view.file(**f).lang(), Lang::Rust | Lang::Cpp))
                 .flat_map(|&f| view.bindings_of(f))
                 .filter(|b| b.kind == BindKind::TypeAlias as u8 && b.node.is_some())
                 .map(|b| (b.node, b))
@@ -401,6 +410,7 @@ impl<'v> Engine<'v> {
             if p.is_none() {
                 continue;
             }
+            let namespaced = matches!(view.file(f).lang().family(), LangFamily::CSharp | LangFamily::Php);
             let jvm = view.file(f).lang().family() == LangFamily::Jvm;
             for n in self.top_level_nodes(f) {
                 let node = view.node(n);
@@ -419,9 +429,60 @@ impl<'v> Engine<'v> {
                     continue;
                 }
                 defs[p.0 as usize].entry(node.name()).or_default().push(n);
+                // C# / PHP parent every declaration under a `namespace` node: the
+                // namespace's children are the package-level names
+                if namespaced && node.kind() == NodeKind::Namespace {
+                    self.namespace_members(n, 0, &mut |m| defs[p.0 as usize].entry(view.node(m).name()).or_default().push(m));
+                }
             }
         }
         self.pkg_defs = defs;
+    }
+
+    /// Whether `from` reaches `to` through resolved `#include`s, breadth-first over at most
+    /// four levels and 256 files (headers usually reach the declaring header in one or two).
+    pub(crate) fn includes_transitively(&self, from: FileId, to: FileId) -> bool {
+        let mut frontier = vec![from];
+        let mut seen = rustc_hash::FxHashSet::default();
+        seen.insert(from);
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for f in frontier {
+                for t in self.imp_targets.get(f.idx()).map(|v| v.as_slice()).unwrap_or_default() {
+                    if let ImportTarget::File(tf) = *t {
+                        if tf == to {
+                            return true;
+                        }
+                        if seen.len() < 256 && seen.insert(tf) {
+                            next.push(tf);
+                        }
+                    }
+                }
+            }
+            if next.is_empty() {
+                return false;
+            }
+            frontier = next;
+        }
+        false
+    }
+
+    /// Declarations directly inside namespace node `n` (and its nested namespaces).
+    fn namespace_members(&self, n: NodeIdx, depth: u8, out: &mut dyn FnMut(NodeIdx)) {
+        if depth > 8 {
+            return;
+        }
+        for e in self.view.out_edges(n) {
+            if e.kind != EdgeKind::Contains {
+                continue;
+            }
+            let k = self.view.node(e.dst).kind();
+            if k == NodeKind::Namespace {
+                self.namespace_members(e.dst, depth + 1, out);
+            } else if k != NodeKind::File && k != NodeKind::Method {
+                out(e.dst);
+            }
+        }
     }
 
     /// Module file a re-export (`export ... from 'x'`) points to, or NONE.
@@ -622,6 +683,7 @@ impl<'v> Engine<'v> {
         let tfile = tn.file();
         let tpkg = self.modules.pkg_of(tfile);
         let mut best = None;
+        let mut cross: SmallVec<[NodeIdx; 4]> = SmallVec::new();
         for cand in self.view.by_qname(&q) {
             let cf = self.view.hot(cand).file;
             // Go: same package; Rust: the owning module or a proved type import.
@@ -629,8 +691,61 @@ impl<'v> Engine<'v> {
                 return Some(cand);
             }
             best.get_or_insert(cand);
+            cross.push(cand);
         }
-        best.filter(|_| tn.qname().contains("::") && self.view.file(tfile).lang().family() == LangFamily::Jvm)
+        match self.view.file(tfile).lang().family() {
+            // Java/Kotlin nested types (pre-existing behaviour)
+            LangFamily::Jvm => best.filter(|_| tn.qname().contains("::")),
+            // Swift extensions (emitted as class nodes) add members in other files and other
+            // modules (a test target extending the library's type). Pick deterministically:
+            // posting order (base before delta) must never decide.
+            LangFamily::Swift => cross.into_iter().filter(|c| self.view.file(self.view.hot(*c).file).lang() == Lang::Swift).min_by_key(|c| {
+                let h = self.view.hot(*c);
+                (self.view.file(h.file).path(), self.view.node(*c).start_line())
+            }),
+            // C# partial classes, Ruby reopened classes and C++ out-of-line definitions
+            // declare members in other files. Chosen by path and line, so a base/delta split
+            // cannot change the answer.
+            fam @ (LangFamily::CSharp | LangFamily::Ruby | LangFamily::C) => {
+                cross.into_iter().filter(|c| self.cross_file_member_ok(t, *c, fam)).min_by_key(|c| {
+                    let h = self.view.hot(*c);
+                    (self.view.file(h.file).path(), self.view.node(*c).start_line())
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a member with type `t`'s qualified name found in another file belongs to `t`:
+    /// C# / Ruby when that file re-declares the type (partial class, reopened class or
+    /// module); C/C++ when the member's file includes the type's file or vice versa.
+    fn cross_file_member_ok(&self, t: NodeIdx, cand: NodeIdx, fam: LangFamily) -> bool {
+        let view = self.view;
+        let tn = view.node(t);
+        let tfile = tn.file();
+        let cf = view.hot(cand).file;
+        if view.file(cf).lang().family() != fam {
+            return false;
+        }
+        // C++: an out-of-line definition is owned by its file or namespace; a candidate inside
+        // another class body belongs to that (same-named) class
+        if fam == LangFamily::C && view.node(cand).parent().is_some_and(|p| p != t && view.node(p).kind().is_type()) {
+            return false;
+        }
+        match fam {
+            LangFamily::CSharp | LangFamily::Ruby => view.by_qname(tn.qname()).any(|x| {
+                let k = view.node(x).kind();
+                view.hot(x).file == cf && (k.is_type() || k == NodeKind::Module)
+            }),
+            LangFamily::C => {
+                // the type's simple name is unique among C/C++ types: no other type to confuse
+                let unique =
+                    view.by_name(tn.name()).filter(|x| view.node(*x).kind().is_type() && view.file(view.hot(*x).file).lang().family() == fam).take(2).count()
+                        == 1;
+                unique || self.includes_transitively(cf, tfile) || self.includes_transitively(tfile, cf)
+            }
+            _ => false,
+        }
     }
 
     /// Equal unqualified type names in different Rust modules are distinct.

@@ -7,9 +7,9 @@ use crate::builtins::{is_builtin, is_common_method};
 use crate::engine::{Bound, Engine};
 use crate::modules::{ImportTarget, PkgId};
 use crate::overload::{self, ArgTy, CallArgs};
-use crate::shape::{parse_shape, split_head, Shape};
+use crate::shape::{normalize_call_name, parse_shape, split_head, Shape};
 use cg_core::{text::pack_pos, EdgeKind, FileId, Lang, LangFamily, NodeIdx, NodeKind, RefKind, Visibility, NONE};
-use cg_extract::facts::{COMMONJS_MODULE, JS_BINDING_ALIAS, JS_SATISFIES_VALUE};
+use cg_extract::facts::{COMMONJS_MODULE, JS_BINDING_ALIAS, JS_SATISFIES_VALUE, SWIFT_CHAIN};
 use cg_extract::{BindKind, ImportKind, ScopeKind};
 use cg_store::{status, BindingRec, ImportRec, RefRec, ScopeRec, View};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -470,6 +470,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
                             || b.kind == BindKind::Mutation as u8
                             || b.kind == BindKind::CommonJsObject as u8
                             || b.kind == BindKind::AssignedThisCall as u8
+                            || b.kind == BindKind::MacroNamespace as u8
                         {
                             continue;
                         }
@@ -500,7 +501,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let mut cur = from;
         for _ in 0..24 {
             let n = view.node(cur);
-            if n.kind().is_type() {
+            if self.holds_members(n.kind()) {
                 return Some(cur);
             }
             match n.parent() {
@@ -513,7 +514,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let prefix = &q[..q.rfind("::")?];
         let mut best = None;
         for cand in view.by_qname(prefix) {
-            if !view.node(cand).kind().is_type() {
+            if !self.holds_members(view.node(cand).kind()) {
                 continue;
             }
             let cf = view.hot(cand).file;
@@ -532,6 +533,12 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         best
+    }
+
+    /// Kinds whose members are reached through the type: every type, and Ruby modules
+    /// (`module Helpers; def halt; end; end`).
+    fn holds_members(&self, k: NodeKind) -> bool {
+        k.is_type() || (self.family == LangFamily::Ruby && k == NodeKind::Module)
     }
 
     /// Node of the class scope that corresponds to type node `t` (same start position).
@@ -608,13 +615,109 @@ impl<'e, 'v> FileCx<'e, 'v> {
             return TypeRes::Unknown;
         }
         if let Some((head, rest)) = split_head(name) {
-            return self.qualified_type(wcx, head, rest, name);
+            return match self.qualified_type(wcx, head, rest, name) {
+                TypeRes::Unknown if self.family == LangFamily::C => self.cpp_scoped(name, true).map_or(TypeRes::Unknown, TypeRes::Node),
+                t => t,
+            };
         }
         match self.resolve_name(wcx, name, Accept::Type, 0, u32::MAX, None, true) {
             NameRes::Found(n, ..) => TypeRes::Node(n),
             NameRes::External => TypeRes::External,
             NameRes::Builtin => TypeRes::Builtin,
             _ => TypeRes::Unknown,
+        }
+    }
+
+    /// `a::b::T` as written in C++: a namespace is one node per block, and the enclosing
+    /// namespaces (or a macro-opened outer one) can be left out of what is written or indexed.
+    // ponytail: the shortest qualified name wins, not the one C++ lookup would find from here.
+    fn cpp_scoped(&self, name: &str, only_types: bool) -> Option<NodeIdx> {
+        let name = name.trim_start_matches("::");
+        if name.starts_with("std::") {
+            return None;
+        }
+        let view = self.view;
+        let leaf = name.rsplit("::").next()?;
+        let mut rest = name;
+        loop {
+            let tail = format!("::{rest}");
+            let hit = view
+                .by_name(leaf)
+                .filter(|n| view.file(view.hot(*n).file).lang().family() == LangFamily::C)
+                .filter(|n| kind_of(view, *n).is_type() || (!only_types && kind_of(view, *n).is_callable()))
+                .filter(|n| {
+                    let q = view.node(*n).qname();
+                    q == rest || (rest.contains("::") && q.ends_with(&tail))
+                })
+                .min_by_key(|n| (view.node(*n).qname().len(), view.file(view.hot(*n).file).path(), view.node(*n).start_line()));
+            if hit.is_some() {
+                return hit;
+            }
+            rest = rest.split_once("::")?.1;
+        }
+    }
+
+    /// C++: a type declared by the class around `from`, its bases or the classes around it.
+    fn cpp_nested_type(&self, from: NodeIdx, name: &str) -> Option<NodeIdx> {
+        if self.lang != Lang::Cpp {
+            return None;
+        }
+        let view = self.view;
+        let mut t = self.enclosing_type(from);
+        for _ in 0..8 {
+            let ty = t?;
+            for owner in std::iter::once(ty).chain(self.e.ancestors(ty)) {
+                if let Some(m) = self.e.direct_member(owner, name).filter(|m| kind_of(view, *m).is_type() && *m != ty) {
+                    return Some(m);
+                }
+            }
+            t = view.node(ty).parent().filter(|p| kind_of(view, *p).is_type());
+        }
+        None
+    }
+
+    /// What a C++ alias finally names, or the type itself.
+    fn cpp_unalias(&self, wcx: &mut WorkerCx<'e, 'v>, mut t: NodeIdx) -> NodeIdx {
+        for _ in 0..4 {
+            if kind_of(self.view, t) != NodeKind::TypeAlias || self.view.file(self.view.hot(t).file).lang() != Lang::Cpp {
+                break;
+            }
+            let Some(b) = self.e.type_aliases.get(&t) else { break };
+            let cx = wcx.file_cx(self.e, self.view.hot(t).file);
+            match cx.lookup_type(wcx, self.view.text_str(b.decl_type)) {
+                TypeRes::Node(n) if n != t => t = n,
+                _ => break,
+            }
+        }
+        t
+    }
+
+    /// The constructors of a C++ class, in file and line order.
+    fn cpp_constructors(&self, t: NodeIdx) -> SmallVec<[NodeIdx; 4]> {
+        let view = self.view;
+        let node = view.node(t);
+        let q = format!("{}::{}", node.qname(), node.name());
+        let mut out: SmallVec<[NodeIdx; 4]> = view.by_qname(&q).filter(|n| kind_of(view, *n) == NodeKind::Method).collect();
+        out.sort_by_key(|n| (view.file(view.hot(*n).file).path(), view.node(*n).start_line()));
+        out
+    }
+
+    /// `Foo x(1, 2);` reaches the index as a call of `Foo::Foo/2`.
+    fn cpp_constructor_ref(&self, wcx: &mut WorkerCx<'e, 'v>, path: &str, arity: usize) -> Outcome {
+        let Some((ty, _)) = path.rsplit_once("::") else { return Outcome::st(status::NO_CANDIDATE) };
+        match self.lookup_type(wcx, ty) {
+            TypeRes::Node(t) => {
+                let t = self.cpp_unalias(wcx, t);
+                let shapes = vec!["?"; arity];
+                match self.cpp_overload(&self.cpp_constructors(t), &shapes) {
+                    Some(c) => Outcome::found(c, by::QUALIFIED, 90),
+                    None => Outcome::st(status::NO_CANDIDATE),
+                }
+            }
+            TypeRes::External => Outcome::st(status::EXTERNAL),
+            TypeRes::Builtin => Outcome::st(status::BUILTIN),
+            TypeRes::Unknown if ty.starts_with("std::") => Outcome::st(status::BUILTIN),
+            TypeRes::Unknown => Outcome::st(status::NO_CANDIDATE),
         }
     }
 
@@ -659,7 +762,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
     fn nested_type(&self, _wcx: &mut WorkerCx<'e, 'v>, mut n: NodeIdx, rest: &str) -> TypeRes {
         for seg in rest.split(['.', ':']).filter(|s| !s.is_empty()) {
             match self.e.direct_member(n, seg) {
-                Some(m) if self.view.node(m).kind().is_type() => n = m,
+                Some(m) if self.holds_members(self.view.node(m).kind()) => n = m,
                 _ => return TypeRes::Unknown,
             }
         }
@@ -1005,13 +1108,24 @@ impl<'e, 'v> FileCx<'e, 'v> {
         if depth >= 16 || callee.len() > 4096 {
             return None;
         }
+        // `detail::counting_buffer<>()`, `detail::get_buffer<char>(out)`
+        if self.family == LangFamily::C && callee.contains("::") {
+            if let Some(n) = self.cpp_scoped(callee, false) {
+                return self.returned_value(wcx, n, self.enclosing_type(n), depth + 1);
+            }
+        }
         if let Some((inner, method)) = callee.rsplit_once('.') {
             if inner.ends_with(['?', ')']) {
                 let receiver = self.expression_value(wcx, inner, scope, line, depth + 1)?;
                 return self.member_return(wcx, receiver, method, depth + 1);
             }
         }
-        let split = callee.rsplit_once("::").or_else(|| callee.rsplit_once('.'));
+        // the last separator of either kind: `Foo::Bar.create` is `create` on `Foo::Bar`
+        let split = match (callee.rfind("::"), callee.rfind('.')) {
+            (Some(c), Some(d)) if d > c => callee.rsplit_once('.'),
+            (Some(_), _) => callee.rsplit_once("::"),
+            (None, _) => callee.rsplit_once('.'),
+        };
         if let Some((owner, method)) = split {
             // Django's default manager returns the concrete model for these
             // operations. Require the actual Model base in the resolved
@@ -1025,7 +1139,8 @@ impl<'e, 'v> FileCx<'e, 'v> {
                     }
                 }
             }
-            let implicit = matches!(owner, "self" | "cls" | "this") && matches!(self.family, LangFamily::Python | LangFamily::Js);
+            let implicit = matches!(owner, "self" | "cls" | "this")
+                && matches!(self.family, LangFamily::Python | LangFamily::Js | LangFamily::Php | LangFamily::CSharp | LangFamily::Swift | LangFamily::Ruby);
             let receiver = if let Some(b) = self
                 .lookup_binding(owner, scope, line, false)
                 .filter(|b| !(implicit && self.view.text_str(b.decl_type).is_empty() && self.view.text_str(b.init_ctor).is_empty()))
@@ -1173,9 +1288,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         let mut result = None;
-        let mut chain = vec![t];
-        chain.extend(self.e.ancestors(t));
-        for ty in chain {
+        for ty in self.field_owners(t) {
             let owner = self.view.hot(ty).file;
             let cx = wcx.file_cx(self.e, owner);
             if let Some(cs) = cx.class_scope_for(ty) {
@@ -1324,6 +1437,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
         if cands.len() < 2 {
             return None;
         }
+        if self.lang == Lang::Cpp {
+            return self.cpp_overload(cands, &args.shapes);
+        }
         let view = self.view;
         let n = args.shapes.len();
         let lang_of = |c: NodeIdx| view.file(view.hot(c).file).lang();
@@ -1380,7 +1496,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
     /// declares several.
     fn overloaded_member(&self, wcx: &mut WorkerCx<'e, 'v>, t: NodeIdx, name: &str, args: Option<&CallArgs<'v>>, r: &RefRec) -> Option<NodeIdx> {
         let args = args?;
-        if !matches!(self.family, LangFamily::Jvm | LangFamily::Js) {
+        if !matches!(self.family, LangFamily::Jvm | LangFamily::Js) && self.lang != Lang::Cpp {
             return None;
         }
         let cands = self.e.member_overloads(t, name);
@@ -1460,11 +1576,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
             let node = self.view.node(cand);
             let k = node.kind();
-            if !accept.ok(k) || (bare_callable && matches!(k, NodeKind::Method | NodeKind::Property | NodeKind::Field)) {
+            if !accept.ok(k) || (bare_callable && (matches!(k, NodeKind::Method | NodeKind::Property | NodeKind::Field) || self.not_a_callee(k))) {
                 continue;
             }
             let cf = node.file();
-            if self.view.file(cf).lang().family() != self.family {
+            if self.view.file(cf).lang().family() != self.family || self.test_only(cf) {
                 continue;
             }
             if !self.visible(cand, name) {
@@ -1503,23 +1619,65 @@ impl<'e, 'v> FileCx<'e, 'v> {
                     let pick = args.and_then(|(a, r)| self.pick_overload(wcx, &best, a, r)).unwrap_or(best[0]);
                     return NameRes::Found(pick, by::PACKAGE, 80);
                 }
+                if self.lang == Lang::Cpp {
+                    // a name written alone is no class's member while something else answers it
+                    let view = self.view;
+                    let free: SmallVec<[NodeIdx; 4]> =
+                        best.iter().copied().filter(|c| !view.node(*c).parent().is_some_and(|p| kind_of(view, p).is_type())).collect();
+                    let mut named = if free.is_empty() { best.clone() } else { free };
+                    // one declaration, repeated across `#if` branches or headers (`call_bare`
+                    // picks a function's overload by the arguments)
+                    if named.iter().all(|c| view.node(*c).qname() == view.node(named[0]).qname()) {
+                        named.sort_by_key(|c| (view.file(view.hot(*c).file).path(), view.node(*c).start_line()));
+                        return NameRes::Found(named[0], by::PACKAGE, 80);
+                    }
+                }
                 NameRes::Ambiguous(k as u32)
             }
         }
     }
 
+    /// C / C++: a macro invocation is not a call (upstream keeps macros out of the call graph).
+    /// Ruby: a variable is never reached by a bare call from another scope.
+    /// A C++ `using X = ..` is also bound as a typed local: `X(1)` constructs, it calls no variable.
+    fn is_cpp_alias(&self, b: &BindingRec, name: &str) -> bool {
+        self.family == LangFamily::C
+            && self.bindings.get(&(b.scope.0.wrapping_sub(self.scope_base), name)).is_some_and(|l| l.iter().any(|o| o.kind == BindKind::TypeAlias as u8))
+    }
+
+    fn not_a_callee(&self, k: NodeKind) -> bool {
+        match self.family {
+            LangFamily::C => k == NodeKind::Constant,
+            LangFamily::Ruby => k == NodeKind::Variable,
+            _ => false,
+        }
+    }
+
+    /// Production code cannot bind to a definition that exists only in a test file; a name
+    /// guess across that line is another program's helper (a spec's `def use`).
+    fn test_only(&self, f: FileId) -> bool {
+        !self.is_test
+            && matches!(self.family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby | LangFamily::Swift)
+            && self.view.file(f).flags() & cg_extract::fileflags::TEST != 0
+    }
+
     /// Member `name` of the type enclosing `from` (and of its outer types for Java / Kotlin).
     fn enclosing_member(&self, wcx: &mut WorkerCx<'e, 'v>, from: Option<NodeIdx>, name: &str, args: Option<(&CallArgs<'v>, &RefRec)>) -> Option<NodeIdx> {
         let view = self.view;
-        let t = self.enclosing_type(from?)?;
-        if let Some((a, r)) = args {
-            if let Some(m) = self.overloaded_member(wcx, t, name, Some(a), r) {
+        let ext = self.enclosing_type(from?)?;
+        // `extension Outer.Inner { .. }` is a node of its own: the members are the declaration's
+        let decl = self.is_swift_extension(ext).then(|| self.swift_declaration(ext)).flatten().filter(|d| *d != ext);
+        for t in std::iter::once(ext).chain(decl) {
+            if let Some((a, r)) = args {
+                if let Some(m) = self.overloaded_member(wcx, t, name, Some(a), r) {
+                    return Some(m);
+                }
+            }
+            if let Some(m) = self.e.find_member(t, name) {
                 return Some(m);
             }
         }
-        if let Some(m) = self.e.find_member(t, name) {
-            return Some(m);
-        }
+        let t = ext;
         if self.family == LangFamily::Jvm {
             let mut outer = view.node(t).parent();
             while let Some(o) = outer {
@@ -1535,6 +1693,24 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         None
+    }
+
+    /// PHP: the kernel emits `$this->m()`, `self::m()`, `static::m()` and `parent::m()` all as a
+    /// bare `m`. A bare `__construct` is always the parent's constructor, and a bare name equal
+    /// to the enclosing method is `parent::m()` when an ancestor declares it (otherwise a
+    /// recursive call); everything else is the class's own member first.
+    fn php_bare_member(&self, from: Option<NodeIdx>, name: &str) -> Option<NodeIdx> {
+        let from = from?;
+        let t = self.enclosing_type(from)?;
+        let inherited = || self.e.ancestors(t).into_iter().find_map(|a| self.e.direct_member(a, name));
+        if name == "__construct" {
+            return inherited();
+        }
+        let own = self.e.direct_member(t, name);
+        if self.view.node(from).name() == name {
+            return inherited().or(own);
+        }
+        own.or_else(inherited)
     }
 
     /// `const local = other`: resolve `other` where the alias is declared, through at most a few
@@ -1618,11 +1794,111 @@ impl<'e, 'v> FileCx<'e, 'v> {
         allow_global: bool,
         args: Option<(&CallArgs<'v>, &RefRec)>,
     ) -> NameRes {
+        let res = self.lookup_name(wcx, name, accept, scope, line, from, allow_global, args);
+        match res {
+            NameRes::Found(n, by_, conf) if self.is_swift_extension(n) => NameRes::Found(self.swift_declaration(n).unwrap_or(n), by_, conf),
+            NameRes::Found(n, ..) if from.is_some_and(|f| self.swift_nested_elsewhere(n, f)) => NameRes::NotFound,
+            _ => res,
+        }
+    }
+
+    /// Swift: a type nested in another and named like a standard one (`PathMonitor.Result`) is
+    /// named bare only inside that type, its extensions and subtypes; elsewhere `Result` is the
+    /// standard one. (The kernel names `Outer.Inner` by `Inner` alone, so other nested names
+    /// cannot be told from a qualified use.)
+    fn swift_nested_elsewhere(&self, n: NodeIdx, from: NodeIdx) -> bool {
+        let view = self.view;
+        if self.family != LangFamily::Swift || !kind_of(view, n).is_type() || !crate::builtins::is_swift_std_type(view.node(n).name()) {
+            return false;
+        }
+        let Some(owner) = view.node(n).parent().filter(|p| kind_of(view, *p).is_type()) else { return false };
+        let owner = view.node(owner).qname();
+        let mut t = Some(from).filter(|f| kind_of(view, *f).is_type()).or_else(|| self.enclosing_type(from));
+        for _ in 0..8 {
+            let Some(ty) = t else { return true };
+            if std::iter::once(ty).chain(self.e.ancestors(ty)).any(|a| view.node(a).qname() == owner) {
+                return false;
+            }
+            t = view.node(ty).parent().filter(|p| kind_of(view, *p).is_type());
+        }
+        true
+    }
+
+    /// Swift `extension Foo { .. }` is a class node named `Foo`, but it does not declare `Foo`.
+    fn is_swift_extension(&self, n: NodeIdx) -> bool {
+        self.family == LangFamily::Swift
+            && kind_of(self.view, n) == NodeKind::Class
+            && self.view.node(n).signature().is_some_and(|s| s.starts_with("extension "))
+    }
+
+    /// Swift `guard let request = request(for: task)`: the name a declaration binds is not in
+    /// scope in its own initializer, so the call there is to the method of that name.
+    fn swift_self_init(&self, b: &BindingRec, name: &str, line: u32) -> bool {
+        self.family == LangFamily::Swift && b.line == line && self.view.text_str(b.init_ctor).strip_suffix("()") == Some(name)
+    }
+
+    /// `t` and what it inherits, for a field lookup; a Swift extension stores no fields, so its
+    /// type's declaration and what that inherits too.
+    fn field_owners(&self, t: NodeIdx) -> Vec<NodeIdx> {
+        let mut chain = vec![t];
+        if self.is_swift_extension(t) {
+            chain.extend(self.swift_declaration(t));
+        }
+        let supers: Vec<NodeIdx> = chain.iter().flat_map(|&c| self.e.ancestors(c)).collect();
+        chain.extend(supers);
+        chain
+    }
+
+    /// The declaration an extension extends: a top-level one (this module's first), else the
+    /// only nested one of that name. `None` when the type comes from outside the project.
+    fn swift_declaration(&self, ext: NodeIdx) -> Option<NodeIdx> {
+        let view = self.view;
+        let name = view.node(ext).name();
+        let decls: SmallVec<[NodeIdx; 4]> = view
+            .by_name(name)
+            .filter(|&n| kind_of(view, n).is_type() && view.file(view.hot(n).file).lang() == Lang::Swift && !self.is_swift_extension(n))
+            .collect();
+        let top = decls.iter().copied().filter(|&n| view.node(n).parent().is_none_or(|p| kind_of(view, p) == NodeKind::File)).min_by_key(|&n| {
+            let f = view.hot(n).file;
+            (self.e.modules.pkg_of(f) != self.pkg, view.file(f).path(), view.node(n).start_line())
+        });
+        // `extension Outer.Inner` extends that nested type; a bare `extension Result` never does
+        let written = view.node(ext).signature().and_then(|s| s.strip_prefix("extension ")).unwrap_or("");
+        let mut segs: Vec<&str> = written.split(['<', ' ']).next().unwrap_or("").split('.').collect();
+        // a module qualifier (`extension Alamofire.HTTPHeader`) names no type of the project
+        while segs.len() > 1 && !self.swift_project_type(segs[0]) {
+            segs.remove(0);
+        }
+        if segs.len() < 2 {
+            return top;
+        }
+        let path = segs.join("::");
+        let tail = format!("::{path}");
+        let nested: SmallVec<[NodeIdx; 2]> = decls.iter().copied().filter(|&n| view.node(n).qname() == path || view.node(n).qname().ends_with(&tail)).collect();
+        if let [only] = nested.as_slice() {
+            Some(*only)
+        } else {
+            None
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_name(
+        &self,
+        wcx: &mut WorkerCx<'e, 'v>,
+        name: &str,
+        accept: Accept,
+        scope: u32,
+        line: u32,
+        from: Option<NodeIdx>,
+        allow_global: bool,
+        args: Option<(&CallArgs<'v>, &RefRec)>,
+    ) -> NameRes {
         let view = self.view;
         let e = self.e;
         // 2. lexical scope
         if accept != Accept::Type {
-            if let Some(b) = self.lookup_binding(name, scope, line, false) {
+            if let Some(b) = self.lookup_binding(name, scope, line, false).filter(|b| !self.is_cpp_alias(b, name) && !self.swift_self_init(b, name, line)) {
                 if b.kind == BindKind::Alias as u8 {
                     return self.follow_alias(wcx, b, accept, from, allow_global, args);
                 }
@@ -1644,7 +1920,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 return NameRes::Local;
             }
             // members of the enclosing class are visible by bare name in these languages
-            if matches!(self.family, LangFamily::Jvm | LangFamily::Python) {
+            if self.family == LangFamily::Php {
+                if let Some(m) = self.php_bare_member(from, name) {
+                    return NameRes::Found(m, by::RECEIVER, 88);
+                }
+            } else if matches!(self.family, LangFamily::Jvm | LangFamily::Python | LangFamily::CSharp | LangFamily::Ruby | LangFamily::Swift | LangFamily::C) {
                 if let Some(m) = self.enclosing_member(wcx, from, name, args) {
                     return NameRes::Found(m, by::RECEIVER, 90);
                 }
@@ -1689,7 +1969,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 continue;
             }
             let k = NodeKind::from_u8(h.kind).unwrap_or(NodeKind::Variable);
-            if !accept.ok(k) || (bare_callable && matches!(k, NodeKind::Method | NodeKind::Property | NodeKind::Field)) {
+            if !accept.ok(k) || (bare_callable && (matches!(k, NodeKind::Method | NodeKind::Property | NodeKind::Field) || self.not_a_callee(k))) {
                 continue;
             }
             same.push(cand);
@@ -1711,6 +1991,16 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 let hits: SmallVec<[NodeIdx; 2]> = list.iter().copied().filter(|n| accept.ok(kind_of(view, *n)) && view.hot(*n).file != self.file).collect();
                 if let Some(n) = hits.first() {
                     return NameRes::Found(*n, by::PACKAGE, 85);
+                }
+            }
+        }
+        // C#: types of the enclosing namespaces need no `using`
+        if self.family == LangFamily::CSharp {
+            for p in e.modules.parent_namespaces(self.pkg) {
+                if let Some(list) = e.pkg_defs.get(p.0 as usize).and_then(|m| m.get(name)) {
+                    if let Some(n) = list.iter().copied().find(|n| accept.ok(kind_of(view, *n))) {
+                        return NameRes::Found(n, by::PACKAGE, 85);
+                    }
                 }
             }
         }
@@ -1748,7 +2038,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         // 7. global name match
-        if is_builtin(self.family, name) {
+        if is_builtin(self.family, name) || (self.lang == Lang::Cpp && crate::builtins::is_cpp_std_free_function(name)) {
             return NameRes::Builtin;
         }
         if allow_global {
@@ -1773,11 +2063,21 @@ impl<'e, 'v> FileCx<'e, 'v> {
         args: Option<(&CallArgs<'v>, &RefRec)>,
     ) -> Outcome {
         for f in path {
+            t = self.cpp_unalias(wcx, t);
             match self.field_type(wcx, t, f) {
                 Some(ft) => t = ft,
-                None => return Outcome::st(status::NO_CANDIDATE),
+                // `Outer.Inner.m()` / `Mod::Klass.m`: a nested type rather than a field
+                None => match self.e.direct_member(t, f) {
+                    Some(inner) if self.holds_members(self.view.node(inner).kind()) => t = inner,
+                    // `NotificationCenter.default.postNotification(..)`: a member of an outside type
+                    // the project only extends, its type unknown
+                    // ponytail: guessed to be that type (`.default`, `.shared`); a wrong guess finds no method
+                    _ if self.is_swift_extension(t) && self.swift_declaration(t).is_none() => {}
+                    _ => return Outcome::st(status::NO_CANDIDATE),
+                },
             }
         }
+        t = self.cpp_unalias(wcx, t);
         if let Some((a, r)) = args {
             if let Some(m) = self.overloaded_member(wcx, t, method, Some(a), r) {
                 return Outcome::found(m, by::RECEIVER, conf);
@@ -1796,7 +2096,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
         if self.family == LangFamily::Js {
             return Outcome::st(status::NO_CANDIDATE);
         }
-        if is_common_method(self.family, method) || is_builtin(self.family, method) {
+        // Ruby duck-types everything: a unique name says nothing of the receiver (`response.body`
+        // is Rack's, not the project's only `body`)
+        if self.family == LangFamily::Ruby || is_common_method(self.family, method) || is_builtin(self.family, method) {
             return Outcome::st(status::NO_CANDIDATE);
         }
         let mut found: SmallVec<[NodeIdx; 2]> = SmallVec::new();
@@ -1812,7 +2114,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             if node.kind() == NodeKind::Function && !assigned.contains(&cand) {
                 continue;
             }
-            if self.view.file(node.file()).lang().family() != self.family || !self.visible(cand, method) {
+            if self.view.file(node.file()).lang().family() != self.family || !self.visible(cand, method) || self.test_only(node.file()) {
                 continue;
             }
             found.push(cand);
@@ -1950,7 +2252,20 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 Some(m) => Outcome::found(m, b, c.min(90)),
                 None => Outcome::found(n, b, c),
             },
-            NameRes::Found(n, b, c) => Outcome::found(n, b, c),
+            // `Foo(1)` runs the constructor its arguments fit
+            NameRes::Found(n, b, c) if self.lang == Lang::Cpp && matches!(kind_of(self.view, n), NodeKind::Class | NodeKind::Struct) => {
+                let ctors = self.cpp_constructors(n);
+                let ctor = args.and_then(|a| self.cpp_overload(&ctors, &a.shapes)).or(ctors.first().copied());
+                Outcome::found(ctor.unwrap_or(n), b, c)
+            }
+            NameRes::Found(n, b, c) if self.family == LangFamily::Ruby => Outcome::found(self.ruby_twin(n, r.from), b, c),
+            NameRes::Found(n, b, c) => Outcome::found(self.cpp_function_overload(n, args), b, c),
+            // a Ruby call written with a name alone is a method call, whatever local shares it
+            res @ (NameRes::Local | NameRes::NotFound) if self.family == LangFamily::Ruby => match self.ruby_bare_method(r, name) {
+                Some(o) => o,
+                None if res == NameRes::Local => Outcome::st(status::LOCAL_BINDING),
+                None => Outcome::st(status::NO_CANDIDATE),
+            },
             NameRes::Local => Outcome::st(status::LOCAL_BINDING),
             NameRes::External | NameRes::Module(_) | NameRes::Pkg(_) => Outcome::st(status::EXTERNAL),
             NameRes::Builtin => Outcome::st(status::BUILTIN),
@@ -1963,8 +2278,18 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let scope = self.scope_at(r.line, r.col);
         let view = self.view;
         let call = args.map(|a| (a, r));
-        // (a) a local variable, parameter or field
-        if let Some(b) = self.lookup_binding(root, scope, r.line, false) {
+        // PHP `\Vendor\Lib\Logger::make()`: a namespaced root is resolved as written, never
+        // reduced to a same-named project class
+        if self.family == LangFamily::Php && root.contains('\\') {
+            return match self.e.modules.resolve_import(self.lang, root, self.file) {
+                ImportTarget::Node(n) if self.holds_members(kind_of(view, n)) => self.member_call(wcx, n, path, method, 90, call),
+                ImportTarget::External => Outcome::st(status::EXTERNAL),
+                _ => Outcome::st(status::NO_CANDIDATE),
+            };
+        }
+        // (a) a local variable, parameter or field; C++ `a::f` never reads one called `a`
+        let scoped_root = self.lang == Lang::Cpp && r_name_is_scoped(view.text_str(r.name));
+        if let Some(b) = self.lookup_binding(root, scope, r.line, false).filter(|_| !scoped_root) {
             if b.kind != BindKind::LocalFn as u8 {
                 return match self.binding_value(wcx, b, 0) {
                     Some(t) if t.method_receiver(method).is_some() => {
@@ -2010,6 +2335,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
                                 return Outcome::st(status::EXTERNAL);
                             }
                         }
+                        if self.family == LangFamily::Swift && path.is_empty() {
+                            if let Some(n) = self.swift_chained(r, root, method, true) {
+                                return Outcome::found(n, by::GLOBAL, 40);
+                            }
+                        }
                         let o = self.fallback_method(method);
                         if o.status == status::RESOLVED && path.is_empty() {
                             o
@@ -2020,9 +2350,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 };
             }
         }
-        // (a2) Java / Kotlin: a field of the enclosing type or an outer one, `this.` implied
-        // (the kernel writes `this.repo.find()` as `repo.find`)
-        if self.family == LangFamily::Jvm {
+        // (a2) Java / Kotlin / C# / Swift / C++: a field of the enclosing type or an outer one, `this.`
+        // implied (the kernel writes `this.repo.find()` as `repo.find`)
+        if matches!(self.family, LangFamily::Jvm | LangFamily::CSharp | LangFamily::Swift) || self.lang == Lang::Cpp {
             if let Some(o) = self.call_on_field(wcx, r, root, path, method, call) {
                 return o;
             }
@@ -2095,8 +2425,18 @@ impl<'e, 'v> FileCx<'e, 'v> {
         }
         match self.lookup_type(wcx, root) {
             TypeRes::Node(t) => {
-                if view.node(t).kind().is_type() {
-                    return self.member_call(wcx, t, path, method, 90, call);
+                if self.holds_members(view.node(t).kind()) {
+                    let o = self.member_call(wcx, t, path, method, 90, call);
+                    if o.status != status::RESOLVED && matches!(self.family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby) {
+                        // `Mod::Klass.m` / `ns::f`: the root may be a namespace-like node whose
+                        // members are only reachable by qualified name
+                        if let Some(n) = self.qualified_callable(r.from, root, path, method, false) {
+                            return Outcome::found(self.cpp_function_overload(n, args), by::QUALIFIED, 90);
+                        }
+                    }
+                    // A known receiver constrains the lookup to its own hierarchy: no
+                    // unique-name fallback when the member is missing.
+                    return o;
                 }
             }
             TypeRes::External => return Outcome::st(status::EXTERNAL),
@@ -2106,12 +2446,38 @@ impl<'e, 'v> FileCx<'e, 'v> {
         if is_builtin(self.family, root) {
             return Outcome::st(status::BUILTIN);
         }
-        // (d) nothing known about the receiver
-        if path.is_empty() {
+        if matches!(self.family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby) {
+            if let Some(n) = self.qualified_callable(r.from, root, path, method, false) {
+                return Outcome::found(self.cpp_function_overload(n, args), by::QUALIFIED, 90);
+            }
+        }
+        // (d) nothing known about the receiver. A `::`-qualified call in C++, PHP or Ruby names
+        // a namespace or class we could not find (a dependency): no unique-name guess.
+        let qualified = matches!(self.family, LangFamily::C | LangFamily::Php | LangFamily::Ruby) && r_name_is_scoped(self.view.text_str(r.name));
+        // A capitalized receiver that no project type answers is a dependency's type (`Task.Run`,
+        // `File.join`), not a value whose method could be guessed by name.
+        if matches!(self.family, LangFamily::CSharp | LangFamily::Swift | LangFamily::Ruby) && root.starts_with(|c: char| c.is_uppercase()) {
+            return Outcome::st(status::EXTERNAL);
+        }
+        if self.lang == Lang::Cpp && qualified && self.e.macro_namespaces.contains(root) {
+            return self.macro_namespace_call(path, method, args);
+        }
+        if path.is_empty() && !qualified {
             self.fallback_method(method)
         } else {
             Outcome::st(status::NO_CANDIDATE)
         }
+    }
+
+    /// C++ `fmt::format(..)` where `fmt` is opened by a macro (`FMT_BEGIN_NAMESPACE`), so the
+    /// index holds no such namespace and `format` sits at the top level of a header.
+    fn macro_namespace_call(&self, path: &[&str], method: &str, args: Option<&CallArgs<'v>>) -> Outcome {
+        let mut q = path.join("::");
+        if !q.is_empty() {
+            q.push_str("::");
+        }
+        q.push_str(method);
+        self.global_namespace_call(&q, args, true)
     }
 
     /// A call on field `root` of the type enclosing `r` (or of an outer type). `None` when no
@@ -2144,7 +2510,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
 
     /// Declared type text of field `name` of `t` or an ancestor (`Some("")`: untyped).
     fn field_decl_type(&self, wcx: &mut WorkerCx<'e, 'v>, t: NodeIdx, name: &str) -> Option<String> {
-        for ty in std::iter::once(t).chain(self.e.ancestors(t)) {
+        for ty in self.field_owners(t) {
             let cx = wcx.file_cx(self.e, self.view.hot(ty).file);
             let Some(cs) = cx.class_scope_for(ty) else { continue };
             if let Some(b) = cx.bindings.get(&(cs, name)).and_then(|l| l.iter().copied().find(|b| b.kind == BindKind::Field as u8)) {
@@ -2162,6 +2528,14 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 if let Some(n) = self.assigned_this_member(r, method) {
                     return Outcome::found(n, by::RECEIVER, 90);
                 }
+                // `this.m()` in an object literal's method (`_.mixin(Input.prototype, Emitter, {..})`):
+                // `this` is no arbitrary receiver, and the file defines one function `m`
+                let view = self.view;
+                let mut own =
+                    view.by_name(method).filter(|&n| view.hot(n).file == self.file && matches!(kind_of(view, n), NodeKind::Function | NodeKind::Method));
+                if let (Some(n), None) = (own.next(), own.next()) {
+                    return Outcome::found(n, by::LEXICAL, 50);
+                }
             }
             return if fields.is_empty() { self.fallback_method(method) } else { Outcome::st(status::NO_CANDIDATE) };
         };
@@ -2169,6 +2543,13 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let o = self.member_call(wcx, t, fields, method, 95, args.map(|a| (a, r)));
         if o.status == status::RESOLVED {
             return o;
+        }
+        // `self.m()` in `extension Outer.Inner`: the nested declaration's member
+        if let Some(d) = self.is_swift_extension(t).then(|| self.swift_declaration(t)).flatten().filter(|d| *d != t) {
+            let o = self.member_call(wcx, d, fields, method, 95, args.map(|a| (a, r)));
+            if o.status == status::RESOLVED {
+                return o;
+            }
         }
         if fields.is_empty() {
             // a callable stored in a field of this type
@@ -2250,7 +2631,414 @@ impl<'e, 'v> FileCx<'e, 'v> {
         self.member_call(wcx, t, &[], method, 85, args.map(|a| (a, r)))
     }
 
+    /// A namespace-qualified callable (`fmt::detail::write`, `Ns.Util.Run`, `Rack::Utils.escape`)
+    /// by its qualified name, as written or relative to the namespaces enclosing the caller.
+    /// Lookup order follows lexical scoping: the caller's innermost enclosing namespace first,
+    /// then the outer ones, then the name as an absolute path (`absolute_only` skips the
+    /// relative levels: C++ `::util::log`). Within one level all hits share one qualified name
+    /// (a header declaration and its definition, overloads, an amalgamated copy): the caller's
+    /// own file wins, then a file it includes or imports, then the first by path and line.
+    fn qualified_callable(&self, from: NodeIdx, root: &str, path: &[&str], method: &str, absolute_only: bool) -> Option<NodeIdx> {
+        let view = self.view;
+        let mut segs: SmallVec<[&str; 6]> = SmallVec::new();
+        segs.push(root);
+        segs.extend(path.iter().copied());
+        segs.push(method);
+        let joined = segs.join("::");
+        let mut levels: Vec<Vec<String>> = Vec::new();
+        if !absolute_only {
+            let mut prefix = view.node(from).qname();
+            while let Some(i) = prefix.rfind("::") {
+                prefix = &prefix[..i];
+                levels.push(vec![format!("{prefix}::{joined}")]);
+            }
+        }
+        let mut absolute = vec![joined.clone()];
+        let sep = match self.family {
+            LangFamily::CSharp => Some("."),
+            LangFamily::Php => Some("\\"),
+            _ => None,
+        };
+        if let Some(sep) = sep {
+            // the namespace part of a qualified name uses the language's separator
+            for i in (1..segs.len() - 1).rev() {
+                absolute.push(format!("{}::{}", segs[..i].join(sep), segs[i..].join("::")));
+            }
+        }
+        levels.push(absolute);
+        for cands in levels {
+            let mut hits: SmallVec<[NodeIdx; 4]> = SmallVec::new();
+            for q in &cands {
+                for n in view.by_qname(q) {
+                    let node = view.node(n);
+                    if view.file(node.file()).lang().family() == self.family && Accept::Callable.ok(node.kind()) && node.kind() != NodeKind::File {
+                        hits.push(n);
+                    }
+                }
+            }
+            if hits.is_empty() {
+                continue;
+            }
+            return hits.iter().copied().min_by_key(|h| {
+                let f = view.hot(*h).file;
+                let rank = if f == self.file {
+                    0
+                } else if self.imported_files.contains(&f) {
+                    1
+                } else {
+                    2
+                };
+                (rank, view.file(f).path(), view.node(*h).start_line())
+            });
+        }
+        None
+    }
+
+    /// Swift: `Data()`, `String(x)`, `URL(string:)` construct standard-library types. A
+    /// project `extension Data { .. }` is emitted as a class node named `Data`, but it does not
+    /// declare the type, so the call is a builtin rather than an edge to the extension. Member
+    /// lookups through the extension (`d.projectMethod()`) are unaffected.
+    fn swift_extended_builtin(&self, name: &str, r: &RefRec) -> bool {
+        if self.family != LangFamily::Swift || !crate::builtins::is_swift_std_type(name) {
+            return false;
+        }
+        if self.lookup_binding(name, self.scope_at(r.line, r.col), r.line, false).is_some() {
+            return false;
+        }
+        // Extensions are class nodes; a struct, enum, protocol or alias of that name in this
+        // module is a real declaration that shadows the standard type: a top-level one
+        // everywhere, a nested one (`struct PathMonitor { enum Result { .. } }`) only inside
+        // its enclosing declaration.
+        let view = self.view;
+        !view.by_name(name).any(|n| {
+            let h = view.hot(n);
+            matches!(kind_of(view, n), NodeKind::Struct | NodeKind::Enum | NodeKind::Protocol | NodeKind::TypeAlias)
+                && view.file(h.file).lang() == Lang::Swift
+                && self.e.modules.pkg_of(h.file) == self.pkg
+                && match view.node(n).parent() {
+                    Some(p) if kind_of(view, p) != NodeKind::File => self.is_ancestor(p, r.from),
+                    _ => true,
+                }
+        })
+    }
+
+    /// Whether `anc` is `n` or one of its enclosing declarations.
+    fn is_ancestor(&self, anc: NodeIdx, n: NodeIdx) -> bool {
+        let mut cur = n;
+        for _ in 0..256 {
+            if cur == anc {
+                return true;
+            }
+            match self.view.node(cur).parent() {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// PHP `\App\Helpers\format_id()` / C++ `::util::log()`: a qualified free function.
+    fn qualified_free_call(&self, r: &RefRec, name: &str) -> Outcome {
+        if self.family == LangFamily::Php {
+            return match self.e.modules.resolve_import(self.lang, name, self.file) {
+                ImportTarget::Node(n) if Accept::Callable.ok(kind_of(self.view, n)) => Outcome::found(n, by::QUALIFIED, 90),
+                ImportTarget::External => Outcome::st(status::EXTERNAL),
+                _ => Outcome::st(status::NO_CANDIDATE),
+            };
+        }
+        let abs = name.trim_start_matches("::");
+        let segs: SmallVec<[&str; 6]> = abs.split("::").filter(|s| !s.is_empty()).collect();
+        match segs.split_last() {
+            // `::std::string(..)` is `std::string(..)`
+            Some((_, rest)) if !rest.is_empty() && is_builtin(self.family, rest[0]) => Outcome::st(status::BUILTIN),
+            Some((method, rest)) if !rest.is_empty() => match self.qualified_callable(r.from, rest[0], &rest[1..], method, true) {
+                Some(n) => Outcome::found(n, by::QUALIFIED, 90),
+                None => Outcome::st(status::NO_CANDIDATE),
+            },
+            Some((only, _)) => self.global_namespace_call(only, None, false),
+            None => Outcome::st(status::NO_CANDIDATE),
+        }
+    }
+
+    /// C++ `::open(..)`: a function of the global namespace, never the enclosing
+    /// `test::open` that wraps it. Only declarations at the top level of the calling file or
+    /// of a file it includes (transitively) qualify; a same-named one elsewhere is a different
+    /// translation unit's (POSIX/Win32 functions are not in the project at all).
+    /// `anywhere`: the namespace itself vouches for the name, so a file with no `#include` of it
+    /// (`import fmt;`) still reaches it, behind what it does include; `fmt::printf` is the
+    /// namespace's, not the C library's.
+    fn global_namespace_call(&self, name: &str, args: Option<&CallArgs<'v>>, anywhere: bool) -> Outcome {
+        if !anywhere && is_builtin(self.family, name) {
+            return Outcome::st(status::BUILTIN);
+        }
+        let view = self.view;
+        let mut cands: SmallVec<[_; 4]> = view
+            .by_qname(name)
+            .filter(|&n| Accept::Callable.ok(kind_of(view, n)) && !self.not_a_callee(kind_of(view, n)))
+            .filter_map(|n| {
+                let f = view.hot(n).file;
+                let rank = if f == self.file {
+                    0u8
+                } else if self.e.includes_transitively(self.file, f) {
+                    1
+                } else if anywhere {
+                    2
+                } else {
+                    return None;
+                };
+                Some((rank, view.file(f).path(), view.node(n).start_line(), n))
+            })
+            .collect();
+        cands.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        let order: SmallVec<[NodeIdx; 4]> = cands.iter().map(|c| c.3).collect();
+        match args.and_then(|a| self.cpp_overload(&order, &a.shapes)).or(order.first().copied()) {
+            Some(n) => Outcome::found(n, by::QUALIFIED, 90),
+            None => Outcome::st(status::NO_CANDIDATE),
+        }
+    }
+
+    /// Upstream's last resort (`findBestMatch`) for a call it could only match by name: the file,
+    /// then the directories it shares with the caller, then a function over anything else and an
+    /// exported definition, then the nearer line; the first in path order on a tie.
+    // ponytail: a guess by name and place, as upstream makes it; it is gated to Ruby and Swift.
+    fn nearest_by_name(&self, r: &RefRec, cands: impl Iterator<Item = NodeIdx>) -> Option<NodeIdx> {
+        let view = self.view;
+        let dirs: Vec<&str> = self.path.split('/').collect();
+        let dirs = &dirs[..dirs.len().saturating_sub(1)];
+        let mut list: Vec<NodeIdx> = cands.collect();
+        list.sort_by_key(|n| (view.file(view.hot(*n).file).path(), view.node(*n).start_line()));
+        let mut best: Option<(f64, NodeIdx)> = None;
+        for n in list {
+            let node = view.node(n);
+            let f = view.hot(n).file;
+            let p: Vec<&str> = view.file(f).path().split('/').collect();
+            let shared = dirs.iter().zip(&p[..p.len().saturating_sub(1)]).take_while(|(a, b)| a == b).count();
+            let mut s = (shared * 15).min(80) as f64;
+            if f == self.file {
+                s += 100.0 + (20.0 - (node.start_line() as f64 - r.line as f64).abs() / 10.0).max(0.0);
+            }
+            if matches!(node.kind(), NodeKind::Function | NodeKind::Method) {
+                s += 25.0;
+            }
+            if node.is_exported() == Some(true) {
+                s += 10.0;
+            }
+            if best.is_none_or(|(b, _)| s > b) {
+                best = Some((s, n));
+            }
+        }
+        best.map(|(_, n)| n)
+    }
+
+    /// Ruby `def build` and `def self.build` share a name: a bare call is on `self`, so a class
+    /// method's call reaches the class method and an instance method's the instance one.
+    fn ruby_twin(&self, n: NodeIdx, from: NodeIdx) -> NodeIdx {
+        let view = self.view;
+        if kind_of(view, n) != NodeKind::Method || kind_of(view, from) != NodeKind::Method {
+            return n;
+        }
+        let want = view.node(from).is_static() == Some(true);
+        if (view.node(n).is_static() == Some(true)) == want {
+            return n;
+        }
+        view.by_qname(view.node(n).qname())
+            .filter(|m| kind_of(view, *m) == NodeKind::Method && view.hot(*m).file == view.hot(n).file && (view.node(*m).is_static() == Some(true)) == want)
+            .min_by_key(|m| view.node(*m).start_line())
+            .unwrap_or(n)
+    }
+
+    /// A Ruby call by a name alone: a method of the class around it and its ancestry; in a
+    /// module or top-level code, whose `self` is whatever includes or runs it, any method of
+    /// that name, the nearest by place (upstream `isRubyMethodInScope`).
+    fn ruby_bare_method(&self, r: &RefRec, name: &str) -> Option<Outcome> {
+        let view = self.view;
+        let t = self.enclosing_type(r.from);
+        if let Some(m) = t.and_then(|t| self.e.find_member(t, name)).filter(|m| kind_of(view, *m) == NodeKind::Method) {
+            return Some(Outcome::found(self.ruby_twin(m, r.from), by::RECEIVER, 88));
+        }
+        if t.is_some_and(|t| kind_of(view, t) == NodeKind::Class) {
+            return None;
+        }
+        let cands = view
+            .by_name(name)
+            .filter(|n| view.file(view.hot(*n).file).lang() == Lang::Ruby && matches!(kind_of(view, *n), NodeKind::Method | NodeKind::Function));
+        self.nearest_by_name(r, cands).map(|n| Outcome::found(self.ruby_twin(n, r.from), by::GLOBAL, 40))
+    }
+
+    /// A Swift call on a value of no known type (`session.request(..).validate()`): a member of
+    /// that name of some type, the nearest by place (upstream `isSwiftCallTarget`). Called on a
+    /// variable (`named`), a member of the type the variable names (`session` a `Session`,
+    /// declaration before extensions) or shares a word with comes first, and failing those only
+    /// a member no other type has a namesake of. A name the standard
+    /// collections and strings carry stays theirs unless the receiver names the member's owner.
+    fn swift_chained(&self, r: &RefRec, receiver: &str, method: &str, named: bool) -> Option<NodeIdx> {
+        let view = self.view;
+        let last = receiver.rsplit('.').next().unwrap_or("");
+        let std_name = SWIFT_STD_METHODS.contains(&method);
+        let mut tiers: [Vec<NodeIdx>; 3] = Default::default();
+        for n in view.by_name(method) {
+            let node = view.node(n);
+            let Some(owner) = node.parent().filter(|p| kind_of(view, *p).is_type()) else { continue };
+            let owner = view.node(owner).name();
+            if view.file(node.file()).lang() != Lang::Swift
+                || !matches!(
+                    node.kind(),
+                    NodeKind::Method | NodeKind::Function | NodeKind::Property | NodeKind::Field | NodeKind::Constant | NodeKind::Variable
+                )
+                || !swift_target_visible(view.file(node.file()).path(), self.path)
+            {
+                continue;
+            }
+            let shares = shares_receiver_word(last, owner, node.qname());
+            if std_name && !shares && self.swift_project_type(owner) {
+                continue;
+            }
+            let owns = named && !last.is_empty() && flat_word(last) == flat_word(owner);
+            tiers[if owns {
+                0
+            } else if named && shares {
+                1
+            } else {
+                2
+            }]
+            .push(n);
+        }
+        if !tiers[0].is_empty() {
+            let declared = |n: &NodeIdx| view.node(*n).parent().is_some_and(|p| self.is_swift_extension(p));
+            return tiers[0].iter().copied().min_by_key(|n| (declared(n), view.file(view.hot(*n).file).path(), view.node(*n).start_line()));
+        }
+        let [_, words, rest] = tiers;
+        // a variable that neither names nor shares a word with an owner says nothing of its type:
+        // only a name one member carries (upstream's unique-name match)
+        let tier = if !words.is_empty() {
+            words
+        } else if named && rest.len() > 1 {
+            return None;
+        } else {
+            rest
+        };
+        self.nearest_by_name(r, tier.into_iter())
+    }
+
+    /// Whether the project declares a Swift type of that name (not just extends an outside one).
+    fn swift_project_type(&self, name: &str) -> bool {
+        self.view
+            .by_name(name)
+            .any(|n| kind_of(self.view, n).is_type() && self.view.file(self.view.hot(n).file).lang() == Lang::Swift && !self.is_swift_extension(n))
+    }
+
+    /// A Swift call to an enum case (`AFError.invalidURL(url:)`) or, through an implicit
+    /// member, to a property (`.failure(error)` is the standard `Result`'s case, not a
+    /// project extension's `failure` property) reaches no callable; nor does an implicit member
+    /// some enum has a case of (`.image(type)` is as likely `Path.image` as a static `image`).
+    fn swift_call_target(&self, o: Outcome, name: &str) -> Outcome {
+        if self.family != LangFamily::Swift || o.status != status::RESOLVED {
+            return o;
+        }
+        let view = self.view;
+        let k = kind_of(view, NodeIdx(o.target));
+        let case = |m: &str| view.by_name(m).any(|n| kind_of(view, n) == NodeKind::EnumMember);
+        if k == NodeKind::EnumMember || name.strip_prefix('.').is_some_and(|m| matches!(k, NodeKind::Property | NodeKind::Field) || case(m)) {
+            return Outcome::st(status::NO_CANDIDATE);
+        }
+        o
+    }
+
+    /// A bare or `self.` Swift call among overloads its type declares in the caller's file: the
+    /// one nearest the call by line, as upstream ranks any name match (`findBestMatch`, its
+    /// line score fading out 200 lines away), before the labels have their say.
+    fn swift_nearest_sibling(&self, o: Outcome, r: &RefRec) -> Outcome {
+        if self.family != LangFamily::Swift || o.status != status::RESOLVED {
+            return o;
+        }
+        let view = self.view;
+        let t = NodeIdx(o.target);
+        let node = view.node(t);
+        if view.hot(t).file != self.file || !matches!(node.kind(), NodeKind::Method | NodeKind::Function) {
+            return o;
+        }
+        let owner = node.qname().rsplit_once("::").map_or("", |(p, _)| p);
+        let mut sibs: SmallVec<[NodeIdx; 4]> = view
+            .by_name(node.name())
+            .filter(|&n| {
+                let m = view.node(n);
+                view.hot(n).file == self.file
+                    && matches!(m.kind(), NodeKind::Method | NodeKind::Function)
+                    && m.qname().rsplit_once("::").map_or("", |(p, _)| p) == owner
+            })
+            .collect();
+        sibs.sort_by_key(|&n| view.node(n).start_line());
+        let near = |n: NodeIdx| (20.0 - (view.node(n).start_line() as f64 - r.line as f64).abs() / 10.0).max(0.0);
+        let mut best = t;
+        let mut score = f64::MIN;
+        for n in sibs {
+            if near(n) > score {
+                score = near(n);
+                best = n;
+            }
+        }
+        Outcome::found(best, o.by, o.conf)
+    }
+
+    /// Swift overloads by argument label: a target whose parameters the call's labels do not fit
+    /// gives way to the one same-owner overload in its file they do fit
+    /// (upstream `retargetSelfOverload`).
+    fn swift_label_overload(&self, o: Outcome, args: Option<&CallArgs<'v>>) -> Outcome {
+        let view = self.view;
+        let Some(a) = args.filter(|_| self.family == LangFamily::Swift && o.status == status::RESOLVED) else { return o };
+        let t = NodeIdx(o.target);
+        let node = view.node(t);
+        if !matches!(node.kind(), NodeKind::Method | NodeKind::Function) {
+            return o;
+        }
+        let fits = |n: NodeIdx| view.node(n).signature().map(|s| overload::swift_labels_fit(&a.shapes, s));
+        if fits(t) != Some(false) {
+            return o;
+        }
+        let owner = node.qname().rsplit_once("::").map_or("", |(p, _)| p);
+        let fit: SmallVec<[NodeIdx; 2]> = view
+            .by_name(node.name())
+            .filter(|&n| {
+                let m = view.node(n);
+                n != t
+                    && view.hot(n).file == view.hot(t).file
+                    && matches!(m.kind(), NodeKind::Method | NodeKind::Function)
+                    && m.qname().rsplit_once("::").map_or("", |(p, _)| p) == owner
+                    && fits(n) == Some(true)
+            })
+            .collect();
+        match fit.as_slice() {
+            [only] => Outcome::found(*only, o.by, o.conf),
+            _ => o,
+        }
+    }
+
+    /// A C++ function's overloads are every function of its qualified name the caller's file can
+    /// see: the arguments pick among them, `chosen` on a tie.
+    fn cpp_function_overload(&self, chosen: NodeIdx, args: Option<&CallArgs<'v>>) -> NodeIdx {
+        let view = self.view;
+        let Some(a) = args.filter(|_| self.lang == Lang::Cpp && kind_of(view, chosen) == NodeKind::Function) else { return chosen };
+        let mut set: SmallVec<[NodeIdx; 4]> = view
+            .by_qname(view.node(chosen).qname())
+            .filter(|&n| kind_of(view, n) == NodeKind::Function && (view.hot(n).file == self.file || self.e.includes_transitively(self.file, view.hot(n).file)))
+            .collect();
+        set.sort_by_key(|&n| (n != chosen, view.hot(n).file != self.file, view.file(view.hot(n).file).path(), view.node(n).start_line()));
+        self.cpp_overload(&set, &a.shapes).unwrap_or(chosen)
+    }
+
+    /// C++ overloads, in preference order: the first the arguments fit best.
+    fn cpp_overload(&self, cands: &[NodeIdx], shapes: &[&str]) -> Option<NodeIdx> {
+        cands.iter().rev().copied().max_by_key(|c| overload::cpp_fit(self.view.node(*c).signature(), shapes))
+    }
+
     pub fn resolve_call_name(&self, wcx: &mut WorkerCx<'e, 'v>, r: &RefRec, name: &str) -> Outcome {
+        if self.lang == Lang::Cpp {
+            if let Some((path, arity)) = name.rsplit_once('/').and_then(|(p, a)| Some((p, a.parse().ok()?))) {
+                return self.cpp_constructor_ref(wcx, path, arity);
+            }
+        }
+        let normalized = normalize_call_name(self.family, name);
+        let name = normalized.as_ref();
         let args = CallArgs::of(self.view, r);
         let o = if self.family != LangFamily::Rust || !name.contains("self") {
             self.call_name_with(wcx, r, name, args.as_ref())
@@ -2271,11 +3059,35 @@ impl<'e, 'v> FileCx<'e, 'v> {
         {
             return Outcome::st(status::NO_CANDIDATE);
         }
+        if self.family == LangFamily::Swift {
+            let o = self.swift_call_target(o, name);
+            let own = match parse_shape(name) {
+                Shape::Bare(_) => true,
+                Shape::This { fields, .. } => fields.is_empty(),
+                _ => false,
+            };
+            let o = if own { self.swift_nearest_sibling(o, r) } else { o };
+            return self.swift_label_overload(o, args.as_ref());
+        }
         o
     }
 
     fn call_name_with(&self, wcx: &mut WorkerCx<'e, 'v>, r: &RefRec, name: &str, args: Option<&CallArgs<'v>>) -> Outcome {
+        if let Some((receiver, method)) = name.strip_prefix(SWIFT_CHAIN).and_then(|c| c.rsplit_once('.').or(Some(("", c)))) {
+            return match self.swift_chained(r, receiver, method, false) {
+                Some(n) => Outcome::found(n, by::GLOBAL, 40),
+                None => Outcome::st(status::NO_CANDIDATE),
+            };
+        }
+        // Swift `$0.m()`, PHP `$fn()` callables held in variables or closure parameters
+        if self.family == LangFamily::Swift && name.starts_with('$') && name[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            return Outcome::st(status::LOCAL_BINDING);
+        }
+        if (self.family == LangFamily::Php && name.contains('\\') && !name.contains(['.', ':'])) || (self.family == LangFamily::C && name.starts_with("::")) {
+            return self.qualified_free_call(r, name);
+        }
         match parse_shape(name) {
+            Shape::Bare(n) if self.swift_extended_builtin(n, r) => Outcome::st(status::BUILTIN),
             Shape::Bare(n) => self.call_bare(wcx, r, n, Accept::Callable, args),
             Shape::Member { root, path, method } => self.call_member(wcx, r, root, &path, method, args),
             Shape::This { kw, fields, method } if self.family == LangFamily::Js && kw != "this" => self.call_member(wcx, r, kw, &fields, method, args),
@@ -2314,13 +3126,20 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 TypeRes::Node(n) => NameRes::Found(n, by::QUALIFIED, 90),
                 TypeRes::External => NameRes::External,
                 TypeRes::Builtin => NameRes::Builtin,
+                // `fmt::detail::buffer<T>` with `fmt` opened by a macro
+                TypeRes::Unknown if self.family == LangFamily::C => {
+                    self.cpp_scoped(name, true).map_or(NameRes::NotFound, |n| NameRes::Found(n, by::QUALIFIED, 90))
+                }
                 TypeRes::Unknown => NameRes::NotFound,
             }
+        } else if let Some(n) = self.cpp_nested_type(r.from, name) {
+            NameRes::Found(n, by::RECEIVER, 95)
         } else {
             let first = self.resolve_name(wcx, name, accept, scope, r.line, Some(r.from), true);
-            // `Self` and friends
+            // `Self` and friends; Swift's `Self` is the dynamic type (a subclass, the conforming
+            // type in a protocol extension), not the declaration it is written in
             match (first, name) {
-                (NameRes::NotFound | NameRes::Builtin, "Self") => match self.enclosing_type(r.from) {
+                (NameRes::NotFound | NameRes::Builtin, "Self") if self.family != LangFamily::Swift => match self.enclosing_type(r.from) {
                     Some(t) => NameRes::Found(t, by::RECEIVER, 95),
                     None => first,
                 },
@@ -2382,18 +3201,64 @@ impl<'e, 'v> FileCx<'e, 'v> {
         }
     }
 
+    /// C# `using A.B;` names the namespace, not one of the files that declare it. A namespace
+    /// has a node per declaration: the first by path stands for it.
+    fn namespace_node(&self, name: &str) -> Option<Outcome> {
+        let view = self.view;
+        if self.family != LangFamily::CSharp {
+            return None;
+        }
+        let n = view
+            .by_qname(name)
+            .filter(|&n| kind_of(view, n) == NodeKind::Namespace)
+            .min_by_key(|&n| (view.file(view.hot(n).file).path(), view.node(n).start_line()))?;
+        Some(Outcome::found(n, by::IMPORT, 95))
+    }
+
+    /// C#: a bare name reaches a member only through the enclosing type (or a `using static`).
+    /// A same-named member elsewhere is no match (`Task` is not `Unit.Task`), and neither is the
+    /// member a reference sits on (`public Type Type { get; }` names the type).
+    fn stray_csharp_member(&self, o: Outcome, r: &RefRec) -> bool {
+        if self.family != LangFamily::CSharp || o.status != status::RESOLVED {
+            return false;
+        }
+        let view = self.view;
+        let t = NodeIdx(o.target);
+        t == r.from
+            || (!matches!(o.by, by::RECEIVER | by::IMPORT)
+                && matches!(
+                    kind_of(view, t),
+                    NodeKind::Method | NodeKind::Property | NodeKind::Field | NodeKind::Constant | NodeKind::Variable | NodeKind::EnumMember
+                )
+                && view.node(t).parent().is_some_and(|p| kind_of(view, p).is_type()))
+    }
+
     fn resolve_import_ref(&self, name: &str, r: &RefRec) -> Outcome {
         let Some(idxs) = self.imports_by_line.get(&r.line) else { return Outcome::st(status::NO_CANDIDATE) };
         let view = self.view;
         let tgt = |i: u32| self.e.imp_targets[self.file.idx()].get(i as usize).copied().unwrap_or(ImportTarget::External);
-        // 1. the module specifier itself
+        // 1. the module specifier itself (C facts keep `<..>` around angle includes and Ruby
+        // facts prefix `require_relative` specs with `./`; the kernel's reference names carry
+        // neither, and Ruby also emits the `.rb` path form)
         for &i in idxs {
             let imp = &self.imports[i as usize];
-            if view.text_str(imp.spec) == name {
+            let spec = view.text_str(imp.spec);
+            let same = spec == name
+                || match self.family {
+                    LangFamily::C => spec.strip_prefix('<').and_then(|s| s.strip_suffix('>')).is_some_and(|s| s == name),
+                    LangFamily::Ruby => {
+                        let plain = spec.strip_prefix("./").unwrap_or(spec);
+                        plain == name
+                            || name.strip_suffix(".rb").is_some_and(|n| n == plain)
+                            || matches!(tgt(i), ImportTarget::File(tf) if view.file(tf).path() == name)
+                    }
+                    _ => false,
+                };
+            if same {
                 return match tgt(i) {
                     ImportTarget::File(tf) => Outcome::found(self.file_node(tf), by::IMPORT, 95),
                     ImportTarget::Node(n) => Outcome::found(n, by::IMPORT, 95),
-                    ImportTarget::Pkg(p) => self.bound_outcome(Bound::Pkg(p)),
+                    ImportTarget::Pkg(p) => self.namespace_node(name).unwrap_or_else(|| self.bound_outcome(Bound::Pkg(p))),
                     ImportTarget::External => Outcome::st(status::EXTERNAL),
                     ImportTarget::NotFound => Outcome::st(status::NO_CANDIDATE),
                 };
@@ -2438,6 +3303,10 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let name = self.view.text_str(r.name);
         let Some(kind) = RefKind::from_wire(r.kind) else { return Outcome::st(status::NO_CANDIDATE) };
         let o = self.resolve_kind(wcx, r, name, kind);
+        // an extension no project declaration answers extends a dependency's type
+        if o.status == status::RESOLVED && self.is_swift_extension(NodeIdx(o.target)) {
+            return Outcome::st(status::EXTERNAL);
+        }
         if o.status == status::NO_CANDIDATE {
             if let Some(found) = self.route_handler(r, name, kind) {
                 return found;
@@ -2463,6 +3332,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 }
             }
             RefKind::Edge(EdgeKind::Extends | EdgeKind::Implements | EdgeKind::TypeOf | EdgeKind::Returns) => self.resolve_type_ref(wcx, r, name, Accept::Type),
+            RefKind::Edge(EdgeKind::Instantiates) if self.swift_extended_builtin(name, r) => Outcome::st(status::BUILTIN),
             RefKind::Edge(EdgeKind::Instantiates) => {
                 let o = self.resolve_type_ref(wcx, r, name, Accept::Type);
                 if o.status == status::NO_CANDIDATE {
@@ -2474,7 +3344,12 @@ impl<'e, 'v> FileCx<'e, 'v> {
             RefKind::Edge(EdgeKind::References) => {
                 let o = self.resolve_type_ref(wcx, r, name, Accept::Type);
                 if matches!(o.status, status::NO_CANDIDATE) {
-                    self.resolve_type_ref(wcx, r, name, Accept::Any)
+                    let any = self.resolve_type_ref(wcx, r, name, Accept::Any);
+                    if self.stray_csharp_member(any, r) {
+                        o
+                    } else {
+                        any
+                    }
                 } else {
                     o
                 }
@@ -2485,6 +3360,128 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
     }
+}
+
+/// Methods of Swift's standard collections, strings and optionals and of Foundation / UIKit
+/// views: a project type rarely carries them itself (upstream `SWIFT_STD_METHODS`).
+const SWIFT_STD_METHODS: &[&str] = &[
+    "append",
+    "insert",
+    "remove",
+    "removeAll",
+    "removeFirst",
+    "removeLast",
+    "removeValue",
+    "contains",
+    "map",
+    "compactMap",
+    "flatMap",
+    "filter",
+    "reduce",
+    "forEach",
+    "sorted",
+    "sort",
+    "first",
+    "last",
+    "min",
+    "max",
+    "firstIndex",
+    "lastIndex",
+    "index",
+    "enumerated",
+    "reversed",
+    "joined",
+    "split",
+    "prefix",
+    "suffix",
+    "dropFirst",
+    "dropLast",
+    "allSatisfy",
+    "randomElement",
+    "shuffled",
+    "popLast",
+    "replaceSubrange",
+    "replacingOccurrences",
+    "components",
+    "trimmingCharacters",
+    "hasPrefix",
+    "hasSuffix",
+    "lowercased",
+    "uppercased",
+    "appending",
+    "updateValue",
+    "merge",
+    "merging",
+    "union",
+    "intersection",
+    "subtracting",
+    "formUnion",
+    "isEqual",
+    "addSubview",
+    "removeFromSuperview",
+    "setNeedsDisplay",
+    "setNeedsLayout",
+    "layoutIfNeeded",
+    "addGestureRecognizer",
+    "addTarget",
+    "addObserver",
+    "removeObserver",
+    "eraseToAnyPublisher",
+];
+
+/// A Swift declaration under a `...Tests` directory or a playground is seen only from inside it.
+fn swift_target_visible(decl: &str, from: &str) -> bool {
+    let segs: Vec<&str> = decl.split('/').collect();
+    let dirs = &segs[..segs.len().saturating_sub(1)];
+    match dirs.iter().position(|s| s.ends_with("Tests") || s.ends_with(".playground")) {
+        Some(i) => from.starts_with(&format!("{}/", dirs[..=i].join("/"))),
+        None => true,
+    }
+}
+
+/// Whether a receiver's name is the owner's, or shares a word of three letters or more with
+/// the owner's qualified name (`sessionManager` and `Session`).
+/// A name's letters and digits, lowercased, a trailing number dropped: `executor1` is `executor`.
+fn flat_word(w: &str) -> String {
+    w.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().trim_end_matches(|c: char| c.is_ascii_digit()).to_ascii_lowercase()
+}
+
+fn shares_receiver_word(receiver: &str, owner: &str, qname: &str) -> bool {
+    let flat = flat_word;
+    if !receiver.is_empty() && flat(receiver) == flat(owner) {
+        return true;
+    }
+    let words = |s: &str| {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut prev_lower = false;
+        for c in s.chars() {
+            if !c.is_ascii_alphanumeric() || (prev_lower && c.is_ascii_uppercase()) {
+                if !cur.is_empty() {
+                    out.push(flat(&cur));
+                }
+                cur.clear();
+            }
+            if c.is_ascii_alphanumeric() {
+                cur.push(c);
+            }
+            prev_lower = c.is_ascii_lowercase();
+        }
+        if !cur.is_empty() {
+            out.push(flat(&cur));
+        }
+        out
+    };
+    let scope = qname.rsplit_once("::").map_or("", |(s, _)| s);
+    let owned: Vec<String> = words(scope).into_iter().filter(|w| w.len() > 2).collect();
+    words(receiver).iter().any(|w| owned.contains(w))
+}
+
+/// Whether a reference name uses a `::` scope qualifier before its last segment
+/// (`ns::f`, `Klass::m`, `Mod::Klass.m`), as opposed to a value receiver (`x.m`).
+fn r_name_is_scoped(name: &str) -> bool {
+    let head = name.find(['.', '(']).map(|i| &name[..i]).unwrap_or(name);
+    head.contains("::")
 }
 
 #[cfg(test)]

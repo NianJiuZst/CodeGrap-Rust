@@ -46,6 +46,8 @@ pub const PASS_THUNK: u16 = 19;
 pub const PASS_TEST_REQUEST: u16 = 20;
 /// Tauri commands and React Native native modules across the language bridge (`bridges`).
 pub const PASS_BRIDGE: u16 = 21;
+/// C# MediatR: a `Handle` method by the type it handles, a `.Send` / `.Publish` by the type it sends.
+pub const PASS_MEDIATR: u16 = 22;
 
 pub const ROLE_EMIT: u8 = 0;
 pub const ROLE_ON: u8 = 1;

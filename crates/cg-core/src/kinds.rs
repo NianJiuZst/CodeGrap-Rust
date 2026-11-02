@@ -139,9 +139,9 @@ impl RefKind {
     }
 }
 
-/// Languages. `Unknown` is 0 so zeroed records mean "no language". Walkers exist only
-/// for the MVP set (design doc 1.3); the rest are detected so configuration stays
-/// forward compatible.
+/// Languages. `Unknown` is 0 so zeroed records mean "no language". Walkers exist for
+/// the MVP set (design doc 1.3) and C/C++, C#, PHP, Ruby and Swift; the rest are
+/// detected so configuration stays forward compatible.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Lang {
@@ -166,6 +166,8 @@ pub enum Lang {
     Lua = 18,
     Luau = 19,
     R = 20,
+    /// Detected by content in `.h` headers so they are not fed to the C walker; no walker.
+    ObjC = 21,
 }
 
 /// Languages whose symbols may reference one another by name (design doc 6.5: "same
@@ -210,6 +212,7 @@ impl Lang {
         Lang::Lua,
         Lang::Luau,
         Lang::R,
+        Lang::ObjC,
     ];
 
     /// Upstream `Language` string; also the kernel's language argument.
@@ -236,6 +239,7 @@ impl Lang {
             Lang::Lua => "lua",
             Lang::Luau => "luau",
             Lang::R => "r",
+            Lang::ObjC => "objc",
         }
     }
 
@@ -251,9 +255,27 @@ impl Lang {
         Lang::ALL.iter().copied().find(|l| *l as u8 == v).unwrap_or(Lang::Unknown)
     }
 
-    /// Whether this build has a walker for the language (MVP set, design doc 1.3 + D2).
+    /// Whether this build has a walker for the language (MVP set, design doc 1.3 + D2,
+    /// plus the second-phase C/C++, C#, PHP, Ruby and Swift walkers).
     pub fn is_supported(self) -> bool {
-        matches!(self, Lang::TypeScript | Lang::Tsx | Lang::JavaScript | Lang::Jsx | Lang::Python | Lang::Go | Lang::Java | Lang::Rust | Lang::Kotlin)
+        matches!(
+            self,
+            Lang::TypeScript
+                | Lang::Tsx
+                | Lang::JavaScript
+                | Lang::Jsx
+                | Lang::Python
+                | Lang::Go
+                | Lang::Java
+                | Lang::Rust
+                | Lang::Kotlin
+                | Lang::C
+                | Lang::Cpp
+                | Lang::CSharp
+                | Lang::Php
+                | Lang::Ruby
+                | Lang::Swift
+        )
     }
 
     pub fn family(self) -> LangFamily {
@@ -271,7 +293,7 @@ impl Lang {
             Lang::Dart => LangFamily::Dart,
             Lang::Lua | Lang::Luau => LangFamily::Lua,
             Lang::R => LangFamily::R,
-            Lang::Unknown => LangFamily::Unknown,
+            Lang::Unknown | Lang::ObjC => LangFamily::Unknown,
         }
     }
 

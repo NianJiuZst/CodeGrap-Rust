@@ -7,18 +7,26 @@ use cg_core::{text, Lang, NONE};
 use tree_sitter::{Node, Tree};
 
 pub mod args;
+mod c;
+mod csharp;
 mod go;
 mod java;
 pub mod js;
 mod kotlin;
+mod php;
 mod python;
+mod ruby;
 mod rust;
+mod swift;
 mod util;
 pub use util::Cx;
 
 /// Internal export key for the module value itself, distinct from a named/ES
 /// `default` export. The leading NUL keeps it out of ordinary source identifiers.
 pub const COMMONJS_MODULE: &str = "\0cjs:module.exports";
+/// Prefix of a Swift call the kernel names by its method alone although it is made on some
+/// other value: `<prefix><receiver>.<method>` (`session.request(..).validate()`).
+pub const SWIFT_CHAIN: &str = "\0chain:";
 
 /// Marks initializer evidence collected through a TypeScript `satisfies` expression.
 pub const JS_SATISFIES_VALUE: &str = "\0js:satisfies:";
@@ -142,6 +150,9 @@ pub enum BindKind {
     /// A `this.member()` inside a function assigned to a named object property.
     /// Metadata only; `decl_type` identifies that object and `init_ctor` the call column.
     AssignedThisCall = 14,
+    /// C++ `#define BEGIN namespace fmt {`: `name` is a namespace opened only by a macro, which
+    /// no node of the index stands for. Metadata only; not a lexical binding.
+    MacroNamespace = 15,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +281,18 @@ pub fn extract_with_timeout(lang: Lang, tree: &Tree, src: &str, rows: FileRows<'
         Lang::Java => java::extract(&mut cx, root),
         Lang::Rust => rust::extract(&mut cx, root),
         Lang::Kotlin => kotlin::extract(&mut cx, root),
+        Lang::C => c::extract(&mut cx, root),
+        Lang::Cpp => {
+            c::extract(&mut cx, root);
+            args::cpp_calls(&mut cx, root);
+        }
+        Lang::CSharp => csharp::extract(&mut cx, root),
+        Lang::Php => php::extract(&mut cx, root),
+        Lang::Ruby => ruby::extract(&mut cx, root),
+        Lang::Swift => {
+            swift::extract(&mut cx, root);
+            args::swift_calls(&mut cx, root);
+        }
         _ => {}
     }
     cx.finish()

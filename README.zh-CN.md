@@ -206,6 +206,12 @@ MCP 服务运行且启用监听时，会在防抖后自动同步源码变化。
 | Java | `.java` |
 | Rust | `.rs` |
 | Kotlin | `.kt`、`.kts` |
+| C | `.c`、`.h`（含 C++ 语法的 `.h` 按 C++ 解析） |
+| C++ | `.cpp`、`.cc`、`.cxx`、`.hpp`、`.hxx`、`.metal`、`.cu`、`.cuh` |
+| C# | `.cs` |
+| PHP | `.php`、`.module`、`.install`、`.theme`、`.inc` |
+| Ruby | `.rb`、`.rake` |
+| Swift | `.swift` |
 
 提取阶段记录源码结构、符号和引用；引用解析阶段使用可获得的作用域、导入、接收者类型、模块及包信息。
 覆盖度受语言构造和项目配置影响，当前实现是静态代码图谱，不能替代完整编译器的类型检查。
@@ -246,7 +252,7 @@ Go 接口分派包含无歧义的提升方法；方法集推断仍是有界的�
 尚未覆盖：MyBatis XML、Angular 模板、Vue / Svelte 生态的 store 与路由、React Native 事件与 Fabric/Expo 原生侧、
 Tauri 事件、GoFrame，以及 Python 参数类型流（上游仅对 Ruby 实现）。
 
-当前版本暂不支持 C/C++、C#、PHP、Ruby、Swift 等上游语言，也不包含 Vue/Svelte 专用提取逻辑。
+C/C++、C#、PHP、Ruby、Swift 使用上游的提取 walker，并配有本项目自己的解析规则（头文件包含、命名空间、`require`、SwiftPM 模块、隐式 `this` 成员）；其解析质量只在样例仓库上做过检查，尚未与上游 oracle 对比，也还没有框架路由规则。Dart、Scala、Lua、Luau、R 只做语言识别，不做提取。当前也不包含 Vue/Svelte 专用提取逻辑。
 
 ## 命令行参考
 

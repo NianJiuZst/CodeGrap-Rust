@@ -27,6 +27,7 @@ pub fn hooks(project: &ProjectInfo) -> Vec<Arc<dyn FileHook>> {
         Arc::new(crate::synth::dynamic::TierScanner),
         Arc::new(crate::synth::dynamic::CeleryScanner),
         Arc::new(crate::synth::dynamic::SpringEventScanner),
+        Arc::new(crate::synth::dynamic::MediatrScanner),
     ];
     let frameworks = project.detect_frameworks();
     if frameworks.iter().any(|f| matches!(f.as_str(), "next" | "react-router" | "tanstack-router")) {

@@ -107,7 +107,8 @@ pub fn file_node_only(rel: &str, line_count: u32) -> EmitOut {
         node.extend_from_slice(&o.to_le_bytes());
         node.extend_from_slice(&l.to_le_bytes());
     }
-    for _ in 0..6 {
+    // docstring, signature, decorators, type_parameters, return_type
+    for _ in 0..5 {
         node.extend_from_slice(&NONE.to_le_bytes());
         node.extend_from_slice(&0u32.to_le_bytes());
     }
@@ -126,7 +127,7 @@ pub fn file_node_only(rel: &str, line_count: u32) -> EmitOut {
 }
 
 enum KernelOutcome {
-    Ok { emit: EmitOut, facts: Box<Facts>, had_error_tree: bool, facts_failed: bool },
+    Ok { emit: EmitOut, facts: Box<Facts>, had_error_tree: bool, error_nodes: usize, facts_failed: bool },
     TooDeep,
     TimedOut,
     Failed(String),
@@ -158,6 +159,7 @@ fn run_kernel(rel: &str, src: &str, lang: Lang, cfg: &ExtractConfig) -> KernelOu
         }
         Ok(Ok(emit)) => {
             let had_error_tree = tree.as_ref().map(|t| t.root_node().has_error()).unwrap_or(false);
+            let error_nodes = if had_error_tree { tree.as_ref().map(crate::macro_mask::error_nodes).unwrap_or(0) } else { 0 };
             let mut facts_failed = false;
             let facts = match &tree {
                 Some(t) => {
@@ -172,7 +174,7 @@ fn run_kernel(rel: &str, src: &str, lang: Lang, cfg: &ExtractConfig) -> KernelOu
                 }
                 None => Facts::default(),
             };
-            KernelOutcome::Ok { emit, facts: Box::new(facts), had_error_tree, facts_failed }
+            KernelOutcome::Ok { emit, facts: Box::new(facts), had_error_tree, error_nodes, facts_failed }
         }
     }
 }
@@ -210,8 +212,8 @@ pub fn extract_one(entry: &FileEntry, cfg: &ExtractConfig) -> Option<FileBatch> 
 pub fn extract_bytes(rel: &str, bytes: &[u8], mtime_ns: i64, lang_hint: Lang, cfg: &ExtractConfig) -> FileBatch {
     let h = hash::hash128(bytes);
     let src = String::from_utf8_lossy(bytes);
-    let lang = scanlang::detect(rel, Some(&src), &cfg.overrides);
-    let lang = if lang.is_supported() { lang } else { lang_hint };
+    let detected = scanlang::detect(rel, Some(&src), &cfg.overrides);
+    let lang = if detected.is_supported() { detected } else { lang_hint };
     let mut flags = 0u8;
     if generated::detect_generated(rel, &src) {
         flags |= fileflags::GENERATED;
@@ -219,14 +221,60 @@ pub fn extract_bytes(rel: &str, bytes: &[u8], mtime_ns: i64, lang_hint: Lang, cf
     if testpath::is_test_path(rel) {
         flags |= fileflags::TEST;
     }
+    if detected == Lang::ObjC {
+        // An Objective-C header has no walker; the C grammar's error recovery would mint
+        // phantom symbols from it. Keep the file (so `status` can count it) without symbols.
+        let line_count = src.bytes().filter(|b| *b == b'\n').count() as u32 + 1;
+        return FileBatch {
+            rel: rel.to_owned(),
+            lang: Lang::ObjC,
+            size: bytes.len() as u32,
+            mtime_ns,
+            hash: h,
+            flags,
+            emit: file_node_only(rel, line_count),
+            spilled: None,
+            extra_nodes: Vec::new(),
+            extra_refs: Vec::new(),
+            sites: Vec::new(),
+            facts: Facts::default(),
+            errors: Vec::new(),
+        };
+    }
     let mut errors = Vec::new();
-    let mut outcome = run_kernel(rel, &src, lang, cfg);
+    // Macros the C++ grammar can't parse are blanked in place; see cpp_preparse.rs.
+    let src = if lang == Lang::Cpp { std::borrow::Cow::Owned(crate::cpp_preparse::pre_parse(&src, rel)) } else { src };
+    // Rust items inside conditional wrappers (`cfg_rt! { .. }`) are extracted from a
+    // position-preserving view with the wrapper tokens blanked; see macro_mask.rs. The
+    // original text is used again if blanking introduced syntax errors.
+    let mut mask = if lang == Lang::Rust { crate::macro_mask::rust_item_wrappers(&src, cfg.parse_timeout) } else { crate::macro_mask::Mask::None };
+    let mut mask_timed_out = false;
+    if matches!(mask, crate::macro_mask::Mask::Expired) {
+        mask_timed_out = true;
+        mask = crate::macro_mask::Mask::None;
+    }
+    let mut outcome = match &mask {
+        crate::macro_mask::Mask::Masked(m, _) => run_kernel(rel, m, lang, cfg),
+        _ => run_kernel(rel, &src, lang, cfg),
+    };
+    // blanking a non-item `cfg_*!` macro can introduce syntax errors: keep the mask only when
+    // the masked parse has no more error nodes than the original
+    if let (crate::macro_mask::Mask::Masked(_, original_errors), KernelOutcome::Ok { error_nodes, .. }) = (&mask, &outcome) {
+        if *error_nodes > *original_errors {
+            mask = crate::macro_mask::Mask::None;
+            outcome = run_kernel(rel, &src, lang, cfg);
+        }
+    }
+    let src = match mask {
+        crate::macro_mask::Mask::Masked(m, _) => std::borrow::Cow::Owned(m),
+        _ => src,
+    };
     if matches!(outcome, KernelOutcome::TooDeep) {
         outcome = run_kernel_big_stack(rel, &src, lang, cfg);
     }
     let line_count = src.bytes().filter(|b| *b == b'\n').count() as u32 + 1;
     let (emit, facts) = match outcome {
-        KernelOutcome::Ok { emit, facts, had_error_tree, facts_failed } => {
+        KernelOutcome::Ok { emit, facts, had_error_tree, facts_failed, .. } => {
             if had_error_tree {
                 flags |= fileflags::PARSE_ERROR;
             }
@@ -236,6 +284,10 @@ pub fn extract_bytes(rel: &str, bytes: &[u8], mtime_ns: i64, lang_hint: Lang, cf
             if facts.timed_out {
                 flags |= fileflags::TIMED_OUT;
                 errors.push(format!("supplementary facts parse timed out after {:?}", cfg.parse_timeout));
+            }
+            if mask_timed_out {
+                flags |= fileflags::TIMED_OUT;
+                errors.push(format!("conditional-wrapper pre-pass timed out after {:?}", cfg.parse_timeout));
             }
             (emit, *facts)
         }
@@ -370,4 +422,19 @@ pub fn extract_all(entries: &[FileEntry], cfg: &ExtractConfig) -> Vec<Option<Fil
     let mut out = Vec::with_capacity(entries.len());
     extract_stream(entries, cfg, |_, b| out.push(b));
     out
+}
+
+#[cfg(test)]
+mod file_node_tests {
+    use super::*;
+
+    #[test]
+    fn file_node_only_row_has_the_abi_size() {
+        let out = file_node_only("src/a/b.rs", 12);
+        assert_eq!(out.nodes.len(), cg_kernel::NODE_ROW_SIZE);
+        let rows = FileRows::new(&out);
+        let n = rows.nodes().next().expect("the file node");
+        assert_eq!((n.name(), n.qname(), n.start_line(), n.end_line()), ("b.rs", "src/a/b.rs", 1, 12));
+        assert_eq!(rows.nodes().count(), 1);
+    }
 }

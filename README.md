@@ -80,6 +80,37 @@ the 97% / 95% gate in any of the six repositories; graph outputs differ and upst
 semantic ground truth. See the [six-repository report](docs/BENCHMARKS-SIX-REPO-2026-11-01.md)
 and [structured evidence](docs/benchmarks/2026-11-01-six-repo-retest.json).
 
+### Second-phase languages
+
+The **2026-11-02 twelve-repository run** of `cgr` **`f4b9685`** and upstream **`d2e0389`**
+measured a **6.63× geometric-mean full-index speedup** (6.66× on the six C, C++, C#, PHP, Ruby
+and Swift repositories) and **55.2%–87.6% lower median peak RSS** on a second machine (AMD
+Ryzen 9 8940HX, 32 threads, 15 GiB, WSL2 Ubuntu 24.04, Node v24.18.0). The six repositories
+above are re-measured here so that every row shares one machine; absolute times are not
+comparable with the table above, where upstream itself is about 1.7–1.9× faster.
+
+| Repository | Files | Upstream full index | `cgr` full index | Speedup | Peak RSS: upstream → `cgr` |
+|---|---:|---:|---:|---:|---:|
+| Express | 142 | 990.8 ms | 162.3 ms | **6.10×** | 218.7 → 97.9 MiB |
+| Gin | 99 | 1,242.5 ms | 165.0 ms | **7.53×** | 235.1 → 67.8 MiB |
+| Tokio | 814 | 4,637.9 ms | 882.0 ms | **5.26×** | 701.3 → 108.7 MiB |
+| Django | 2,984 | 18,467.9 ms | 2,392.8 ms | **7.72×** | 1,936.6 → 239.4 MiB |
+| Zod | 522 | 4,276.2 ms | 689.2 ms | **6.20×** | 598.2 → 142.0 MiB |
+| OkHttp | 690 | 6,677.3 ms | 939.8 ms | **7.10×** | 823.0 → 151.1 MiB |
+| cJSON (C) | 68 | 1,046.5 ms | 125.5 ms | **8.34×** | 307.3 → 66.5 MiB |
+| fmt (C++) | 80 | 4,731.2 ms | 497.9 ms | **9.50×** | 542.0 → 107.3 MiB |
+| MediatR (C#) | 159 | 1,046.3 ms | 171.3 ms | **6.11×** | 228.0 → 98.0 MiB |
+| Slim (PHP) | 125 | 831.1 ms | 122.9 ms | **6.76×** | 209.2 → 61.6 MiB |
+| Sinatra (Ruby) | 147 | 806.5 ms | 137.9 ms | **5.85×** | 206.3 → 70.8 MiB |
+| Alamofire (Swift) | 111 | 2,048.6 ms | 450.4 ms | **4.55×** | 403.9 → 107.3 MiB |
+
+Same method as above: one warmup and three timed CLI rebuilds per side, two workers, a 2 GiB
+`cgr` memory budget, at least 30 seconds between runs, warm OS caches, the same files and bytes
+on both sides, and upstream's native kernel loaded (`linux-x64` prebuild). On this machine `main`
+(`2c35e7a`) indexes Express, Gin, Django, Zod and OkHttp within the three-sample spread of this
+branch; Tokio is 669.5 → 882.0 ms because this branch also extracts the items inside `cfg_*!`
+wrapper macros (739 more nodes). Sync and query latency were not re-measured.
+
 The sections below retain the earlier **`b827b1d`** sync and query measurements. The new
 retest completed only Express sync and did not complete query latency tests.
 
@@ -227,6 +258,12 @@ with watching enabled, it performs that synchronization automatically after a de
 | Java | `.java` |
 | Rust | `.rs` |
 | Kotlin | `.kt`, `.kts` |
+| C | `.c`, `.h` (a `.h` with C++ constructs is parsed as C++) |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.metal`, `.cu`, `.cuh` |
+| C# | `.cs` |
+| PHP | `.php`, `.module`, `.install`, `.theme`, `.inc` |
+| Ruby | `.rb`, `.rake` |
+| Swift | `.swift` |
 
 Extraction records source structure, symbols and references. Resolution uses available scope,
 import, receiver-type, module and package information. Coverage depends on language constructs
@@ -282,8 +319,13 @@ Not covered: MyBatis XML, Angular templates, Vue / Svelte ecosystem stores and r
 events and the Fabric / Expo native side, Tauri events, GoFrame, and Python parameter-type flow
 (upstream implements it for Ruby only).
 
-C/C++, C#, PHP, Ruby, Swift and the other upstream language families are outside this version's
-supported extraction set. Vue/Svelte-specific extraction is also outside the current scope.
+C/C++, C#, PHP, Ruby and Swift use the upstream extraction walkers with this project's own
+resolution rules (includes, namespaces, `require`, SwiftPM modules, implicit `this` members).
+Against upstream `d2e0389` on strict edge keys, cJSON, MediatR, Slim and Sinatra meet the
+97% / 95% gate; fmt (94.1% / 92.8%) and Alamofire (96.5% / 93.8%) do not; much of the gap is
+call sites where the two pick different overloads or scopes (see [docs/LANGUAGES-P5.md](docs/LANGUAGES-P5.md)). These
+languages have no framework route rules yet. Dart, Scala, Lua, Luau and R are detected but not extracted.
+Vue/Svelte-specific extraction is also outside the current scope.
 
 ## Command-line reference
 

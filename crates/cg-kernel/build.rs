@@ -1,7 +1,6 @@
 fn main() {
-    // P1: napi_build::setup() removed. Only the Kotlin grammar (vendored C) is
-    // compiled here; the other vendored grammars (lua, scala, dart, swift)
-    // join with their walkers in M5.
+    // P1: napi_build::setup() removed. P5: the Kotlin and Swift grammars
+    // (vendored C) are compiled here; lua, scala and dart are not vendored.
     if std::env::var_os("CARGO_FEATURE_LANG_KOTLIN").is_some() {
         // Kotlin grammar — vendored C, compiled here instead of a crate dep: the
         // crates.io tree-sitter-kotlin 0.3.8 pins `tree-sitter >= 0.21, < 0.23`
@@ -25,6 +24,26 @@ fn main() {
         c.flag_if_supported("-utf-8"); // msvc
         c.compile("tree-sitter-kotlin");
         println!("cargo:rerun-if-changed=grammars/kotlin");
+    }
+    // P5: Swift grammar - vendored C, the crates.io tree-sitter-swift 0.7.3
+    // tarball's src/ with upstream's scanner fix (`1ULL << FAKE_TRY_BANG`: the
+    // crate's `1UL` overflows where `unsigned long` is 32 bits, i.e. MSVC, and
+    // `try! Foo()` would read as `!Foo`). Flags crib the tarball's own
+    // bindings/rust/build.rs (c11).
+    //   parser.c  d3edff6effe31b9a507f496577407987343b101b23eb7bee7a9b050e8ab5d27a
+    //   scanner.c 8acafef098ea4a52ebfc4cdf2fe26706113a22ac8ba2faf7d952755ff350cad6 (patched)
+    if std::env::var_os("CARGO_FEATURE_LANG_SWIFT").is_some() {
+        let mut swift = cc::Build::new();
+        swift.std("c11");
+        swift.include("grammars/swift");
+        swift.file("grammars/swift/parser.c");
+        swift.file("grammars/swift/scanner.c");
+        swift.flag_if_supported("-Wno-unused-parameter");
+        swift.flag_if_supported("-Wno-unused-but-set-variable");
+        swift.flag_if_supported("-Wno-trigraphs");
+        swift.flag_if_supported("-utf-8"); // msvc
+        swift.compile("tree-sitter-swift");
+        println!("cargo:rerun-if-changed=grammars/swift");
     }
     println!("cargo:rerun-if-changed=build.rs");
 }
