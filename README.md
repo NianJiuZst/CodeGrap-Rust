@@ -269,6 +269,14 @@ Extraction records source structure, symbols and references. Resolution uses ava
 import, receiver-type, module and package information. Coverage depends on language constructs
 and project configuration; this is a static code graph rather than a full compiler type checker.
 
+TypeScript/TSX factory calls propagate explicit named return types from function declarations,
+variable-initialized arrow/function expressions and methods, using the factory's enclosing
+declarations and imports. Types declared inside the factory body do not shadow its return
+annotation. Union/intersection types, generic substitution, arrays and async/generator wrappers
+remain unresolved; an unsupported annotation does not justify guessing a same-named method.
+Block-level type shadowing is not modeled. These return rules use engine version 10, so syncing
+an older index refreshes its facts and call edges.
+
 ### Framework and dynamic-dispatch rules
 
 Route hooks are implemented for **Express, Flask, FastAPI, Django, Gin, Spring, Axum, Next.js,

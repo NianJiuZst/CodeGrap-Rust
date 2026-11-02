@@ -64,6 +64,53 @@ export class Widget extends Base {
 }
 
 #[test]
+fn typescript_return_facts_preserve_unknowns_and_declaration_identity() {
+    let source = r#"class A {}
+function named(): A { return new A(); }
+const arrow = (): (A) => new A();
+const expression = function (): ns.A { throw 0; };
+class Factory {
+  make(): A { return new A(); }
+}
+function union(): A | Other { throw 0; }
+function container(): Promise<A> { throw 0; }
+function generic<A>(): A { throw 0; }
+class Generic<A> { genericMethod(): A { throw 0; } }
+async function asyncFactory(): A { throw 0; }
+function* generator(): A { throw 0; }
+function unannotated() { return new A(); }
+"#;
+    for (path, lang) in [("returns.ts", Lang::TypeScript), ("returns.tsx", Lang::Tsx)] {
+        let batch = run(path, source, lang);
+        assert_eq!(batch.flags & fileflags::PARSE_ERROR, 0);
+        let rows = batch.rows();
+        let facts: Vec<_> = batch.facts.bindings.iter().filter(|b| b.kind == BindKind::ReturnType).collect();
+        assert_eq!(facts.len(), 10, "{facts:#?}");
+        for (name, expected) in [
+            ("named", "A"),
+            ("arrow", "A"),
+            ("expression", "ns.A"),
+            ("make", "A"),
+            ("union", ""),
+            ("container", ""),
+            ("generic", ""),
+            ("genericMethod", ""),
+            ("asyncFactory", ""),
+            ("generator", ""),
+        ] {
+            let fact = facts.iter().find(|b| b.name == name).unwrap_or_else(|| panic!("missing {name}: {facts:#?}"));
+            assert_eq!(fact.decl_type, expected, "{name}");
+            assert!(fact.init_ctor.is_empty());
+            let node = rows.node(fact.node_row as usize);
+            assert_eq!(node.name(), name);
+            assert_eq!(node.start_line(), fact.line);
+        }
+    }
+    let js = run("plain.js", "function make() { return new A(); }", Lang::JavaScript);
+    assert!(!js.facts.bindings.iter().any(|b| b.kind == BindKind::ReturnType));
+}
+
+#[test]
 fn typescript_satisfies_preserves_initializer_evidence() {
     let src = r#"const direct = new Service() satisfies Runner;
 const factory = makeService() satisfies Runner;
