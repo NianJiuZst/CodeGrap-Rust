@@ -15,7 +15,7 @@
 use crate::detect::{diff_view, Diff};
 use cg_core::budget::MemBudget;
 use cg_core::config::ProjectConfig;
-use cg_core::{brand, CgError, EdgeKind, FileId, NodeIdx, RefKind, Result, StrId, NONE};
+use cg_core::{brand, CgError, EdgeKind, FileId, LangFamily, NodeIdx, NodeKind, RefKind, Result, StrId, NONE};
 use cg_extract::{fileflags, try_extract_stream, BindKind, ExtractConfig, FileBatch};
 use cg_resolve::driver::{make_edge, round_of, update_of, FNREF_META};
 use cg_resolve::{hooks_for, index_with_guard, resolve_refs, Engine, IndexOptions, Outcome, ProjectInfo, Round_};
@@ -257,6 +257,20 @@ fn defs_of(view: &View, f: FileId) -> BTreeMap<DefKey, Vec<DefDetail>> {
 type ExportSig = Vec<(String, String, String, u8)>;
 
 type ResolverFactSig = BTreeSet<(u8, String, String, String, String)>;
+type JsValueFactSig = Vec<(u8, String, String, String)>;
+
+/// Module-level value evidence can be followed through imported aliases.
+fn js_value_fact_sig(view: &View, f: FileId) -> JsValueFactSig {
+    if view.file(f).lang().family() != LangFamily::Js {
+        return Vec::new();
+    }
+    let scope = view.scope_base(f);
+    view.bindings_of(f)
+        .iter()
+        .filter(|b| b.scope.0 == scope && (b.kind == BindKind::Local as u8 || b.kind == BindKind::Alias as u8))
+        .map(|b| (b.kind, view.text_str(b.name).to_owned(), view.text_str(b.decl_type).to_owned(), view.text_str(b.init_ctor).to_owned()))
+        .collect()
+}
 
 /// These facts change resolution even when the kernel's declaration identity
 /// stays the same (e.g. `obj.old = function internal` -> `obj.new = ...`, or the target of a
@@ -545,8 +559,20 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
         let old = if states[i] == DeltaState::Replaced { defs_of(&base_view, *f) } else { BTreeMap::new() };
         let new = defs_of(&view1, *f);
         definitions_changed |= old != new;
+        if view1.file(*f).lang().family() == LangFamily::Js
+            && old.keys().chain(new.keys()).any(|key| {
+                matches!(NodeKind::from_u8(key.kind), Some(NodeKind::Function | NodeKind::Method | NodeKind::Component)) && old.get(key) != new.get(key)
+            })
+        {
+            // An exported value may depend on a function's return annotation.
+            export_changed.push(*f);
+        }
         let old_facts = if states[i] == DeltaState::Replaced { resolver_fact_sig(&base_view, *f) } else { BTreeSet::new() };
         let new_facts = resolver_fact_sig(&view1, *f);
+        let old_values = if states[i] == DeltaState::Replaced { js_value_fact_sig(&base_view, *f) } else { Vec::new() };
+        if old_values != js_value_fact_sig(&view1, *f) {
+            export_changed.push(*f);
+        }
         if old_facts != new_facts {
             definitions_changed = true;
             d_names.extend(old_facts.iter().chain(&new_facts).map(|fact| fact.1.clone()));
@@ -594,7 +620,27 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
     if !export_changed.is_empty() {
         let live: Vec<FileId> = view1.files().collect();
         let mut importers: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        let mut value_forwarders: FxHashSet<u32> = FxHashSet::default();
         for g in &live {
+            if view1.file(*g).lang().family() == LangFamily::Js {
+                let scope = view1.scope_base(*g);
+                let values: FxHashSet<&str> = view1
+                    .bindings_of(*g)
+                    .iter()
+                    .filter(|b| {
+                        b.scope.0 == scope
+                            && (b.kind == BindKind::Local as u8 || b.kind == BindKind::Alias as u8)
+                            && (!view1.text_str(b.decl_type).is_empty() || !view1.text_str(b.init_ctor).is_empty())
+                    })
+                    .map(|b| view1.text_str(b.name))
+                    .collect();
+                if engine.exports[g.idx()].values().any(|e| match e {
+                    cg_resolve::ExportEntry::Node(n) if view1.hot(*n).file == *g => values.contains(view1.node(*n).name()),
+                    _ => false,
+                }) {
+                    value_forwarders.insert(g.0);
+                }
+            }
             let mut srcs: FxHashSet<u32> = FxHashSet::default();
             for t in &engine.imp_targets[g.idx()] {
                 match t {
@@ -646,7 +692,7 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
                         .values()
                         .any(|e| matches!(e, cg_resolve::ExportEntry::Re(y, _) | cg_resolve::ExportEntry::Module(y) if y.0 == x))
                     || base_reexports(*g, x);
-                if reexports && seen.insert(*g) {
+                if (reexports || value_forwarders.contains(g)) && seen.insert(*g) {
                     frontier.push(*g);
                 }
             }

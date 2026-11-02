@@ -9,7 +9,7 @@ use crate::modules::{ImportTarget, PkgId};
 use crate::overload::{self, ArgTy, CallArgs};
 use crate::shape::{parse_shape, split_head, Shape};
 use cg_core::{text::pack_pos, EdgeKind, FileId, Lang, LangFamily, NodeIdx, NodeKind, RefKind, Visibility, NONE};
-use cg_extract::facts::COMMONJS_MODULE;
+use cg_extract::facts::{COMMONJS_MODULE, JS_BINDING_ALIAS, JS_SATISFIES_VALUE};
 use cg_extract::{BindKind, ImportKind, ScopeKind};
 use cg_store::{status, BindingRec, ImportRec, RefRec, ScopeRec, View};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -562,7 +562,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
 
     /// Binding of a file-level variable called `name` (module singletons such as `app = Flask()`).
     pub fn file_binding(&self, name: &str) -> Option<&'v BindingRec> {
-        self.bindings.get(&(0, name)).and_then(|l| l.iter().copied().find(|b| b.kind == BindKind::Local as u8 || b.kind == BindKind::Field as u8))
+        self.bindings
+            .get(&(0, name))
+            .and_then(|l| l.iter().copied().find(|b| b.kind == BindKind::Local as u8 || b.kind == BindKind::Field as u8 || b.kind == BindKind::Alias as u8))
     }
 
     /// Follow `segs` from a module / type: exports, top-level definitions, submodules, members.
@@ -695,16 +697,71 @@ impl<'e, 'v> FileCx<'e, 'v> {
             if let Some(other) = self.lookup_binding(init, scope, b.line, false).filter(|o| !std::ptr::eq(*o, b)) {
                 return self.binding_value(wcx, other, depth + 1);
             }
+            if self.visible_import(init, scope).is_some() {
+                return self.imported_binding_value(wcx, init, scope, depth + 1);
+            }
         }
         // The new variable is not in scope in its own initializer (`let rt = rt()`).
-        let shadows = init.split(['.', ':', '(']).next() == Some(self.view.text_str(b.name));
+        let root = init.strip_prefix(JS_SATISFIES_VALUE).unwrap_or(init);
+        let root = root.strip_prefix(JS_BINDING_ALIAS).unwrap_or(root);
+        let shadows = root.split(['.', ':', '(']).next() == Some(self.view.text_str(b.name));
         let line = if shadows { b.line.saturating_sub(1) } else { b.line };
         self.expression_value(wcx, init, scope, line, depth + 1)
+    }
+
+    fn imported_binding_value(&self, wcx: &mut WorkerCx<'e, 'v>, name: &str, scope: u32, depth: u8) -> Option<ValueType> {
+        if depth >= 16 {
+            return None;
+        }
+        let import = self.visible_import(name, scope)?;
+        let Bound::Node(node) = self.e.bind_import(self.file, import as usize) else { return None };
+        if self.view.node(node).kind().is_type() {
+            return Some(ValueType::plain(node));
+        }
+        let owner = self.view.hot(node).file;
+        let cx = wcx.file_cx(self.e, owner);
+        let binding = cx.file_binding(self.view.node(node).name())?;
+        cx.binding_value(wcx, binding, depth + 1)
+    }
+
+    /// Do not guess a member of an unresolved value when an alias leads back
+    /// to an explicit type or a `satisfies` operand.
+    fn blocks_member_fallback(&self, wcx: &mut WorkerCx<'e, 'v>, binding: &BindingRec, depth: u8) -> bool {
+        if depth >= 16 {
+            return true;
+        }
+        let init = self.view.text_str(binding.init_ctor);
+        if !self.view.text_str(binding.decl_type).is_empty() || init.starts_with(JS_SATISFIES_VALUE) || init.starts_with(JS_BINDING_ALIAS) {
+            return true;
+        }
+        if binding.kind != BindKind::Alias as u8 {
+            return false;
+        }
+        let scope = binding.scope.0.wrapping_sub(self.scope_base);
+        if let Some(other) = self.lookup_binding(init, scope, binding.line, false) {
+            return std::ptr::eq(other, binding) || self.blocks_member_fallback(wcx, other, depth + 1);
+        }
+        let Some(import) = self.visible_import(init, scope) else { return false };
+        let Bound::Node(node) = self.e.bind_import(self.file, import as usize) else { return true };
+        let cx = wcx.file_cx(self.e, self.view.hot(node).file);
+        match cx.file_binding(self.view.node(node).name()) {
+            Some(other) => cx.blocks_member_fallback(wcx, other, depth + 1),
+            None => true,
+        }
     }
 
     fn expression_value(&self, wcx: &mut WorkerCx<'e, 'v>, init: &str, scope: u32, line: u32, depth: u8) -> Option<ValueType> {
         if depth >= 16 {
             return None;
+        }
+        if let Some(inner) = init.strip_prefix(JS_SATISFIES_VALUE) {
+            return self.expression_value(wcx, inner, scope, line, depth + 1);
+        }
+        if let Some(name) = init.strip_prefix(JS_BINDING_ALIAS) {
+            if let Some(binding) = self.lookup_binding(name, scope, line, false) {
+                return self.binding_value(wcx, binding, depth + 1);
+            }
+            return self.imported_binding_value(wcx, name, scope, depth + 1);
         }
         // `A()|B()`: a factory returning different classes in different branches is typed by
         // the nearest class they all derive from, or not at all
@@ -1153,6 +1210,54 @@ impl<'e, 'v> FileCx<'e, 'v> {
         ArgTy::Named(self.view.node(t).name().to_owned(), Some(t))
     }
 
+    /// Recover a primitive return annotation only from a single unambiguous JS callee.
+    fn primitive_call_arg(&self, wcx: &mut WorkerCx<'e, 'v>, callee: &str, scope: u32, line: u32) -> Option<ArgTy> {
+        if self.family != LangFamily::Js || callee.is_empty() || !callee.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+            return None;
+        }
+        let NameRes::Found(node, ..) = self.resolve_name(wcx, callee, Accept::Callable, scope, line, None, false) else { return None };
+        if self.sibling_overloads(node).len() != 1 {
+            return None;
+        }
+        let (_, ret) = self.view.node(node).signature()?.rsplit_once(':')?;
+        let ret = ret.trim().trim_end_matches(';').trim();
+        matches!(ret, "string" | "number" | "boolean" | "bigint" | "symbol").then(|| self.named_arg(wcx, ret))
+    }
+
+    fn binding_arg_type(&self, wcx: &mut WorkerCx<'e, 'v>, b: &BindingRec, depth: u8) -> ArgTy {
+        if depth >= 16 {
+            return ArgTy::Unknown;
+        }
+        let declared = self.view.text_str(b.decl_type);
+        if !declared.is_empty() {
+            return self.named_arg(wcx, declared);
+        }
+        let init = self.view.text_str(b.init_ctor);
+        let satisfied = init.strip_prefix(JS_SATISFIES_VALUE);
+        let value = satisfied.unwrap_or(init);
+        let alias = value.strip_prefix(JS_BINDING_ALIAS).or_else(|| (b.kind == BindKind::Alias as u8).then_some(value));
+        let scope = b.scope.0.wrapping_sub(self.scope_base);
+        if let Some(name) = alias {
+            if let Some(other) = self.lookup_binding(name, scope, b.line, false).filter(|other| !std::ptr::eq(*other, b)) {
+                return self.binding_arg_type(wcx, other, depth + 1);
+            }
+            if let Some(import) = self.visible_import(name, scope) {
+                if let Bound::Node(node) = self.e.bind_import(self.file, import as usize) {
+                    let cx = wcx.file_cx(self.e, self.view.hot(node).file);
+                    if let Some(other) = cx.file_binding(self.view.node(node).name()) {
+                        return cx.binding_arg_type(wcx, other, depth + 1);
+                    }
+                }
+            }
+        }
+        if let Some(callee) = satisfied.and_then(|s| s.strip_suffix("()")) {
+            if let Some(arg) = self.primitive_call_arg(wcx, callee, scope, b.line) {
+                return arg;
+            }
+        }
+        self.binding_type(wcx, b).map_or(ArgTy::Unknown, |t| self.node_arg(t))
+    }
+
     fn arg_type(&self, wcx: &mut WorkerCx<'e, 'v>, shape: &str, scope: u32, r: &RefRec) -> ArgTy {
         match shape {
             "?" => ArgTy::Unknown,
@@ -1163,16 +1268,15 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 if let Some(t) = shape.strip_prefix("T:") {
                     return self.named_arg(wcx, t);
                 }
+                if let Some(callee) = shape.strip_prefix("C:") {
+                    return self.primitive_call_arg(wcx, callee, scope, r.line).unwrap_or(ArgTy::Unknown);
+                }
                 if let Some(v) = shape.strip_prefix("V:") {
                     if let Some(b) = self.lookup_binding(v, scope, r.line, false) {
                         if b.kind == BindKind::LocalFn as u8 {
                             return ArgTy::Lambda(None);
                         }
-                        let dt = self.view.text_str(b.decl_type);
-                        if !dt.is_empty() {
-                            return self.named_arg(wcx, dt);
-                        }
-                        return self.binding_type(wcx, b).map_or(ArgTy::Unknown, |t| self.node_arg(t));
+                        return self.binding_arg_type(wcx, b, 0);
                     }
                     // a bare field: Java / Kotlin only (JS reads fields through `this.`)
                     return if self.family == LangFamily::Jvm { self.field_arg(wcx, r, v) } else { ArgTy::Unknown };
@@ -1797,9 +1901,13 @@ impl<'e, 'v> FileCx<'e, 'v> {
                                 return Outcome::found(m, by::LEXICAL, 90);
                             }
                         }
-                        // An initializer rooted in an explicit external import
-                        // does not justify guessing an unrelated project member.
                         let init = self.view.text_str(b.init_ctor);
+                        // Unknown satisfies operands and their aliases do not
+                        // justify guessing an unrelated project member.
+                        if self.blocks_member_fallback(wcx, b, 0) {
+                            return Outcome::st(status::LOCAL_BINDING);
+                        }
+                        // Neither does an initializer rooted in an external import.
                         let head = init.split(['.', ':', '(']).next().unwrap_or("");
                         if let Some(i) = self.visible_import(head, scope).filter(|_| self.lookup_binding(head, scope, r.line, false).is_none()) {
                             if self.e.bind_import(self.file, i as usize) == Bound::External {

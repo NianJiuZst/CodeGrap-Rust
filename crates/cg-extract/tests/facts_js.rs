@@ -62,3 +62,33 @@ export class Widget extends Base {
     assert!(f.scopes.iter().any(|s| s.kind == ScopeKind::Class));
     assert!(f.scopes.iter().filter(|s| s.kind == ScopeKind::Function).count() >= 3);
 }
+
+#[test]
+fn typescript_satisfies_preserves_initializer_evidence() {
+    let src = r#"const direct = new Service() satisfies Runner;
+const factory = makeService() satisfies Runner;
+const grouped = (new Service() satisfies Runner) satisfies object;
+const asserted = (new Service() as Runner) satisfies object;
+const cast = new Service() as Runner;
+const unknown = externalValue satisfies Runner;
+const annotated: Runner = new Service() satisfies object;
+class Holder { service = new Service() satisfies Runner; }
+"#;
+    for lang in [Lang::TypeScript, Lang::Tsx] {
+        let b = run("satisfies.ts", src, lang);
+        assert_eq!(b.flags & (fileflags::PARSE_ERROR | fileflags::PANICKED), 0, "{:?}", b.errors);
+        for (name, decl_type, init_ctor) in [
+            ("direct", "", "\0js:satisfies:Service"),
+            ("factory", "", "\0js:satisfies:makeService()"),
+            ("grouped", "", "\0js:satisfies:Service"),
+            ("asserted", "Runner", ""),
+            ("cast", "Runner", ""),
+            ("unknown", "", "\0js:satisfies:\0js:binding:externalValue"),
+            ("annotated", "Runner", "\0js:satisfies:Service"),
+            ("service", "", "\0js:satisfies:Service"),
+        ] {
+            let binding = b.facts.bindings.iter().find(|binding| binding.name == name).unwrap();
+            assert_eq!((binding.decl_type.as_str(), binding.init_ctor.as_str()), (decl_type, init_ctor), "{lang:?} {name}");
+        }
+    }
+}

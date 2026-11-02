@@ -151,13 +151,39 @@ fn ts_type_name(cx: &Cx, n: Node) -> String {
 /// (declared type, initialiser) of a value expression: `new Foo()` -> ("", "Foo"),
 /// `foo()` -> ("", "foo()"), `x as Foo` -> ("Foo", "").
 fn value_info(cx: &Cx, v: Node) -> (String, String) {
+    value_info_inner(cx, v, false)
+}
+
+fn value_info_inner(cx: &Cx, v: Node, in_satisfies: bool) -> (String, String) {
     match v.kind() {
         "new_expression" => {
             let c = v.child_by_field_name("constructor").map(|c| cx.text(c).to_owned()).unwrap_or_default();
             (String::new(), c)
         }
-        "await_expression" | "parenthesized_expression" | "non_null_expression" => v.named_child(0).map(|c| value_info(cx, c)).unwrap_or_default(),
-        "as_expression" | "satisfies_expression" => {
+        "await_expression" | "parenthesized_expression" | "non_null_expression" => {
+            v.named_child(0).map(|c| value_info_inner(cx, c, in_satisfies)).unwrap_or_default()
+        }
+        // Preserve the operand's evidence, but mark it so an unknown receiver
+        // cannot be guessed from an unrelated global method.
+        "satisfies_expression" => {
+            let (ty, init) = v.named_child(0).map(|c| value_info_inner(cx, c, true)).unwrap_or_default();
+            if ty.is_empty() && !init.starts_with(JS_SATISFIES_VALUE) {
+                (ty, format!("{JS_SATISFIES_VALUE}{init}"))
+            } else {
+                (ty, init)
+            }
+        }
+        "identifier" if in_satisfies => (String::new(), format!("{JS_BINDING_ALIAS}{}", cx.text(v))),
+        "string" | "template_string" if in_satisfies => ("string".into(), String::new()),
+        "number" if in_satisfies => (if cx.text(v).ends_with('n') { "bigint" } else { "number" }.into(), String::new()),
+        "true" | "false" if in_satisfies => ("boolean".into(), String::new()),
+        "unary_expression" if in_satisfies => match v.child_by_field_name("argument") {
+            Some(n) if n.kind() == "number" && matches!(cx.text(v).as_bytes().first(), Some(b'-' | b'+')) => {
+                (if cx.text(n).ends_with('n') { "bigint" } else { "number" }.into(), String::new())
+            }
+            _ => Default::default(),
+        },
+        "as_expression" => {
             let t = v.named_child(1).map(|c| ts_type_name(cx, c)).unwrap_or_default();
             (t, String::new())
         }
