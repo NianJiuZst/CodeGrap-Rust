@@ -136,7 +136,7 @@ fn path_line(view: &View, f: FileId, line: u32) -> String {
 
 /// Languages whose supertype methods dispatch to a subtype's same-named methods.
 fn overrides_lang(l: Lang) -> bool {
-    matches!(l.family(), LangFamily::Jvm | LangFamily::Js) || matches!(l, Lang::Go | Lang::Rust)
+    matches!(l.family(), LangFamily::Jvm | LangFamily::Js | LangFamily::CSharp | LangFamily::Swift) || matches!(l, Lang::Go | Lang::Rust)
 }
 
 /// The methods of `t` called `name`: its body's, or for Go / Rust the receiver and impl
@@ -220,8 +220,26 @@ fn interface_impl(e: &Engine<'_>, out: &mut Out) {
             if base == cls || !overrides_lang(blang) || (lang == Lang::Go && bn.kind() != NodeKind::Interface) {
                 continue;
             }
-            let base_methods: Vec<NodeIdx> =
-                view.out_edges(base).filter(|ed| ed.kind == EdgeKind::Contains).map(|ed| ed.dst).filter(|m| view.node(*m).kind() == NodeKind::Method).collect();
+            let methods_of = |t: NodeIdx| {
+                let mut ms: Vec<NodeIdx> = view
+                    .out_edges(t)
+                    .filter(|ed| ed.kind == EdgeKind::Contains)
+                    .map(|ed| ed.dst)
+                    .filter(|m| view.node(*m).kind() == NodeKind::Method)
+                    .collect();
+                // The cap below keeps a slice of these: upstream's slice is in id order.
+                if matches!(blang.family(), LangFamily::CSharp | LangFamily::Swift) {
+                    ms.sort_by_key(|m| view.cold(*m).digest);
+                }
+                ms
+            };
+            let mut base_methods: Vec<NodeIdx> = methods_of(base);
+            // A Swift protocol's requirements are not methods: its default implementations live
+            // in its extensions, the class-kind nodes that share its name.
+            if blang == Lang::Swift && bn.kind() == NodeKind::Interface {
+                let exts = view.by_name(bn.name()).filter(|n| view.node(*n).kind() == NodeKind::Class && view.file(view.node(*n).file()).lang() == Lang::Swift);
+                base_methods.extend(exts.flat_map(methods_of));
+            }
             let mut added = 0;
             for &bm in &base_methods {
                 if added >= MAX_IMPLS_PER_PAIR {
@@ -251,6 +269,42 @@ fn interface_impl(e: &Engine<'_>, out: &mut Out) {
                     out.push(EdgeKind::Calls, bm, m, bmn.start_line(), "interface-impl", Some(at), Some(("via", mn.name())), order_of("interface-impl"));
                     added += 1;
                 }
+            }
+        }
+    }
+}
+
+/// C++: a virtual call stops at the base method; link it to the same-named method of each class
+/// that extends the base. Over-approximates, as upstream's `cppOverrideEdges` does.
+fn cpp_override(e: &Engine<'_>, out: &mut Out) {
+    let view = e.view;
+    let is_cpp = |t: NodeIdx| view.file(view.node(t).file()).lang() == Lang::Cpp;
+    // the cap keeps a slice of these and a repeated name keeps the last: upstream's are in id order
+    let methods_of = |t: NodeIdx| {
+        let mut ms: Vec<NodeIdx> =
+            view.out_edges(t).filter(|ed| ed.kind == EdgeKind::Contains).map(|ed| ed.dst).filter(|m| view.node(*m).kind() == NodeKind::Method).collect();
+        ms.sort_by_key(|m| view.cold(*m).digest);
+        ms
+    };
+    let mut types: Vec<NodeIdx> = e.supers.keys().copied().filter(|t| view.node(*t).kind() == NodeKind::Class && is_cpp(*t)).collect();
+    types.sort();
+    for cls in types {
+        let subs = methods_of(cls);
+        let mut bases: Vec<NodeIdx> = e.supers[&cls].iter().copied().filter(|b| *b != cls && is_cpp(*b)).collect();
+        bases.sort();
+        bases.dedup();
+        for base in bases {
+            let by_name: FxHashMap<&str, NodeIdx> = methods_of(base).into_iter().map(|m| (view.node(m).name(), m)).collect();
+            let mut added = 0;
+            for &m in &subs {
+                if added >= MAX_IMPLS_PER_PAIR {
+                    break;
+                }
+                let mn = view.node(m);
+                let Some(&bm) = by_name.get(mn.name()).filter(|bm| **bm != m) else { continue };
+                let at = format!("{}:{}", view.file(mn.file()).path(), mn.start_line());
+                out.push(EdgeKind::Calls, bm, m, view.node(bm).start_line(), "cpp-override", Some(at), Some(("via", mn.name())), order_of("cpp-override"));
+                added += 1;
             }
         }
     }
@@ -406,6 +460,7 @@ pub fn run_all(e: &Engine<'_>) -> SynthOutput {
     let mut wcx = WorkerCx::new();
     go::go_implements(e, &mut out);
     interface_impl(e, &mut out);
+    cpp_override(e, &mut out);
     event_emitter(e, &mut out, &mut wcx, None);
     react_render(e, &mut out, None);
     jsx_render(e, &mut out, &mut wcx, None);
@@ -431,6 +486,7 @@ const GLOBAL_PASSES: &[&str] = &[
     "event-bus",
     "celery-dispatch",
     "spring-event",
+    "mediatr-dispatch",
     "go-func-field",
     "go-grpc-stub-impl",
     "gin-middleware-chain",
@@ -456,6 +512,7 @@ pub(crate) fn order_of(by: &str) -> u16 {
         "event-emitter" => 150,
         "react-render" => 160,
         "jsx-render" => 170,
+        "cpp-override" => 255,
         "interface-impl" => 260,
         "kotlin-expect-actual" => 270,
         "go-grpc-stub-impl" => 280,
@@ -467,6 +524,7 @@ pub(crate) fn order_of(by: &str) -> u16 {
         "object-registry" => 390,
         "celery-dispatch" => 430,
         "spring-event" => 440,
+        "mediatr-dispatch" => 445,
         "go-func-field" => 480,
         "next-link" => 510,
         "next-proxy" => 520,
@@ -509,6 +567,7 @@ fn run_global<'e, 'v>(e: &'e Engine<'v>, out: &mut Out, wcx: &mut WorkerCx<'e, '
     redux::rtk_query(e, out);
     dynamic::celery(e, out);
     dynamic::spring_events(e, out);
+    dynamic::mediatr_dispatch(e, out);
     bridges::link(e, out);
     jvm::test_requests(e, out);
     jvm::kotlin_expect_actual(e, out);
@@ -549,7 +608,7 @@ pub fn run_incremental(e: &Engine<'_>, previous: &View, changed: &FxHashSet<u32>
                     "event-emitter" => value.get("event").and_then(|v| v.as_str()).is_some_and(|key| keys.contains(key)),
                     "react-render" | "jsx-render" => changed.contains(&f.0),
                     // registration sites name lines of other files: recomputed whole, as cheap
-                    "interface-impl" | "go-implements" => true,
+                    "interface-impl" | "cpp-override" | "go-implements" => true,
                     by => GLOBAL_PASSES.contains(&by),
                 };
                 if recompute {
@@ -568,7 +627,7 @@ pub fn run_incremental(e: &Engine<'_>, previous: &View, changed: &FxHashSet<u32>
                     src,
                     dst,
                     kind: outkind::pack(edge.kind, edge.provenance, edge.class),
-                    line: if changed.contains(&f.0) && matches!(by, "interface-impl" | "go-implements" | "go-method-contains") {
+                    line: if changed.contains(&f.0) && matches!(by, "interface-impl" | "cpp-override" | "go-implements" | "go-method-contains") {
                         e.view.hot(NodeIdx(src)).start_line
                     } else {
                         edge.line.unwrap_or(NONE)
@@ -585,6 +644,7 @@ pub fn run_incremental(e: &Engine<'_>, previous: &View, changed: &FxHashSet<u32>
     let mut wcx = WorkerCx::new();
     go::go_implements(e, &mut out);
     interface_impl(e, &mut out);
+    cpp_override(e, &mut out);
     event_emitter(e, &mut out, &mut wcx, Some(&keys));
     react_render(e, &mut out, Some(changed));
     jsx_render(e, &mut out, &mut wcx, Some(changed));

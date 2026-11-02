@@ -14,6 +14,83 @@ const MAX_CHAIN: u32 = 64;
 
 pub fn extract(cx: &mut Cx, root: Node) {
     walk(cx, root, 0, 0);
+    chained_calls(cx, root);
+}
+
+/// The kernel names a call on anything but a plain name, `self` or a type by its method alone
+/// (`session.request(..).validate()` is `validate`): mark those as chained, with the receiver
+/// written before them, so that no bare name is taken for an implicit `self` call.
+fn chained_calls(cx: &mut Cx, root: Node) {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        stack.extend(kids(n));
+        if n.kind() != "call_expression" {
+            continue;
+        }
+        let Some(nav) = n.named_child(0).filter(|f| f.kind() == "navigation_expression") else { continue };
+        let (Some(recv), Some(suffix)) = (nav.named_child(0), nav.named_child(1)) else { continue };
+        let method = if suffix.kind() == "navigation_suffix" { kids(suffix).find(|g| g.kind() == "simple_identifier") } else { Some(suffix) };
+        let Some(method) = method.filter(|m| m.kind() == "simple_identifier") else { continue };
+        let text = cx.text(recv).trim();
+        let plain = text.strip_prefix("try").map_or(text, |t| t.trim_start_matches(['!', '?'])).trim_start();
+        let plain = plain.strip_prefix("await ").unwrap_or(plain).trim();
+        let path = receiver_path(plain);
+        // a name, `self` / `super`, or a type the kernel keeps in the name; not a type's static
+        // member (`NotificationCenter.default.post(..)`), which it drops with the type
+        let static_member = plain.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            && path.contains('.')
+            && path.rsplit('.').next().is_some_and(|l| l.starts_with(|c: char| c.is_lowercase()));
+        if plain.chars().all(|c| c.is_alphanumeric() || c == '_') || (plain.starts_with(|c: char| c.is_ascii_uppercase()) && !static_member) {
+            continue;
+        }
+        let pos = cx.start(n);
+        let name = cx.text(method).to_owned();
+        cx.facts.call_names.push(CallNameFact {
+            line: (pos >> 32) as u32,
+            col: pos as u32,
+            tail: name.clone(),
+            kernel_name: name.clone(),
+            name: format!("{SWIFT_CHAIN}{path}.{name}"),
+        });
+    }
+}
+
+/// `a.b(x)[0]?` -> `a.b`: the path a receiver ends in, calls and subscripts dropped.
+fn receiver_path(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut i = b.len();
+    let mut out = Vec::new();
+    while i > 0 {
+        let c = b[i - 1];
+        if matches!(c, b')' | b']' | b'}') {
+            let open = match c {
+                b')' => b'(',
+                b']' => b'[',
+                _ => b'{',
+            };
+            let mut depth = 0;
+            while i > 0 {
+                i -= 1;
+                if b[i] == c {
+                    depth += 1;
+                } else if b[i] == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+        } else if matches!(c, b'?' | b'!') || c.is_ascii_whitespace() {
+            i -= 1;
+        } else if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+            out.push(c);
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8_lossy(&out).trim_matches('.').to_owned()
 }
 
 /// Children of `n` with their field names (anonymous tokens included).

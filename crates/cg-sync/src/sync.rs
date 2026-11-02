@@ -271,6 +271,7 @@ fn resolver_fact_sig(view: &View, f: FileId) -> ResolverFactSig {
                 || b.kind == BindKind::TypeAlias as u8)
                 && b.node.is_some())
                 || b.kind == BindKind::Deref as u8
+                || b.kind == BindKind::MacroNamespace as u8
         })
         .map(|b| {
             (

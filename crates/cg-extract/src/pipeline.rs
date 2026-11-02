@@ -242,6 +242,8 @@ pub fn extract_bytes(rel: &str, bytes: &[u8], mtime_ns: i64, lang_hint: Lang, cf
         };
     }
     let mut errors = Vec::new();
+    // Macros the C++ grammar can't parse are blanked in place; see cpp_preparse.rs.
+    let src = if lang == Lang::Cpp { std::borrow::Cow::Owned(crate::cpp_preparse::pre_parse(&src, rel)) } else { src };
     // Rust items inside conditional wrappers (`cfg_rt! { .. }`) are extracted from a
     // position-preserving view with the wrapper tokens blanked; see macro_mask.rs. The
     // original text is used again if blanking introduced syntax errors.

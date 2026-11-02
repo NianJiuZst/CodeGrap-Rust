@@ -395,6 +395,109 @@ fn csharp_namespaces_partial_classes_and_determinism() {
 }
 
 #[test]
+fn csharp_names_reach_types_namespaces_and_declared_fields() {
+    let (_d, view) = project(&[
+        ("src/Unit.cs", "using System.Threading.Tasks;\nnamespace A {\n  public struct Unit {\n    public static Task<Unit> Task => null;\n  }\n}\n"),
+        ("src/Details.cs", "using System;\nnamespace A {\n  public class Details {\n    public Type Type { get; }\n  }\n}\n"),
+        ("src/Runner.cs", "namespace A.B {\n  public class Runner {\n    public static void Run() {}\n    public void Own() {}\n    public void Write() {}\n    public void Group() { Items(Own); }\n    void Items(object o) {}\n  }\n}\n"),
+        (
+            "src/User.cs",
+            "using System;\nusing System.IO;\nusing System.Threading.Tasks;\nusing A.B;\nnamespace A.C {\n  public class User {\n    private readonly TextWriter _writer;\n    private readonly Runner _runner;\n    public Task Handle(Type t) {\n      _writer.Write();\n      _runner.Own();\n      return Task.Run(() => 1);\n    }\n  }\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(!edges.iter().any(|e| e.ends_with("-> src/Unit.cs::A::Unit::Task")), "the type Task is not the property Unit.Task: {edges:?}");
+    assert!(!edges.iter().any(|e| e.ends_with("-> src/Details.cs::A::Details::Type")), "the type Type is not the property Details.Type: {edges:?}");
+    assert!(
+        !has(&edges, "src/User.cs::A.C::User::Handle -calls-> src/Runner.cs::A.B::Runner::Run"),
+        "Task.Run is the dependency's, not a unique-name guess: {edges:?}"
+    );
+    assert!(
+        !has(&edges, "src/User.cs::A.C::User::Handle -calls-> src/Runner.cs::A.B::Runner::Write"),
+        "a field of a dependency's type is no project receiver: {edges:?}"
+    );
+    assert!(has(&edges, "src/User.cs::A.C::User::Handle -calls-> src/Runner.cs::A.B::Runner::Own"), "implied this on a declared field: {edges:?}");
+    assert!(
+        edges.iter().any(|e| e.starts_with("src/User.cs") && e.contains("-imports-> ") && e.ends_with("::A.B")),
+        "a using names the namespace node: {edges:?}"
+    );
+    assert!(
+        has(&edges, "src/Runner.cs::A.B::Runner::Group -references-> src/Runner.cs::A.B::Runner::Own"),
+        "a method group of the enclosing type stays: {edges:?}"
+    );
+}
+
+#[test]
+fn swift_types_are_their_declarations_not_their_extensions() {
+    let (_d, view) = project(&[
+        ("Sources/App/Session.swift", "open class Session {\n  public init() {}\n  public func request() -> Request { Request() }\n}\n"),
+        ("Sources/App/Request.swift", "public class Request {\n  public func validate() {}\n}\n"),
+        ("Tests/AHelpers.swift", "extension Session {\n  func helper() {}\n}\nextension Bool {\n  var flag: Bool { self }\n}\nextension DispatchQueue {\n  func hop() {}\n}\n"),
+        ("Sources/App/ZNote.swift", "extension Request {\n  func note() {}\n}\n"),
+        (
+            "Tests/SessionTests.swift",
+            "final class Holder {\n  private let session = Session()\n  private let queue: DispatchQueue = .main\n  func make(_ on: Bool) -> Session {\n    let s = Session()\n    s.helper()\n    session.request()\n    queue.hop()\n    return s\n  }\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(
+        has(&edges, "Tests/SessionTests.swift::Holder::make -instantiates-> Sources/App/Session.swift::Session")
+            || has(&edges, "Tests/SessionTests.swift::Holder::make -calls-> Sources/App/Session.swift::Session"),
+        "Session() is the class: {edges:?}"
+    );
+    assert!(!edges.iter().any(|e| e.contains("-> Tests/AHelpers.swift::Session") && !e.contains("::Session::")), "never the extension: {edges:?}");
+    assert!(
+        !edges.iter().any(|e| e.ends_with("-> Tests/AHelpers.swift::Bool") || e.ends_with("-> Tests/AHelpers.swift::DispatchQueue")),
+        "an extended dependency type is not a project declaration: {edges:?}"
+    );
+    assert!(
+        has(&edges, "Tests/SessionTests.swift::Holder::make -calls-> Tests/AHelpers.swift::Session::helper"),
+        "members added by the extension stay reachable: {edges:?}"
+    );
+    assert!(has(&edges, "Tests/SessionTests.swift::Holder::make -calls-> Sources/App/Session.swift::Session::request"), "implied self on a field: {edges:?}");
+}
+
+#[test]
+fn c_macros_are_not_calls_and_macro_namespaces_resolve() {
+    let (_d, view) = project(&[
+        ("include/fmt/format.h", "#define FMT_BEGIN_NAMESPACE namespace fmt {\n#define FMT_END_NAMESPACE }\n#define CHECK(x) do_check(x)\nFMT_BEGIN_NAMESPACE\ninline int format(int a) { return a; }\ninline int do_check(int a) { return a; }\nFMT_END_NAMESPACE\n"),
+        ("src/app.cc", "#include \"fmt/format.h\"\nvoid run() {\n  CHECK(1);\n  fmt::format(1);\n  dep::missing(1);\n}\n"),
+        ("src/other.cc", "int missing(int a) { return a; }\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(!edges.iter().any(|e| e.contains("-calls-> ") && e.ends_with("::CHECK")), "a macro invocation is not a call: {edges:?}");
+    assert!(has(&edges, "src/app.cc::run -calls-> include/fmt/format.h::format"), "a namespace opened by a macro: {edges:?}");
+    assert!(!has(&edges, "src/app.cc::run -calls-> src/other.cc::missing"), "a same-named function the file does not include: {edges:?}");
+}
+
+#[test]
+fn ruby_production_code_does_not_bind_to_spec_helpers() {
+    let (_d, view) = project(&[
+        ("lib/app.rb", "class App\n  def run\n    use_it 1\n    File.only_here(1)\n  end\nend\n"),
+        ("spec/app_spec.rb", "def use_it(x); end\ndef only_here(x); end\nclass Other\n  def only_here(x); end\nend\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(!edges.iter().any(|e| e.starts_with("lib/app.rb") && e.contains("-calls-> spec/")), "{edges:?}");
+}
+
+#[test]
+fn php_this_method_return_types_type_locals() {
+    let (_d, view) = project(&[
+        ("src/Dispatcher.php", "<?php\nnamespace App;\nclass Dispatcher {\n  public function handle() {}\n}\n"),
+        (
+            "tests/TestBase.php",
+            "<?php\nnamespace Tests;\nuse App\\Dispatcher;\nclass TestBase {\n  protected function make(): Dispatcher { return new Dispatcher(); }\n}\n",
+        ),
+        (
+            "tests/UseTest.php",
+            "<?php\nnamespace Tests;\nclass UseTest extends TestBase {\n  public function go() {\n    $d = $this->make();\n    $d->handle();\n  }\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "tests/UseTest.php::Tests::UseTest::go -calls-> src/Dispatcher.php::App::Dispatcher::handle"), "{edges:?}");
+}
+
+#[test]
 fn cpp_namespace_order_and_out_of_line_members() {
     let (_d, view) = project(&[
         (
@@ -495,4 +598,127 @@ fn swift_standard_types_versus_project_types() {
         "a nested type shadows the standard type inside its enclosing declaration: {edges:?}"
     );
     assert!(has(&edges, "Sources/App/Main.swift::make -calls-> Sources/App/Ext.swift::Data::asString"), "members added by the extension are reachable");
+}
+
+#[test]
+fn mediatr_sends_reach_handlers_and_csharp_supertypes_their_implementations() {
+    let (_d, view) = project(&[
+        (
+            "Api/Orders.cs",
+            "class Orders {\n  readonly IMediator _mediator;\n  void Cancel() { var cmd = new CancelOrder(); _mediator.Send(cmd); }\n  void Other(ShipOrder ship) { _mediator.Publish(ship); }\n  void Mail() { _smtp.Send(new CancelOrder()); }\n}\n",
+        ),
+        (
+            "App/Handlers.cs",
+            "class CancelOrder {}\nclass ShipOrder {}\nclass CancelHandler : IRequestHandler<CancelOrder, bool> {\n  public bool Handle(CancelOrder c, int t) { return true; }\n}\nclass ShipHandler : IEventHandler<ShipOrder> {\n  public void Handle(ShipOrder s, int t) {}\n}\n",
+        ),
+        ("App/Shape.cs", "abstract class Shape { public abstract int Area(); }\nclass Square : Shape { public override int Area() { return 1; } }\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "Api/Orders.cs::Orders::Cancel -calls-> App/Handlers.cs::CancelHandler::Handle"), "{edges:?}");
+    assert!(has(&edges, "Api/Orders.cs::Orders::Other -calls-> App/Handlers.cs::ShipHandler::Handle"), "{edges:?}");
+    assert!(!has(&edges, "Api/Orders.cs::Orders::Mail -calls-> App/Handlers.cs::CancelHandler::Handle"), "{edges:?}");
+    assert!(has(&edges, "App/Shape.cs::Shape::Area -calls-> App/Shape.cs::Square::Area"), "{edges:?}");
+}
+
+#[test]
+fn cpp_macro_namespace_calls_pick_the_overload_their_arguments_fit() {
+    let (_d, view) = project(&[
+        ("a_style.hpp", "struct style {};\nint format(style s, const char* f) { return 1; }\n"),
+        ("b_plain.hpp", "int format(const char* f, int a) { return 2; }\nint size(int n) { return n; }\n"),
+        (
+            "main.cc",
+            "#include \"a_style.hpp\"\n#include \"b_plain.hpp\"\nvoid plain() { ns::format(\"x\", 1); }\nvoid styled(style st, int w) { ns::format(st, w); }\nvoid other() { dep::missing(1); }\n",
+        ),
+        ("ns.hpp", "#define NS_BEGIN namespace ns {\n"),
+        // a module import makes a variable of the root's name, and includes nothing
+        ("mod.cc", "import ns;\nvoid imported() { ns::size(3); }\n"),
+        ("use.cc", "#include \"b_plain.hpp\"\nvoid measure() { ns::size(3); }\nvoid foreign() { dep::size(3); }\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "main.cc::plain -calls-> b_plain.hpp::format"), "{edges:?}");
+    assert!(has(&edges, "main.cc::styled -calls-> a_style.hpp::format"), "{edges:?}");
+    assert!(has(&edges, "use.cc::measure -calls-> b_plain.hpp::size"), "{edges:?}");
+    assert!(has(&edges, "mod.cc::imported -calls-> b_plain.hpp::size"), "{edges:?}");
+    assert!(!edges.iter().any(|e| e.starts_with("main.cc::other -calls->")), "{edges:?}");
+    assert!(!edges.iter().any(|e| e.starts_with("use.cc::foreign -calls->")), "no macro opens `dep`: {edges:?}");
+}
+
+#[test]
+fn ruby_bare_calls_are_method_calls_and_modules_reach_by_name() {
+    let (_d, view) = project(&[(
+        "lib/app.rb",
+        "module Helpers\n  def redirect(uri)\n    uri(uri)\n    halt(302)\n  end\n  def uri(x)\n  end\nend\nclass Base\n  include Helpers\n  def halt(code)\n  end\n  def self.build(x)\n  end\n  def build(x)\n  end\n  def run\n    build(1)\n  end\nend\n",
+    )]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "lib/app.rb::Helpers::redirect -calls-> lib/app.rb::Helpers::uri"), "a call, not the parameter: {edges:?}");
+    assert!(has(&edges, "lib/app.rb::Helpers::redirect -calls-> lib/app.rb::Base::halt"), "a module's self is its includer: {edges:?}");
+    let run_build: Vec<&String> = edges.iter().filter(|e| e.starts_with("lib/app.rb::Base::run -calls-> lib/app.rb::Base::build")).collect();
+    assert_eq!(run_build.len(), 1, "{edges:?}");
+}
+
+#[test]
+fn swift_chained_calls_reach_a_member_by_name() {
+    let (_d, view) = project(&[
+        ("Sources/Session.swift", "class Session {\n  func request() -> Int { return 0 }\n}\nclass DataRequest {\n  func validate() -> Int { return 0 }\n}\n"),
+        ("Sources/Use.swift", "func use() {\n  let s = make()\n  s.request().validate()\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "Sources/Use.swift::use -calls-> Sources/Session.swift::Session::request"), "{edges:?}");
+    assert!(has(&edges, "Sources/Use.swift::use -calls-> Sources/Session.swift::DataRequest::validate"), "{edges:?}");
+}
+
+#[test]
+fn swift_extensions_read_their_type_fields_and_a_binding_is_not_its_own_callee() {
+    let (_d, view) = project(&[(
+        "Sources/Monitor.swift",
+        "protocol Monitor {\n  func ping()\n}\nclass Delegate {\n  var observer: (any Monitor)?\n  func lookup(for id: Int) -> Int? { return id }\n}\nextension Delegate {\n  func go() {\n    observer?.ping()\n    guard let lookup = lookup(for: 1) else { return }\n    _ = lookup\n  }\n}\nclass Other {\n  func ping() {}\n}\nextension Monitor {\n  func ping() {}\n}\n",
+    )]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "Sources/Monitor.swift::Delegate::go -calls-> Sources/Monitor.swift::Monitor::ping"), "the declaration's field: {edges:?}");
+    assert!(has(&edges, "Sources/Monitor.swift::Delegate::go -calls-> Sources/Monitor.swift::Delegate::lookup"), "not the binding: {edges:?}");
+}
+
+#[test]
+fn swift_nested_types_static_members_and_extension_overloads() {
+    let (_d, view) = project(&[
+        (
+            "Sources/Monitor.swift",
+            "final class PathMonitor {\n  enum Result {\n    case ok\n  }\n  func last() -> Result { return .ok }\n}\nfunc parse() -> Result<Int, Error> { return .success(1) }\n",
+        ),
+        (
+            "Sources/Session.swift",
+            "class Session {\n  func open(to url: String) {}\n}\nextension NotificationCenter {\n  func postRequest(named name: String) {}\n}\nfunc notify() {\n  NotificationCenter.default.postRequest(named: \"x\")\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "Sources/Monitor.swift::PathMonitor::last -references-> Sources/Monitor.swift::PathMonitor::Result"), "{edges:?}");
+    assert!(!has(&edges, "Sources/Monitor.swift::parse -references-> Sources/Monitor.swift::PathMonitor::Result"), "nested, not in scope: {edges:?}");
+    assert!(has(&edges, "Sources/Session.swift::notify -calls-> Sources/Session.swift::NotificationCenter::postRequest"), "{edges:?}");
+}
+
+#[test]
+fn cpp_receivers_constructors_and_overrides() {
+    let (_d, view) = project(&[
+        (
+            "lib.hpp",
+            "#define LIB_BEGIN namespace lib {\nLIB_BEGIN\nnamespace detail {\nstruct buf { int size() { return 0; } };\ninline auto make() -> buf { return buf(); }\nstruct bigint { bigint() {} bigint(long n) {} };\n}\nusing view = detail::buf;\nclass base { public: virtual int run() { return 0; } };\nclass impl : public base { public: int run() { return 1; } };\nclass holder { detail::buf b_; int len() { return b_.size(); } };\n}\n",
+        ),
+        (
+            "other.hpp",
+            "struct wrap { struct Item { int id() { return 1; } }; };\n",
+        ),
+        (
+            "main.cc",
+            "#include \"lib.hpp\"\n#include \"other.hpp\"\nusing lib::detail::bigint;\nusing lib::detail::make;\nvoid ctor() { bigint(42); }\nvoid stack() { bigint n(42); }\nvoid by_using() { make(); }\nvoid by_return() { auto b = lib::detail::make(); b.size(); }\nvoid by_alias(lib::view v) { v.size(); }\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "lib.hpp::detail::make -instantiates-> lib.hpp::detail::buf"), "no constructor to call: {edges:?}");
+    assert!(edges.iter().any(|e| e.starts_with("main.cc::ctor -calls-> lib.hpp::detail::bigint::bigint")), "{edges:?}");
+    assert!(edges.iter().any(|e| e.starts_with("main.cc::stack -calls-> lib.hpp::detail::bigint::bigint")), "{edges:?}");
+    assert!(has(&edges, "main.cc::by_using -calls-> lib.hpp::detail::make"), "`using` names the declaration: {edges:?}");
+    assert!(has(&edges, "main.cc::by_return -calls-> lib.hpp::detail::buf::size"), "the return type: {edges:?}");
+    assert!(has(&edges, "main.cc::by_alias -calls-> lib.hpp::detail::buf::size"), "through the alias: {edges:?}");
+    assert!(has(&edges, "lib.hpp::holder::len -calls-> lib.hpp::detail::buf::size"), "a field receiver: {edges:?}");
+    assert!(has(&edges, "lib.hpp::base::run -calls-> lib.hpp::impl::run"), "a virtual call's hop: {edges:?}");
 }

@@ -862,7 +862,7 @@ impl<'t> Walker<'t> {
         }
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
-            signature: None, // getSignature reads the never-resolving 'parameter' field
+            signature: self.swift_parameters(node),
             visibility: Some(self.visibility_of(node)),
             is_async: Some(self.is_async(node)), // present-false (dead hook)
             is_static: Some(self.is_static(node)),
@@ -879,12 +879,33 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
+    /// The parameter list as written, `(_ a: Int, label b: String = "")`: Swift overloads by
+    /// argument label, which the resolver reads from here (upstream reads the source again).
+    fn swift_parameters(&self, node: Node<'t>) -> Option<String> {
+        let open = (0..node.child_count()).filter_map(|i| node.child(i)).find(|c| c.kind() == "(")?;
+        let bytes = self.src.as_bytes();
+        let mut depth = 0usize;
+        for i in open.start_byte()..node.end_byte().min(bytes.len()) {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return self.src.get(open.start_byte()..=i).map(str::to_owned);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn extract_method(&mut self, node: Node<'t>) {
         stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
-            signature: None,
+            signature: self.swift_parameters(node),
             visibility: Some(self.visibility_of(node)),
             is_async: Some(self.is_async(node)),
             is_static: Some(self.is_static(node)),
@@ -904,8 +925,13 @@ impl<'t> Walker<'t> {
     fn extract_class(&mut self, node: Node<'t>) {
         stack_guard!();
         let name = self.extract_name(node);
+        // An extension is a class node too; the signature is what tells it from the declaration
+        let is_extension = (0..node.child_count()).any(|i| node.child(i).is_some_and(|c| c.kind() == "extension"));
+        // as written: `extension Outer.Inner` is named `Inner`, but extends no top-level `Inner`
+        let written = node.child_by_field_name("name").map_or_else(|| name.clone(), |n| self.text(n).to_owned());
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            signature: is_extension.then(|| format!("extension {written}")),
             visibility: Some(self.visibility_of(node)),
             ..Extra::default()
         };

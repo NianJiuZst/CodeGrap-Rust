@@ -9,7 +9,9 @@
 use cg_core::{Lang, LangFamily, NodeIdx};
 use cg_extract::facts::args::ARGS_MARK;
 use cg_store::{RefRec, View};
+use regex::Regex;
 use smallvec::SmallVec;
+use std::sync::LazyLock;
 
 /// Argument shapes of a call reference (see `cg_extract::facts::args`).
 pub struct CallArgs<'v> {
@@ -540,6 +542,177 @@ pub fn takes(lang: Lang, sig: Option<&str>, n: usize) -> Option<bool> {
     parse_params(lang, sig?).map(|p| p.takes(n))
 }
 
+/// C++ (upstream `cppOverloadFit`): how well a call fits a parameter list. The count first, then
+/// each string literal against its parameter: a string type by name over a template parameter
+/// that might be one, and a narrow literal never a wide parameter. Unread lists score nothing.
+/// Whether a Swift call's argument labels (`_` for none) fit a declaration's parameter list:
+/// each parameter's external label in order, one with a default value or a variadic one free
+/// to be left out (upstream `swiftLabelsFit`).
+pub fn swift_labels_fit(labels: &[&str], sig: &str) -> bool {
+    let list = sig.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')).unwrap_or("");
+    let mut i = 0;
+    for p in split_top(list).into_iter().map(str::trim).filter(|p| !p.is_empty()) {
+        let label = swift_param_label(p);
+        if i < labels.len() && labels[i] == label {
+            i += 1;
+            continue;
+        }
+        if !(p.contains('=') || p.contains("...")) {
+            return false;
+        }
+    }
+    i == labels.len()
+}
+
+/// `@escaping inout label name: T` -> `label`; `_ name: T` -> `_`.
+fn swift_param_label(p: &str) -> &str {
+    let mut rest = p.trim_start();
+    while let Some(attr) = rest.strip_prefix('@') {
+        let end = attr.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(attr.len());
+        let mut after = &attr[end..];
+        if let Some(args) = after.strip_prefix('(') {
+            after = args.split_once(')').map_or("", |(_, r)| r);
+        }
+        rest = after.trim_start();
+    }
+    rest = rest.strip_prefix("inout ").unwrap_or(rest).trim_start();
+    let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rest.len());
+    if end > 0 {
+        &rest[..end]
+    } else {
+        "_"
+    }
+}
+
+pub fn cpp_fit(sig: Option<&str>, args: &[&str]) -> i32 {
+    static WIDE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bw(?:string|char_t|format|string_view)|wchar_t").unwrap());
+    static STRINGISH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"string|char|Char|format").unwrap());
+    static STRING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"string|char|Char|\bstr\b").unwrap());
+    static TEMPLATE_PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?:const\s+)?[A-Z]\w{0,2}\s*[&*]{0,2}\s*\w*$").unwrap());
+    let Some(sig) = sig else { return 0 };
+    if sig.ends_with(" = delete") {
+        return i32::MIN;
+    }
+    let Some(list) = sig.trim_end_matches(';').trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')) else { return 0 };
+    let params: SmallVec<[&str; 6]> = split_top(list).into_iter().map(str::trim).filter(|p| !p.is_empty() && *p != "void").collect();
+    let variadic = params.iter().any(|p| cpp_is_pack(p));
+    let required = params.iter().filter(|p| !cpp_is_pack(p) && !p.contains('=')).count();
+    let mut score = 0;
+    if args.len() < required || (!variadic && args.len() > params.len()) {
+        score -= 3;
+    }
+    for (arg, param) in args.iter().zip(&params) {
+        if cpp_is_pack(param) {
+            break;
+        }
+        if !matches!(*arg, "S" | "W") {
+            continue;
+        }
+        score += if (*arg == "W") != WIDE.is_match(param) && STRINGISH.is_match(param) {
+            -2
+        } else if cpp_is_scalar(cpp_param_type(param)) {
+            -3
+        } else if STRING.is_match(param) {
+            3
+        } else if TEMPLATE_PARAM.is_match(param) {
+            1
+        } else {
+            -2
+        };
+    }
+    score
+}
+
+/// `T&&... args`, not `tuple<T...> t`.
+fn cpp_is_pack(p: &str) -> bool {
+    cpp_without_templates(p).contains("...")
+}
+
+fn cpp_without_templates(p: &str) -> String {
+    let mut depth = 0;
+    p.chars()
+        .filter(|c| {
+            match c {
+                '<' => depth += 1,
+                '>' => depth = (depth - 1).max(0),
+                _ => {}
+            }
+            depth == 0 && *c != '>'
+        })
+        .collect()
+}
+
+/// A parameter's type: no default, no name.
+fn cpp_param_type(p: &str) -> &str {
+    static NAMED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(.*[\w>*&\s])\b[A-Za-z_]\w*\s*(?:\[[^\]]*\])?$").unwrap());
+    let mut depth = 0;
+    let mut end = p.len();
+    for (i, c) in p.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            '=' if depth == 0 => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let text = p[..end].trim();
+    match NAMED.captures(text).map(|c| c.get(1).map_or("", |m| m.as_str()).trim()) {
+        Some(head)
+            if head.contains(|c: char| c.is_ascii_alphabetic())
+                && !matches!(head, "const" | "volatile" | "unsigned" | "signed" | "struct" | "class" | "enum") =>
+        {
+            head
+        }
+        _ => text,
+    }
+}
+
+/// A pointer (other than `char*`), number, bool or character: no string literal converts to one
+/// (upstream `cppTypeCategory`).
+fn cpp_is_scalar(ty: &str) -> bool {
+    const CHARS: &[&str] = &["char", "wchar_t", "char8_t", "char16_t", "char32_t"];
+    const NUMBERS: &[&str] = &[
+        "int",
+        "unsigned",
+        "signed",
+        "short",
+        "long",
+        "float",
+        "double",
+        "size_t",
+        "ssize_t",
+        "ptrdiff_t",
+        "int8_t",
+        "int16_t",
+        "int32_t",
+        "int64_t",
+        "uint8_t",
+        "uint16_t",
+        "uint32_t",
+        "uint64_t",
+        "intptr_t",
+        "uintptr_t",
+        "size_type",
+        "difference_type",
+    ];
+    let flat = cpp_without_templates(ty);
+    let stars = flat.matches('*').count();
+    let spaced = flat.replace(['*', '&'], " ");
+    let words: SmallVec<[&str; 4]> =
+        spaced.split_whitespace().filter(|w| !matches!(*w, "const" | "volatile" | "struct" | "class" | "typename" | "enum")).collect();
+    let last = words.last().map_or("", |w| w.rsplit("::").next().unwrap_or(w));
+    if stars > 0 {
+        return !(CHARS.contains(&last) && stars == 1);
+    }
+    last == "bool"
+        || (CHARS.contains(&last) && words.iter().all(|w| CHARS.contains(w) || matches!(*w, "signed" | "unsigned")))
+        || NUMBERS.contains(&last)
+        || (!words.is_empty() && words.iter().all(|w| NUMBERS.contains(w)))
+}
+
 fn arg_is_project(arg: &ArgTy) -> bool {
     matches!(arg, ArgTy::Named(_, Some(_)))
 }
@@ -680,5 +853,43 @@ mod tests {
         assert!(t("(a: any, b?: any): void", &[named("string"), named("number")]).is_some());
         assert!(t("(cb: () => void)", &[named("string")]).is_none());
         assert!(t("(mode: 'a' | 'b')", &[named("string")]).is_some());
+    }
+}
+
+#[cfg(test)]
+mod cpp_tests {
+    use super::cpp_fit;
+
+    fn fit(sig: &str, args: &[&str]) -> i32 {
+        cpp_fit(Some(sig), args)
+    }
+
+    #[test]
+    fn a_format_string_goes_to_the_string_parameter_not_the_style() {
+        let plain = "(format_string<T...> fmt, T&&... args)";
+        let styled = "(text_style ts, format_string<T...> fmt, T&&... args)";
+        assert!(fit(plain, &["S", "?"]) > fit(styled, &["S", "?"]));
+        // nothing readable: they tie, and the caller's order decides
+        assert_eq!(fit(plain, &["?", "?"]), fit(styled, &["?", "?"]));
+    }
+
+    #[test]
+    fn swift_labels_pick_the_declaration() {
+        assert!(swift_labels_fit(&["_", "task", "didCompleteWithError"], "(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?)"));
+        assert!(!swift_labels_fit(&["_", "dataTask", "didReceive"], "(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?)"));
+        assert!(swift_labels_fit(&["_"], "(_ url: URL, method: HTTPMethod = .get, @escaping handler: (() -> Void)? = nil)"));
+        assert!(!swift_labels_fit(&[], "(_ url: URL)"));
+    }
+
+    #[test]
+    fn count_width_pointers_and_deleted() {
+        assert!(fit("(int a)", &["?", "?"]) < fit("(int a, int b = 0)", &["?", "?"]));
+        assert!(fit("(wstring_view s)", &["S"]) < fit("(string_view s)", &["S"]));
+        assert!(fit("(wstring_view s)", &["W"]) > fit("(string_view s)", &["W"]));
+        assert!(fit("(std::string* out)", &["S"]) < fit("(const char* s)", &["S"]));
+        assert!(fit("(std::size_t n)", &["S"]) < fit("(const S& s)", &["S"]));
+        assert_eq!(fit("(void)", &[]), 0);
+        assert!(fit("(const char* s) = delete", &["S"]) < fit("(int n, int m)", &["S"]));
+        assert_eq!(cpp_fit(None, &["S"]), 0);
     }
 }

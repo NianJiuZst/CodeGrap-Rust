@@ -44,6 +44,8 @@ pub struct Engine<'v> {
     pub pkg_defs: Vec<FxHashMap<&'v str, SmallVec<[NodeIdx; 2]>>>,
     /// Direct supertypes (`extends` / `implements` resolved in round 1).
     pub supers: FxHashMap<NodeIdx, SmallVec<[NodeIdx; 3]>>,
+    /// C++ namespaces opened by a `#define` anywhere in the project.
+    pub macro_namespaces: rustc_hash::FxHashSet<&'v str>,
     /// JavaScript functions with syntax evidence that they implement an object member.
     pub member_functions: FxHashMap<&'v str, SmallVec<[NodeIdx; 2]>>,
     pub return_types: FxHashMap<NodeIdx, &'v cg_store::BindingRec>,
@@ -118,6 +120,13 @@ impl<'v> Engine<'v> {
             stars: vec![Vec::new(); n_files],
             pkg_defs: Vec::new(),
             supers: FxHashMap::default(),
+            macro_namespaces: files
+                .iter()
+                .filter(|f| view.file(**f).lang() == Lang::Cpp)
+                .flat_map(|&f| view.bindings_of(f))
+                .filter(|b| b.kind == BindKind::MacroNamespace as u8)
+                .map(|b| view.text_str(b.name))
+                .collect(),
             member_functions,
             return_types: files
                 .iter()
@@ -148,7 +157,7 @@ impl<'v> Engine<'v> {
             },
             type_aliases: files
                 .iter()
-                .filter(|f| view.file(**f).lang() == Lang::Rust)
+                .filter(|f| matches!(view.file(**f).lang(), Lang::Rust | Lang::Cpp))
                 .flat_map(|&f| view.bindings_of(f))
                 .filter(|b| b.kind == BindKind::TypeAlias as u8 && b.node.is_some())
                 .map(|b| (b.node, b))

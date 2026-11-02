@@ -38,7 +38,8 @@ fn walk(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
     match n.kind() {
         "preproc_include" => include(cx, n),
         // Macro bodies are opaque text; their names are not bindings.
-        "preproc_def" | "preproc_function_def" | "preproc_call" | "comment" => {}
+        "preproc_def" => macro_namespaces(cx, n, scope),
+        "preproc_function_def" | "preproc_call" | "comment" => {}
         "using_declaration" => using(cx, n, scope),
         "namespace_alias_definition" => namespace_alias(cx, n, scope),
         "alias_declaration" => {
@@ -46,6 +47,7 @@ fn walk(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
                 let t = type_name(cx, ty);
                 if !t.is_empty() {
                     bind(cx, scope, nm, BindKind::Local, &t, "");
+                    owned_fact(cx, scope, n, nm, BindKind::TypeAlias, &t);
                 }
             }
         }
@@ -82,6 +84,19 @@ fn walk(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
 
 // ---------------------------------------------------------------------------------------------
 // imports
+
+/// The namespaces a `#define` body opens.
+fn macro_namespaces(cx: &mut Cx, n: Node, scope: u32) {
+    let Some(value) = n.child_by_field_name("value") else { return };
+    let words: Vec<String> = cx.text(value).split_whitespace().map(str::to_owned).collect();
+    let line = cx.line(n);
+    for pair in words.windows(2).filter(|w| w[0] == "namespace") {
+        let name = pair[1].split("::").next().unwrap_or("").trim_end_matches('{');
+        if !name.is_empty() && name != "{" {
+            cx.add_binding(scope, name, BindKind::MacroNamespace, "", "", line);
+        }
+    }
+}
 
 fn include(cx: &mut Cx, n: Node) {
     let Some(path) = n.child_by_field_name("path") else { return };
@@ -149,6 +164,14 @@ fn function(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
     if let Some(fd) = n.child_by_field_name("declarator").and_then(own_function_declarator) {
         if let Some(params) = fd.child_by_field_name("parameters") {
             parameters(cx, params, sc, BindKind::Param);
+        }
+        // `auto f() -> T` says it after the parameters, `T f()` before the name
+        let trailing = kids(fd).find(|c| c.kind() == "trailing_return_type").and_then(|t| kids(t).find(|c| c.kind() == "type_descriptor"));
+        if let (Some(t), Some(nm)) = (trailing.or(n.child_by_field_name("type")), fd.child_by_field_name("declarator")) {
+            let base = type_name(cx, t);
+            if !base.is_empty() {
+                owned_fact(cx, scope, n, nm, BindKind::ReturnType, &base);
+            }
         }
     }
     for ch in kids(n) {
@@ -368,6 +391,15 @@ fn is_reserved(n: Node, s: &str) -> bool {
 }
 
 /// Record a binding named by the identifier node `nm`, at the line of the name.
+/// A fact about the node `n` declares, found from anywhere by that node: a function's return
+/// type, what an alias names.
+fn owned_fact(cx: &mut Cx, scope: u32, n: Node, nm: Node, kind: BindKind, ty: &str) {
+    if let Some(row) = cx.row_at(cx.start(n)) {
+        let (name, line) = (cx.text(nm).to_owned(), cx.line(nm));
+        cx.facts.bindings.push(BindingFact { scope, name, kind, decl_type: ty.to_owned(), init_ctor: String::new(), line, node_row: row });
+    }
+}
+
 fn bind(cx: &mut Cx, scope: u32, nm: Node, kind: BindKind, ty: &str, init: &str) {
     let name = cx.text(nm);
     // `_GLIBCXX_NODISCARD _GLIBCXX20_CONSTEXPR` before a declaration reads as `Type name;`
@@ -503,6 +535,7 @@ fn type_definition(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
     for d in declarators {
         if let Declared::Var(nm, false) = classify(cx, d) {
             bind(cx, scope, nm, BindKind::Local, &base, "");
+            owned_fact(cx, scope, n, nm, BindKind::TypeAlias, &base);
         }
     }
 }

@@ -21,7 +21,8 @@ fn c(src: &str) -> Facts {
 }
 
 fn binds<'a>(f: &'a Facts, name: &str) -> Vec<&'a BindingFact> {
-    f.bindings.iter().filter(|b| b.name == name).collect()
+    // metadata kept beside a declaration is no lexical binding
+    f.bindings.iter().filter(|b| b.name == name && !matches!(b.kind, BindKind::TypeAlias | BindKind::ReturnType | BindKind::MacroNamespace)).collect()
 }
 
 fn bind<'a>(f: &'a Facts, name: &str) -> &'a BindingFact {

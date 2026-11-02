@@ -1,5 +1,6 @@
 //! cg-extract: turns files into per-file node/edge/reference tables plus facts.
 
+pub mod cpp_preparse;
 pub mod facts;
 pub mod macro_mask;
 pub mod pipeline;

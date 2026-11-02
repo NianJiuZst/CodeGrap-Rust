@@ -19,7 +19,7 @@
 //! the view. Every pass is capped per key, and an ambiguous name links nothing.
 
 use super::scan::{call_args, enclosing_row, is_minified, mid_chain, LineIndex, FN_KINDS};
-use super::sites::{PASS_BUS, PASS_CALLBACK, PASS_CELERY, PASS_HTTP, PASS_QUEUE, PASS_REGISTRY, PASS_SPRING};
+use super::sites::{PASS_BUS, PASS_CALLBACK, PASS_CELERY, PASS_HTTP, PASS_MEDIATR, PASS_QUEUE, PASS_REGISTRY, PASS_SPRING};
 use super::{order_of, Out};
 use crate::engine::{Bound, Engine};
 use crate::frameworks::href::{index_at_depth0, match_bracket, read_string_at, HOLE};
@@ -45,6 +45,7 @@ const REGISTRY_FANOUT_CAP: usize = 40;
 const EVENT_FANOUT_CAP: usize = 6;
 const CELERY_FANOUT_CAP: usize = 80;
 const SPRING_FANOUT_CAP: usize = 80;
+const MEDIATR_FANOUT_CAP: usize = 80;
 
 fn site(pass: u16, role: u8, key_a: impl Into<String>, key_b: impl Into<String>, node_row: Option<u32>, line: u32, payload: impl Into<String>) -> SiteFact {
     SiteFact { pass, role, key_kind: 0, key_a: key_a.into(), key_b: key_b.into(), node_row: node_row.unwrap_or(NONE), line, payload: payload.into() }
@@ -1510,6 +1511,168 @@ pub(crate) fn spring_events(e: &Engine<'_>, out: &mut Out) {
             *n += 1;
             let meta = serde_json::json!({ "synthesizedBy": "spring-event", "via": ty, "registeredAt": registered(view, f, line) });
             out.push_meta(EdgeKind::Calls, disp, t, line, NONE, meta, order_of("spring-event"));
+        }
+    }
+}
+
+// =================================================================== MediatR dispatch
+
+pub const ROLE_MEDIATR_HANDLER: u8 = 0;
+pub const ROLE_MEDIATR_SEND: u8 = 1;
+
+re!(mediatr_base_re, r"(?:IRequestHandler|INotificationHandler)\s*<\s*([A-Za-z_]\w*)");
+re!(mediatr_dispatch_re, r"([A-Za-z_][\w.]*)\s*\.\s*(Send|Publish)\s*\(\s*(new\s+[A-Z]\w*|[A-Za-z_]\w*)");
+re!(mediatr_receiver_re, r"(?i)mediator|sender|publisher");
+re!(mediatr_handle_param_re, r"\bHandle\s*\(\s*(?:\[[^\]]*\]\s*)?(?:[A-Za-z_]\w*\.)*([A-Za-z_]\w*)");
+re!(mediatr_parens_re, r"\([^()]*(?:\([^()]*\)[^()]*)*\)");
+re!(mediatr_generic_arg_re, r"[<,]\s*(?:[A-Za-z_]\w*\.)*([A-Za-z_]\w*)");
+re!(mediatr_own_params_re, r"<([^<>]*)>");
+re!(mediatr_new_re, r"^new\s+([A-Z]\w*)");
+
+/// The types a class's base list names as generic arguments, its own type parameters and
+/// primary constructor aside (16 lines: a primary constructor can push the list down).
+fn mediatr_base_types(lines: &[&str], class_start: usize) -> Vec<String> {
+    let head = lines.iter().skip(class_start.saturating_sub(1)).take(16).copied().collect::<Vec<_>>().join("\n");
+    let head = head.split('{').next().unwrap_or("");
+    let text = mediatr_parens_re().replace_all(head, " ");
+    let Some(colon) = text.find(':') else { return Vec::new() };
+    let own: Vec<&str> =
+        mediatr_own_params_re().captures(&text[..colon]).map(|c| c.get(1).unwrap().as_str().split(',').map(str::trim).collect()).unwrap_or_default();
+    mediatr_generic_arg_re().captures_iter(&text[colon + 1..]).map(|c| c[1].to_owned()).filter(|t| !own.contains(&t.as_str())).collect()
+}
+
+/// The type sent at a dispatch: an inline `new X(..)`, else within the enclosing method an
+/// `arg = new X(..)` or a mapper's `arg = m.Map<X>(..)` (either wins), else a declared `X arg`.
+fn mediatr_arg_type(arg: &str, lines: &[&str], method_start: u32, line: u32) -> Option<String> {
+    if let Some(c) = mediatr_new_re().captures(arg) {
+        return Some(c[1].to_owned());
+    }
+    if !arg.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let assign = Regex::new(&format!(r"\b{arg}\b\s*=\s*new\s+([A-Z]\w*)")).ok()?;
+    let mapped = Regex::new(&format!(r"\b{arg}\b\s*=[^;]*?\.\s*\w+<(?:[^<>;]*,\s*)?(?:\w+\.)*([A-Z]\w*)>\s*\(")).ok()?;
+    let decl = Regex::new(&format!(r"\b([A-Z]\w*)\b\s+{arg}\b")).ok()?;
+    let mut declared = None;
+    for l in lines.iter().take(line as usize).skip(method_start.saturating_sub(1) as usize) {
+        if let Some(c) = assign.captures(l).or_else(|| mapped.captures(l)) {
+            return Some(c[1].to_owned());
+        }
+        if declared.is_none() {
+            declared = decl.captures(l).map(|c| c[1].to_owned());
+        }
+    }
+    declared
+}
+
+/// MediatR decouples `.Send(x)` / `.Publish(x)` from the `Handle` method through the type of x
+/// (upstream `mediatrDispatchEdges`). The receiver must be mediator-ish and the type a known
+/// handler's. A handler is what names the interface, or any class whose base list repeats its
+/// `Handle`'s first parameter: projects derive their own `ICommandHandler<T>`.
+pub struct MediatrScanner;
+
+impl FileHook for MediatrScanner {
+    fn name(&self) -> &'static str {
+        "mediatr-sites"
+    }
+    fn applies(&self, lang: Lang, _rel: &str) -> bool {
+        lang == Lang::CSharp
+    }
+    fn triggers(&self) -> &'static [&'static str] {
+        &[".Send(", ".Publish(", "Handle("]
+    }
+    fn run(&self, ctx: &HookCtx<'_>, out: &mut HookOut) {
+        let src = ctx.src;
+        if src.contains(".Send(") || src.contains(".Publish(") {
+            let safe = cg_extract::post::strip_js_comments(src);
+            let li = LineIndex::new(&safe);
+            let lines: Vec<&str> = safe.split('\n').collect();
+            for c in mediatr_dispatch_re().captures_iter(&safe) {
+                if !mediatr_receiver_re().is_match(&c[1]) {
+                    continue;
+                }
+                let line = li.line(c.get(0).unwrap().start());
+                let Some(row) = enclosing_row(ctx, line, FN_KINDS) else { continue };
+                let Some(from) = ctx.rows.nodes().nth(row as usize) else { continue };
+                if let Some(ty) = mediatr_arg_type(&c[3], &lines, from.start_line(), line) {
+                    out.sites.push(site(PASS_MEDIATR, ROLE_MEDIATR_SEND, ty, &c[2], Some(row), line, ""));
+                }
+            }
+        }
+        if !src.contains("Handle(") {
+            return;
+        }
+        let lines: Vec<&str> = src.split('\n').collect();
+        let handles: Vec<(u32, u32)> = ctx
+            .rows
+            .nodes()
+            .enumerate()
+            .filter(|(_, n)| n.kind() == NodeKind::Method && n.name() == "Handle")
+            .map(|(row, n)| (row as u32, n.start_line()))
+            .collect();
+        for cls in ctx.rows.nodes().filter(|n| n.kind() == NodeKind::Class) {
+            let inside: Vec<(u32, u32)> = handles.iter().copied().filter(|(_, l)| (cls.start_line()..=cls.end_line()).contains(l)).collect();
+            let Some(&(first, _)) = inside.first() else { continue };
+            let start = cls.start_line() as usize;
+            let decl = lines.iter().skip(start - 1).take(4).copied().collect::<Vec<_>>().join("\n");
+            let mut add = |ty: &str, row: u32, line: u32| out.sites.push(site(PASS_MEDIATR, ROLE_MEDIATR_HANDLER, ty, "", Some(row), line, ""));
+            if let Some(c) = mediatr_base_re().captures(decl.split('{').next().unwrap_or("")) {
+                add(&c[1], first, cls.start_line());
+            }
+            let bases = mediatr_base_types(&lines, start);
+            for &(row, line) in &inside {
+                let head = lines.iter().skip(line as usize - 1).take(3).copied().collect::<Vec<_>>().join(" ");
+                if let Some(c) = mediatr_handle_param_re().captures(&head).filter(|c| bases.iter().any(|b| *b == c[1])) {
+                    add(&c[1], row, line);
+                }
+            }
+        }
+    }
+}
+
+/// How many leading folders two paths share.
+fn shared_folders(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<&str>, Vec<&str>) = (a.split('/').collect(), b.split('/').collect());
+    a.iter().zip(&b).take(a.len().min(b.len()) - 1).take_while(|(x, y)| x == y).count()
+}
+
+pub(crate) fn mediatr_dispatch(e: &Engine<'_>, out: &mut Out) {
+    let view = e.view;
+    let mut handlers: FxHashMap<&str, Vec<NodeIdx>> = FxHashMap::default();
+    let mut sends = Vec::new();
+    for f in view.files() {
+        for s in view.sites_of(f).iter().filter(|s| s.pass == PASS_MEDIATR) {
+            if s.role == ROLE_MEDIATR_HANDLER {
+                let known = handlers.entry(text(view, s.key_a)).or_default();
+                if !known.contains(&s.node) {
+                    known.push(s.node);
+                }
+            } else {
+                sends.push((f, s.node, s.line, text(view, s.key_a), text(view, s.key_b)));
+            }
+        }
+    }
+    let mut seen: FxHashSet<(NodeIdx, NodeIdx)> = FxHashSet::default();
+    let mut per_file: FxHashMap<FileId, usize> = FxHashMap::default();
+    for (f, disp, line, ty, verb) in sends {
+        let Some(targets) = handlers.get(ty) else { continue };
+        let path = view.file(f).path();
+        let shared = |t: NodeIdx| shared_folders(path, view.file(view.node(t).file()).path());
+        // Solutions sit side by side with same-named requests: a Send has one handler, the
+        // nearest; a Publish fans out, but stays in this top-level folder when any is there.
+        let best = targets.iter().map(|&t| shared(t)).max().unwrap_or(0);
+        let n = per_file.entry(f).or_default();
+        if *n >= MEDIATR_FANOUT_CAP {
+            continue;
+        }
+        for &t in targets {
+            let reachable = targets.len() < 2 || if verb == "Send" { shared(t) == best } else { best == 0 || shared(t) > 0 };
+            if !reachable || t == disp || !seen.insert((disp, t)) {
+                continue;
+            }
+            *n += 1;
+            let meta = serde_json::json!({ "synthesizedBy": "mediatr-dispatch", "via": ty, "registeredAt": registered(view, f, line) });
+            out.push_meta(EdgeKind::Calls, disp, t, line, NONE, meta, order_of("mediatr-dispatch"));
         }
     }
 }

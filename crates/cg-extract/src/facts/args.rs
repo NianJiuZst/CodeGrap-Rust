@@ -9,6 +9,8 @@
 //! * `N`        - `null` / `undefined`
 //! * `L<k>`     - a lambda / function literal taking `k` parameters; `L` alone: a method
 //!   reference, whose parameter count the text does not say
+//! * `S` / `W`  - C++ only: a narrow / wide string literal
+//! * Swift: each argument's label, `_` for none
 //! * `?`        - anything else (a call, an operator, ...): fits every parameter
 //!
 //! A spread argument (`...xs`) or a named one (Kotlin `f(n = 1)`) makes the positional
@@ -294,5 +296,89 @@ fn js_shape(cx: &Cx, a: Node) -> String {
             _ => "?".into(),
         },
         _ => "?".into(),
+    }
+}
+
+// ------------------------------------------------------------------- C++
+
+/// Every call in the file. C++ reads no types here: the count and the string literals are what
+/// `overload::cpp_fit` weighs.
+/// Swift `f(a, label: b)`, `x.f(..)`: the labels, when the call writes its `( .. )` (a call
+/// with a trailing closure only says nothing of its labels).
+pub fn swift_calls(cx: &mut Cx, root: Node) {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        stack.extend(kids(n));
+        if n.kind() != "call_expression" {
+            continue;
+        }
+        let Some(callee) = n.named_child(0) else { continue };
+        let name = match callee.kind() {
+            "simple_identifier" => Some(callee),
+            "navigation_expression" => match callee.named_child(1) {
+                Some(s) if s.kind() == "navigation_suffix" => kids(s).find(|g| g.kind() == "simple_identifier"),
+                other => other.filter(|s| s.kind() == "simple_identifier"),
+            },
+            _ => None,
+        };
+        let Some(name) = name else { continue };
+        let Some(list) = kids(n).find(|c| c.kind() == "call_suffix").and_then(|s| kids(s).find(|c| c.kind() == "value_arguments")) else { continue };
+        if !cx.text(list).starts_with('(') {
+            continue;
+        }
+        let labels = kids(list).filter(|a| a.kind() == "value_argument").map(|a| swift_label(cx.text(a)).to_owned()).collect();
+        let tail = cx.text(name).to_owned();
+        push(cx, n, &tail, labels);
+    }
+}
+
+fn swift_label(arg: &str) -> &str {
+    let t = arg.trim_start();
+    let end = t.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(t.len());
+    let rest = t[end..].trim_start();
+    if end > 0 && rest.starts_with(':') && !rest.starts_with("::") {
+        &t[..end]
+    } else {
+        "_"
+    }
+}
+
+pub fn cpp_calls(cx: &mut Cx, root: Node) {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "call_expression" {
+            cpp_call(cx, n);
+        }
+        stack.extend(kids(n));
+    }
+}
+
+/// `f(a)`, `ns::f<T>(a)`, `x.f(a)`: the kernel's reference sits at the start of the call.
+fn cpp_call(cx: &mut Cx, call: Node) {
+    let (Some(mut name), Some(list)) = (call.child_by_field_name("function"), call.child_by_field_name("arguments")) else { return };
+    while let Some(inner) = match name.kind() {
+        "qualified_identifier" | "template_function" | "template_method" => name.child_by_field_name("name"),
+        "field_expression" => name.child_by_field_name("field"),
+        _ => None,
+    } {
+        name = inner;
+    }
+    let tail = cx.text(name).to_owned();
+    let args = kids(list).filter(|a| a.is_named() && a.kind() != "comment").map(|a| cpp_shape(cx.text(a)).to_owned()).collect();
+    push(cx, call, &tail, args);
+}
+
+fn cpp_shape(arg: &str) -> &'static str {
+    let body = ["u8", "u", "U", "L"].iter().find_map(|p| arg.strip_prefix(p)).unwrap_or(arg);
+    if body.strip_prefix('R').unwrap_or(body).starts_with('"') {
+        if arg.starts_with('L') {
+            "W"
+        } else {
+            "S"
+        }
+    } else if arg.strip_prefix("FMT_STRING").is_some_and(|r| r.trim_start().starts_with('(')) {
+        "S"
+    } else {
+        "?"
     }
 }

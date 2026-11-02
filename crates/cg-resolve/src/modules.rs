@@ -358,6 +358,9 @@ impl<'v> Modules<'v> {
 
     // ---- C / C++: `#include "a/b.h"` relative to the includer, then by path suffix
     fn resolve_c(&self, spec: &str, from_path: &str) -> ImportTarget {
+        if spec.contains("::") {
+            return self.resolve_cpp_using(spec);
+        }
         let (angle, inc) = match spec.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
             Some(inner) => (true, inner.trim()),
             None => (false, spec.trim()),
@@ -395,6 +398,27 @@ impl<'v> Modules<'v> {
             ImportTarget::External
         } else {
             ImportTarget::NotFound
+        }
+    }
+
+    /// `using a::b::f;` names a declaration, with its outer namespaces possibly opened by a macro
+    /// and so missing from the qualified name.
+    // ponytail: only `std` is known to be foreign, so `using dep::f;` can reach a project's global
+    // `f`; checking the macro bodies for `namespace dep` needs the sources at resolution.
+    fn resolve_cpp_using(&self, spec: &str) -> ImportTarget {
+        let spec = spec.trim_start_matches("::");
+        if spec.starts_with("std::") {
+            return ImportTarget::External;
+        }
+        let mut rest = spec;
+        loop {
+            if let Some(n) = self.canonical(self.view.by_qname(rest).filter(|n| self.view.file(self.view.hot(*n).file).lang().family() == LangFamily::C)) {
+                return ImportTarget::Node(n);
+            }
+            match rest.split_once("::") {
+                Some((_, tail)) => rest = tail,
+                None => return ImportTarget::External,
+            }
         }
     }
 

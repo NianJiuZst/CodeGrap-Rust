@@ -24,6 +24,9 @@ pub use util::Cx;
 /// Internal export key for the module value itself, distinct from a named/ES
 /// `default` export. The leading NUL keeps it out of ordinary source identifiers.
 pub const COMMONJS_MODULE: &str = "\0cjs:module.exports";
+/// Prefix of a Swift call the kernel names by its method alone although it is made on some
+/// other value: `<prefix><receiver>.<method>` (`session.request(..).validate()`).
+pub const SWIFT_CHAIN: &str = "\0chain:";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -129,6 +132,9 @@ pub enum BindKind {
     /// Rust `type X = Y;` outside an impl, keyed by the alias's node: `decl_type` is `Y`.
     /// Metadata only; not a lexical binding.
     TypeAlias = 10,
+    /// C++ `#define BEGIN namespace fmt {`: `name` is a namespace opened only by a macro, which
+    /// no node of the index stands for. Metadata only; not a lexical binding.
+    MacroNamespace = 11,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,11 +263,18 @@ pub fn extract_with_timeout(lang: Lang, tree: &Tree, src: &str, rows: FileRows<'
         Lang::Java => java::extract(&mut cx, root),
         Lang::Rust => rust::extract(&mut cx, root),
         Lang::Kotlin => kotlin::extract(&mut cx, root),
-        Lang::C | Lang::Cpp => c::extract(&mut cx, root),
+        Lang::C => c::extract(&mut cx, root),
+        Lang::Cpp => {
+            c::extract(&mut cx, root);
+            args::cpp_calls(&mut cx, root);
+        }
         Lang::CSharp => csharp::extract(&mut cx, root),
         Lang::Php => php::extract(&mut cx, root),
         Lang::Ruby => ruby::extract(&mut cx, root),
-        Lang::Swift => swift::extract(&mut cx, root),
+        Lang::Swift => {
+            swift::extract(&mut cx, root);
+            args::swift_calls(&mut cx, root);
+        }
         _ => {}
     }
     cx.finish()
