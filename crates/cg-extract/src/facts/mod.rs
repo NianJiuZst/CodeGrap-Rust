@@ -28,6 +28,13 @@ pub const COMMONJS_MODULE: &str = "\0cjs:module.exports";
 /// other value: `<prefix><receiver>.<method>` (`session.request(..).validate()`).
 pub const SWIFT_CHAIN: &str = "\0chain:";
 
+/// Marks initializer evidence collected through a TypeScript `satisfies` expression.
+pub const JS_SATISFIES_VALUE: &str = "\0js:satisfies:";
+
+/// Initializer evidence that names a JavaScript/TypeScript lexical binding.
+/// The NUL prefix distinguishes it from a constructor or call path.
+pub const JS_BINDING_ALIAS: &str = "\0js:binding:";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ImportKind {
@@ -132,9 +139,20 @@ pub enum BindKind {
     /// Rust `type X = Y;` outside an impl, keyed by the alias's node: `decl_type` is `Y`.
     /// Metadata only; not a lexical binding.
     TypeAlias = 10,
+    /// A JS factory returns an object it mixed with an imported module's members.
+    /// Metadata only; `decl_type` is the source module specifier.
+    FactoryMixin = 11,
+    /// A JavaScript name is assigned after declaration. Metadata only.
+    Mutation = 12,
+    /// A top-level JavaScript object is assigned to `module.exports` in its initializer.
+    /// Metadata only; `name` is the local object name.
+    CommonJsObject = 13,
+    /// A `this.member()` inside a function assigned to a named object property.
+    /// Metadata only; `decl_type` identifies that object and `init_ctor` the call column.
+    AssignedThisCall = 14,
     /// C++ `#define BEGIN namespace fmt {`: `name` is a namespace opened only by a macro, which
     /// no node of the index stands for. Metadata only; not a lexical binding.
-    MacroNamespace = 11,
+    MacroNamespace = 15,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,7 +163,7 @@ pub struct BindingFact {
     /// Declared type, usually reduced to its head (`Foo<T>` -> `Foo`). Rust
     /// retains generic arguments to distinguish containers and pointer targets.
     pub decl_type: String,
-    /// Constructor or bounded initializer call path (`Foo::new().build()`), or empty.
+    /// Constructor, bounded initializer call path, tagged lexical alias, or empty.
     pub init_ctor: String,
     /// 1-based declaration line; the binding is visible from here on (hoisted functions
     /// are visible throughout their scope and use line 0).

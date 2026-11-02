@@ -9,7 +9,7 @@ use crate::modules::{ImportTarget, PkgId};
 use crate::overload::{self, ArgTy, CallArgs};
 use crate::shape::{normalize_call_name, parse_shape, split_head, Shape};
 use cg_core::{text::pack_pos, EdgeKind, FileId, Lang, LangFamily, NodeIdx, NodeKind, RefKind, Visibility, NONE};
-use cg_extract::facts::{COMMONJS_MODULE, SWIFT_CHAIN};
+use cg_extract::facts::{COMMONJS_MODULE, JS_BINDING_ALIAS, JS_SATISFIES_VALUE, SWIFT_CHAIN};
 use cg_extract::{BindKind, ImportKind, ScopeKind};
 use cg_store::{status, BindingRec, ImportRec, RefRec, ScopeRec, View};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -466,6 +466,10 @@ impl<'e, 'v> FileCx<'e, 'v> {
                             || b.kind == BindKind::Deref as u8
                             || b.kind == BindKind::Fixture as u8
                             || b.kind == BindKind::TypeAlias as u8
+                            || b.kind == BindKind::FactoryMixin as u8
+                            || b.kind == BindKind::Mutation as u8
+                            || b.kind == BindKind::CommonJsObject as u8
+                            || b.kind == BindKind::AssignedThisCall as u8
                             || b.kind == BindKind::MacroNamespace as u8
                         {
                             continue;
@@ -569,21 +573,29 @@ impl<'e, 'v> FileCx<'e, 'v> {
 
     /// Binding of a file-level variable called `name` (module singletons such as `app = Flask()`).
     pub fn file_binding(&self, name: &str) -> Option<&'v BindingRec> {
-        self.bindings.get(&(0, name)).and_then(|l| l.iter().copied().find(|b| b.kind == BindKind::Local as u8 || b.kind == BindKind::Field as u8))
+        self.bindings
+            .get(&(0, name))
+            .and_then(|l| l.iter().copied().find(|b| b.kind == BindKind::Local as u8 || b.kind == BindKind::Field as u8 || b.kind == BindKind::Alias as u8))
     }
 
     /// Follow `segs` from a module / type: exports, top-level definitions, submodules, members.
     fn walk_path(&self, start: Bound, segs: &[&str]) -> Option<Bound> {
+        self.walk_path_in_space(start, segs, false)
+    }
+
+    fn walk_path_in_space(&self, start: Bound, segs: &[&str], type_space: bool) -> Option<Bound> {
         let mut cur = start;
-        for seg in segs {
+        for (i, seg) in segs.iter().enumerate() {
             cur = match cur {
-                Bound::Module(m) => match self.e.lookup_export(m, seg, 0) {
-                    Some(b) => b,
-                    None => match (self.view.file(m).lang().family() != LangFamily::Js).then(|| self.e.lookup_top_level(m, seg)).flatten() {
-                        Some(n) => Bound::Node(n),
-                        None => Bound::Module(self.e.submodule(m, seg)?),
-                    },
-                },
+                Bound::Module(m) => {
+                    match if type_space && i + 1 == segs.len() { self.e.lookup_type_export(m, seg, 0) } else { self.e.lookup_export(m, seg, 0) } {
+                        Some(b) => b,
+                        None => match (self.view.file(m).lang().family() != LangFamily::Js).then(|| self.e.lookup_top_level(m, seg)).flatten() {
+                            Some(n) => Bound::Node(n),
+                            None => Bound::Module(self.e.submodule(m, seg)?),
+                        },
+                    }
+                }
                 Bound::Node(n) => Bound::Node(self.e.direct_member(n, seg).or_else(|| self.e.find_member(n, seg))?),
                 Bound::Pkg(p) => {
                     let n = self.e.pkg_defs.get(p.0 as usize).and_then(|m| m.get(*seg)).and_then(|l| l.iter().find(|n| self.visible(**n, seg)))?;
@@ -719,11 +731,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
         }
         let segs: Vec<&str> = rest.split(['.', ':']).filter(|s| !s.is_empty()).collect();
         match self.resolve_name(wcx, head, Accept::Any, 0, u32::MAX, None, false) {
-            NameRes::Module(tf) => match self.walk_path(Bound::Module(tf), &segs) {
+            NameRes::Module(tf) => match self.walk_path_in_space(Bound::Module(tf), &segs, true) {
                 Some(Bound::Node(n)) => TypeRes::Node(n),
                 _ => TypeRes::Unknown,
             },
-            NameRes::Pkg(p) => match self.walk_path(Bound::Pkg(p), &segs) {
+            NameRes::Pkg(p) => match self.walk_path_in_space(Bound::Pkg(p), &segs, true) {
                 Some(Bound::Node(n)) => TypeRes::Node(n),
                 _ => TypeRes::Unknown,
             },
@@ -798,16 +810,71 @@ impl<'e, 'v> FileCx<'e, 'v> {
             if let Some(other) = self.lookup_binding(init, scope, b.line, false).filter(|o| !std::ptr::eq(*o, b)) {
                 return self.binding_value(wcx, other, depth + 1);
             }
+            if self.visible_import(init, scope).is_some() {
+                return self.imported_binding_value(wcx, init, scope, depth + 1);
+            }
         }
         // The new variable is not in scope in its own initializer (`let rt = rt()`).
-        let shadows = init.split(['.', ':', '(']).next() == Some(self.view.text_str(b.name));
+        let root = init.strip_prefix(JS_SATISFIES_VALUE).unwrap_or(init);
+        let root = root.strip_prefix(JS_BINDING_ALIAS).unwrap_or(root);
+        let shadows = root.split(['.', ':', '(']).next() == Some(self.view.text_str(b.name));
         let line = if shadows { b.line.saturating_sub(1) } else { b.line };
         self.expression_value(wcx, init, scope, line, depth + 1)
+    }
+
+    fn imported_binding_value(&self, wcx: &mut WorkerCx<'e, 'v>, name: &str, scope: u32, depth: u8) -> Option<ValueType> {
+        if depth >= 16 {
+            return None;
+        }
+        let import = self.visible_import(name, scope)?;
+        let Bound::Node(node) = self.e.bind_import(self.file, import as usize) else { return None };
+        if self.view.node(node).kind().is_type() {
+            return Some(ValueType::plain(node));
+        }
+        let owner = self.view.hot(node).file;
+        let cx = wcx.file_cx(self.e, owner);
+        let binding = cx.file_binding(self.view.node(node).name())?;
+        cx.binding_value(wcx, binding, depth + 1)
+    }
+
+    /// Do not guess a member of an unresolved value when an alias leads back
+    /// to an explicit type or a `satisfies` operand.
+    fn blocks_member_fallback(&self, wcx: &mut WorkerCx<'e, 'v>, binding: &BindingRec, depth: u8) -> bool {
+        if depth >= 16 {
+            return true;
+        }
+        let init = self.view.text_str(binding.init_ctor);
+        if !self.view.text_str(binding.decl_type).is_empty() || init.starts_with(JS_SATISFIES_VALUE) || init.starts_with(JS_BINDING_ALIAS) {
+            return true;
+        }
+        if binding.kind != BindKind::Alias as u8 {
+            return false;
+        }
+        let scope = binding.scope.0.wrapping_sub(self.scope_base);
+        if let Some(other) = self.lookup_binding(init, scope, binding.line, false) {
+            return std::ptr::eq(other, binding) || self.blocks_member_fallback(wcx, other, depth + 1);
+        }
+        let Some(import) = self.visible_import(init, scope) else { return false };
+        let Bound::Node(node) = self.e.bind_import(self.file, import as usize) else { return true };
+        let cx = wcx.file_cx(self.e, self.view.hot(node).file);
+        match cx.file_binding(self.view.node(node).name()) {
+            Some(other) => cx.blocks_member_fallback(wcx, other, depth + 1),
+            None => true,
+        }
     }
 
     fn expression_value(&self, wcx: &mut WorkerCx<'e, 'v>, init: &str, scope: u32, line: u32, depth: u8) -> Option<ValueType> {
         if depth >= 16 {
             return None;
+        }
+        if let Some(inner) = init.strip_prefix(JS_SATISFIES_VALUE) {
+            return self.expression_value(wcx, inner, scope, line, depth + 1);
+        }
+        if let Some(name) = init.strip_prefix(JS_BINDING_ALIAS) {
+            if let Some(binding) = self.lookup_binding(name, scope, line, false) {
+                return self.binding_value(wcx, binding, depth + 1);
+            }
+            return self.imported_binding_value(wcx, name, scope, depth + 1);
         }
         // `A()|B()`: a factory returning different classes in different branches is typed by
         // the nearest class they all derive from, or not at all
@@ -1266,6 +1333,54 @@ impl<'e, 'v> FileCx<'e, 'v> {
         ArgTy::Named(self.view.node(t).name().to_owned(), Some(t))
     }
 
+    /// Recover a primitive return annotation only from a single unambiguous JS callee.
+    fn primitive_call_arg(&self, wcx: &mut WorkerCx<'e, 'v>, callee: &str, scope: u32, line: u32) -> Option<ArgTy> {
+        if self.family != LangFamily::Js || callee.is_empty() || !callee.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+            return None;
+        }
+        let NameRes::Found(node, ..) = self.resolve_name(wcx, callee, Accept::Callable, scope, line, None, false) else { return None };
+        if self.sibling_overloads(node).len() != 1 {
+            return None;
+        }
+        let (_, ret) = self.view.node(node).signature()?.rsplit_once(':')?;
+        let ret = ret.trim().trim_end_matches(';').trim();
+        matches!(ret, "string" | "number" | "boolean" | "bigint" | "symbol").then(|| self.named_arg(wcx, ret))
+    }
+
+    fn binding_arg_type(&self, wcx: &mut WorkerCx<'e, 'v>, b: &BindingRec, depth: u8) -> ArgTy {
+        if depth >= 16 {
+            return ArgTy::Unknown;
+        }
+        let declared = self.view.text_str(b.decl_type);
+        if !declared.is_empty() {
+            return self.named_arg(wcx, declared);
+        }
+        let init = self.view.text_str(b.init_ctor);
+        let satisfied = init.strip_prefix(JS_SATISFIES_VALUE);
+        let value = satisfied.unwrap_or(init);
+        let alias = value.strip_prefix(JS_BINDING_ALIAS).or_else(|| (b.kind == BindKind::Alias as u8).then_some(value));
+        let scope = b.scope.0.wrapping_sub(self.scope_base);
+        if let Some(name) = alias {
+            if let Some(other) = self.lookup_binding(name, scope, b.line, false).filter(|other| !std::ptr::eq(*other, b)) {
+                return self.binding_arg_type(wcx, other, depth + 1);
+            }
+            if let Some(import) = self.visible_import(name, scope) {
+                if let Bound::Node(node) = self.e.bind_import(self.file, import as usize) {
+                    let cx = wcx.file_cx(self.e, self.view.hot(node).file);
+                    if let Some(other) = cx.file_binding(self.view.node(node).name()) {
+                        return cx.binding_arg_type(wcx, other, depth + 1);
+                    }
+                }
+            }
+        }
+        if let Some(callee) = satisfied.and_then(|s| s.strip_suffix("()")) {
+            if let Some(arg) = self.primitive_call_arg(wcx, callee, scope, b.line) {
+                return arg;
+            }
+        }
+        self.binding_type(wcx, b).map_or(ArgTy::Unknown, |t| self.node_arg(t))
+    }
+
     fn arg_type(&self, wcx: &mut WorkerCx<'e, 'v>, shape: &str, scope: u32, r: &RefRec) -> ArgTy {
         match shape {
             "?" => ArgTy::Unknown,
@@ -1276,16 +1391,15 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 if let Some(t) = shape.strip_prefix("T:") {
                     return self.named_arg(wcx, t);
                 }
+                if let Some(callee) = shape.strip_prefix("C:") {
+                    return self.primitive_call_arg(wcx, callee, scope, r.line).unwrap_or(ArgTy::Unknown);
+                }
                 if let Some(v) = shape.strip_prefix("V:") {
                     if let Some(b) = self.lookup_binding(v, scope, r.line, false) {
                         if b.kind == BindKind::LocalFn as u8 {
                             return ArgTy::Lambda(None);
                         }
-                        let dt = self.view.text_str(b.decl_type);
-                        if !dt.is_empty() {
-                            return self.named_arg(wcx, dt);
-                        }
-                        return self.binding_type(wcx, b).map_or(ArgTy::Unknown, |t| self.node_arg(t));
+                        return self.binding_arg_type(wcx, b, 0);
                     }
                     // a bare field: Java / Kotlin only (JS reads fields through `this.`)
                     return if self.family == LangFamily::Jvm { self.field_arg(wcx, r, v) } else { ArgTy::Unknown };
@@ -1792,6 +1906,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
                     return NameRes::Found(b.node, by::LEXICAL, 98);
                 }
                 if b.kind == BindKind::LocalFn as u8 {
+                    if self.family == LangFamily::Js {
+                        // Without the declaration's exact node, a same-named function in
+                        // another closure is not evidence for this binding.
+                        return NameRes::Local;
+                    }
                     // a local function declared in this scope: its node is the same-named nested definition
                     let hit = view.by_name(name).find(|n| view.hot(*n).file == self.file && matches!(kind_of(view, *n), NodeKind::Function | NodeKind::Method));
                     if let Some(n) = hit {
@@ -1813,7 +1932,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
         }
         // 3. import binding
         if let Some(i) = self.visible_import(name, scope) {
-            match e.bind_import(self.file, i as usize) {
+            match if accept == Accept::Type { e.bind_type_import(self.file, i as usize) } else { e.bind_import(self.file, i as usize) } {
                 Bound::Node(n) => {
                     if accept.ok(kind_of(view, n)) || accept == Accept::Any {
                         return NameRes::Found(n, by::IMPORT, 95);
@@ -1839,12 +1958,6 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 Bound::External => return NameRes::External,
                 Bound::Unknown if self.family == LangFamily::Js => return NameRes::NotFound,
                 Bound::Unknown => {}
-            }
-        }
-        // JS / TS: `this.method()` is emitted as a bare `method`; an explicit import wins over it
-        if accept != Accept::Type && self.family == LangFamily::Js {
-            if let Some(m) = self.enclosing_member(wcx, from, name, args) {
-                return NameRes::Found(m, by::RECEIVER, 88);
             }
         }
         // 4. same file
@@ -1978,6 +2091,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
 
     /// Method of an untyped receiver: only when the name is unique in the language family.
     fn fallback_method(&self, method: &str) -> Outcome {
+        // A unique property name does not identify an arbitrary JavaScript receiver.
+        // `router.use()` and `app.use()` can denote completely unrelated objects.
+        if self.family == LangFamily::Js {
+            return Outcome::st(status::NO_CANDIDATE);
+        }
         // Ruby duck-types everything: a unique name says nothing of the receiver (`response.body`
         // is Rack's, not the project's only `body`)
         if self.family == LangFamily::Ruby || is_common_method(self.family, method) || is_builtin(self.family, method) {
@@ -2009,6 +2127,77 @@ impl<'e, 'v> FileCx<'e, 'v> {
             0 => Outcome::st(status::NO_CANDIDATE),
             _ => Outcome::ambiguous(2),
         }
+    }
+
+    /// Express' own factory returns an application with `lib/application.js` mixed in.
+    /// Resolve only a direct call to that repository's actual exported factory, never
+    /// an untyped variable or a router merely sharing a method name.
+    fn express_application_member(&self, b: &BindingRec, method: &str) -> Option<NodeIdx> {
+        if self.family != LangFamily::Js {
+            return None;
+        }
+        let init = self.view.text_str(b.init_ctor);
+        let head = init.strip_suffix("()")?;
+        if head.is_empty() || head.contains(['.', ':', '(', ')']) {
+            return None;
+        }
+        let scope = b.scope.0.wrapping_sub(self.scope_base);
+        if self.lookup_binding(head, scope, b.line, false).is_some() {
+            return None;
+        }
+        let i = self.visible_import(head, scope)?;
+        let factory = match self.e.bind_import(self.file, i as usize) {
+            Bound::Node(n) => n,
+            Bound::Module(f) => match self.e.lookup_export(f, COMMONJS_MODULE, 0)? {
+                Bound::Node(n) => n,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let node = self.view.node(factory);
+        if node.kind() != NodeKind::Function || node.name() != "createApplication" {
+            return None;
+        }
+        let factory_path = self.view.file(node.file()).path();
+        let package = self.e.project.packages.iter().find(|p| {
+            p.name.as_deref() == Some("express")
+                && factory_path == if p.dir.is_empty() { "lib/express.js".to_owned() } else { format!("{}/lib/express.js", p.dir) }
+        })?;
+        let local = self.view.text_str(b.name);
+        let overridden_member = format!("{local}.{method}");
+        if self
+            .view
+            .bindings_of(self.file)
+            .iter()
+            .any(|fact| fact.kind == BindKind::Mutation as u8 && [local, head, overridden_member.as_str()].contains(&self.view.text_str(fact.name)))
+        {
+            return None;
+        }
+        let application = if package.dir.is_empty() { "lib/application.js".to_owned() } else { format!("{}/lib/application.js", package.dir) };
+        let mixin = self.view.bindings_of(node.file()).iter().find_map(|fact| {
+            if fact.kind != BindKind::FactoryMixin as u8 || fact.node != factory {
+                return None;
+            }
+            match self.e.modules.resolve_import(self.view.file(node.file()).lang(), self.view.text_str(fact.decl_type), node.file()) {
+                ImportTarget::File(f) if self.view.file(f).path() == application => Some(f),
+                _ => None,
+            }
+        })?;
+        let facts = self.view.bindings_of(mixin);
+        // Only members actually assigned to the exported object qualify. A
+        // same-named method of another object in the module is not evidence.
+        let mut candidates = facts.iter().filter(|fact| {
+            if fact.kind != BindKind::MemberFn as u8 || fact.node.is_none() || self.view.text_str(fact.name) != method {
+                return false;
+            }
+            let object = self.view.text_str(fact.init_ctor);
+            !object.is_empty()
+                && facts.iter().any(|b| b.kind == BindKind::CommonJsObject as u8 && self.view.text_str(b.name) == object && b.line <= fact.line)
+                && !facts.iter().any(|b| b.kind == BindKind::Mutation as u8 && self.view.text_str(b.name) == object)
+                && facts.iter().filter(|b| b.kind == BindKind::Mutation as u8 && self.view.text_str(b.name) == "module.exports").count() == 1
+        });
+        let candidate = candidates.next()?.node;
+        candidates.next().is_none().then_some(candidate)
     }
 
     fn in_module(&self, wcx: &mut WorkerCx<'e, 'v>, tf: FileId, path: &[&str], method: &str) -> Outcome {
@@ -2116,15 +2305,30 @@ impl<'e, 'v> FileCx<'e, 'v> {
                         if !self.view.text_str(b.decl_type).is_empty() {
                             return Outcome::st(status::NO_CANDIDATE);
                         }
-                        // `const api = { run: impl }` at the top of this file: `api.run()` runs `impl`
-                        if self.family == LangFamily::Js && path.is_empty() && b.scope.0 == self.scope_base && Self::is_call(r) {
-                            if let Some(m) = self.e.lookup_top_level(self.file, root).and_then(|n| self.forward_alias_node(wcx, n, Some(method))) {
-                                return Outcome::found(m, by::LEXICAL, 90);
+                        if path.is_empty() {
+                            if let Some(member) = self.express_application_member(b, method) {
+                                return Outcome::found(member, by::FRAMEWORK, 90);
                             }
                         }
-                        // An initializer rooted in an explicit external import
-                        // does not justify guessing an unrelated project member.
+                        // `const api = { run: impl }` at the top of this file: `api.run()` runs `impl`
+                        if self.family == LangFamily::Js && path.is_empty() && b.scope.0 == self.scope_base {
+                            if let Some(n) = self.e.lookup_top_level(self.file, root) {
+                                if let Some(m) = self
+                                    .e
+                                    .direct_member(n, method)
+                                    .or_else(|| Self::is_call(r).then(|| self.forward_alias_node(wcx, n, Some(method))).flatten())
+                                {
+                                    return Outcome::found(m, by::LEXICAL, 90);
+                                }
+                            }
+                        }
                         let init = self.view.text_str(b.init_ctor);
+                        // Unknown satisfies operands and their aliases do not
+                        // justify guessing an unrelated project member.
+                        if self.blocks_member_fallback(wcx, b, 0) {
+                            return Outcome::st(status::LOCAL_BINDING);
+                        }
+                        // Neither does an initializer rooted in an external import.
                         let head = init.split(['.', ':', '(']).next().unwrap_or("");
                         if let Some(i) = self.visible_import(head, scope).filter(|_| self.lookup_binding(head, scope, r.line, false).is_none()) {
                             if self.e.bind_import(self.file, i as usize) == Bound::External {
@@ -2320,6 +2524,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
         // in a function given to an ES5 constructor's prototype, `this` is the constructor's object
         let t = self.enclosing_type(r.from).or_else(|| self.e.proto_owner.get(&r.from).copied().filter(|_| self.family == LangFamily::Js));
         let Some(t) = t else {
+            if self.family == LangFamily::Js && fields.is_empty() {
+                if let Some(n) = self.assigned_this_member(r, method) {
+                    return Outcome::found(n, by::RECEIVER, 90);
+                }
+            }
             return if fields.is_empty() { self.fallback_method(method) } else { Outcome::st(status::NO_CANDIDATE) };
         };
         let _ = kw;
@@ -2352,6 +2561,35 @@ impl<'e, 'v> FileCx<'e, 'v> {
             return Outcome::st(status::NO_CANDIDATE);
         }
         Outcome::st(status::NO_CANDIDATE)
+    }
+
+    fn assigned_this_member(&self, r: &RefRec, method: &str) -> Option<NodeIdx> {
+        let facts = self.view.bindings_of(self.file);
+        let call = facts.iter().find(|b| {
+            b.kind == BindKind::AssignedThisCall as u8
+                && b.node == r.from
+                && b.line == r.line
+                && self.view.text_str(b.name) == method
+                && self.view.text_str(b.init_ctor).parse::<u32>().ok() == Some(r.col)
+        })?;
+        let object = self.view.text_str(call.decl_type);
+        let from = facts.iter().find(|b| b.kind == BindKind::MemberFn as u8 && b.node == r.from && self.view.text_str(b.init_ctor) == object)?;
+        if facts.iter().any(|b| b.kind == BindKind::Mutation as u8 && self.view.text_str(b.name) == object) {
+            return None;
+        }
+        let property = format!("{object}.{method}");
+        if facts.iter().filter(|b| b.kind == BindKind::Mutation as u8 && self.view.text_str(b.name) == property).count() > 1 {
+            return None;
+        }
+        let mut targets = facts.iter().filter(|b| {
+            b.kind == BindKind::MemberFn as u8
+                && b.node.is_some()
+                && b.scope == from.scope
+                && self.view.text_str(b.name) == method
+                && self.view.text_str(b.init_ctor) == object
+        });
+        let node = targets.next()?.node;
+        targets.next().is_none().then_some(node)
     }
 
     fn call_super(&self, wcx: &mut WorkerCx<'e, 'v>, r: &RefRec, method: &str, args: Option<&CallArgs<'v>>) -> Outcome {
@@ -2792,8 +3030,26 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let normalized = normalize_call_name(self.family, name);
         let name = normalized.as_ref();
         let args = CallArgs::of(self.view, r);
-        if self.family != LangFamily::Rust || !name.contains("self") {
-            let o = self.call_name_with(wcx, r, name, args.as_ref());
+        let o = if self.family != LangFamily::Rust || !name.contains("self") {
+            self.call_name_with(wcx, r, name, args.as_ref())
+        } else {
+            // `self.state.lock()`: `self` is the type the calling method belongs to
+            let previous = wcx.self_ty.replace(self.enclosing_type(r.from).unwrap_or(NodeIdx(NONE)));
+            if wcx.self_ty == Some(NodeIdx(NONE)) {
+                wcx.self_ty = None;
+            }
+            let result = self.call_name_with(wcx, r, name, args.as_ref());
+            wcx.self_ty = previous;
+            result
+        };
+        if self.family == LangFamily::Js
+            && Self::is_call(r)
+            && o.status == status::RESOLVED
+            && matches!(kind_of(self.view, NodeIdx(o.target)), NodeKind::Interface | NodeKind::TypeAlias)
+        {
+            return Outcome::st(status::NO_CANDIDATE);
+        }
+        if self.family == LangFamily::Swift {
             let o = self.swift_call_target(o, name);
             let own = match parse_shape(name) {
                 Shape::Bare(_) => true,
@@ -2803,13 +3059,6 @@ impl<'e, 'v> FileCx<'e, 'v> {
             let o = if own { self.swift_nearest_sibling(o, r) } else { o };
             return self.swift_label_overload(o, args.as_ref());
         }
-        // `self.state.lock()`: `self` is the type the calling method belongs to
-        let previous = wcx.self_ty.replace(self.enclosing_type(r.from).unwrap_or(NodeIdx(NONE)));
-        if wcx.self_ty == Some(NodeIdx(NONE)) {
-            wcx.self_ty = None;
-        }
-        let o = self.call_name_with(wcx, r, name, args.as_ref());
-        wcx.self_ty = previous;
         o
     }
 
@@ -2831,6 +3080,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             Shape::Bare(n) if self.swift_extended_builtin(n, r) => Outcome::st(status::BUILTIN),
             Shape::Bare(n) => self.call_bare(wcx, r, n, Accept::Callable, args),
             Shape::Member { root, path, method } => self.call_member(wcx, r, root, &path, method, args),
+            Shape::This { kw, fields, method } if self.family == LangFamily::Js && kw != "this" => self.call_member(wcx, r, kw, &fields, method, args),
             Shape::This { kw, fields, method } => self.call_this(wcx, r, kw, &fields, method, args),
             Shape::Super { method } => self.call_super(wcx, r, method, args),
             Shape::New { class, method } => match self.lookup_type(wcx, class) {

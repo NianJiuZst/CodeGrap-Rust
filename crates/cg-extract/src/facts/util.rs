@@ -120,7 +120,18 @@ impl<'a> Cx<'a> {
                 if let Some(b) = self.facts.bindings.iter().rev().find(|b| {
                     b.scope == scope
                         && b.name == name
-                        && !matches!(b.kind, BindKind::MemberFn | BindKind::ReturnType | BindKind::Deref | BindKind::Fixture | BindKind::TypeAlias)
+                        && !matches!(
+                            b.kind,
+                            BindKind::MemberFn
+                                | BindKind::ReturnType
+                                | BindKind::Deref
+                                | BindKind::Fixture
+                                | BindKind::TypeAlias
+                                | BindKind::FactoryMixin
+                                | BindKind::Mutation
+                                | BindKind::CommonJsObject
+                                | BindKind::AssignedThisCall
+                        )
                 }) {
                     return Some((b.decl_type.clone(), b.init_ctor.clone()));
                 }

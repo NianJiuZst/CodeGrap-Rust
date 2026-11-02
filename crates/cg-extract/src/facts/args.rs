@@ -5,6 +5,7 @@
 //! * `T:<type>` - a literal, `new T(..)` or a cast: the static type as written
 //! * `V:<name>` - a local, parameter or field, typed at resolution from its binding
 //! * `F:<name>` - `this.<name>`: a field of the enclosing type
+//! * `C:<name>` - a call inside `satisfies`, typed from an unambiguous return annotation
 //! * `#this`    - `this`
 //! * `N`        - `null` / `undefined`
 //! * `L<k>`     - a lambda / function literal taking `k` parameters; `L` alone: a method
@@ -261,10 +262,14 @@ fn js_type(cx: &Cx, t: Node) -> String {
 }
 
 fn js_shape(cx: &Cx, a: Node) -> String {
+    js_shape_inner(cx, a, false)
+}
+
+fn js_shape_inner(cx: &Cx, a: Node, in_satisfies: bool) -> String {
     let typed = |t: &str| format!("T:{t}");
     match a.kind() {
         "string" | "template_string" => typed("string"),
-        "number" => typed("number"),
+        "number" => typed(if cx.text(a).ends_with('n') { "bigint" } else { "number" }),
         "true" | "false" => typed("boolean"),
         "null" | "undefined" => "N".into(),
         "this" => "#this".into(),
@@ -286,13 +291,20 @@ fn js_shape(cx: &Cx, a: Node) -> String {
             };
             lambda(n)
         }
-        "parenthesized_expression" | "non_null_expression" => a.named_child(0).map(|c| js_shape(cx, c)).unwrap_or_else(|| "?".into()),
-        "as_expression" | "satisfies_expression" => match a.named_child(1).map(|t| js_type(cx, t)) {
+        "parenthesized_expression" | "non_null_expression" => a.named_child(0).map(|c| js_shape_inner(cx, c, in_satisfies)).unwrap_or_else(|| "?".into()),
+        "satisfies_expression" => a.named_child(0).map(|c| js_shape_inner(cx, c, true)).unwrap_or_else(|| "?".into()),
+        "call_expression" if in_satisfies => match a.child_by_field_name("function") {
+            Some(f) if f.kind() == "identifier" => format!("C:{}", cx.text(f)),
+            _ => "?".into(),
+        },
+        "as_expression" => match a.named_child(1).map(|t| js_type(cx, t)) {
             Some(t) if !t.is_empty() => typed(&t),
             _ => "?".into(),
         },
         "unary_expression" => match a.child_by_field_name("argument") {
-            Some(o) if o.kind() == "number" && matches!(cx.text(a).as_bytes().first(), Some(b'-' | b'+')) => typed("number"),
+            Some(o) if o.kind() == "number" && matches!(cx.text(a).as_bytes().first(), Some(b'-' | b'+')) => {
+                typed(if cx.text(o).ends_with('n') { "bigint" } else { "number" })
+            }
             _ => "?".into(),
         },
         _ => "?".into(),
