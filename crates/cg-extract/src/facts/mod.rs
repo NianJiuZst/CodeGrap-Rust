@@ -131,6 +131,17 @@ pub enum BindKind {
     /// Rust `type X = Y;` outside an impl, keyed by the alias's node: `decl_type` is `Y`.
     /// Metadata only; not a lexical binding.
     TypeAlias = 10,
+    /// A JS factory returns an object it mixed with an imported module's members.
+    /// Metadata only; `decl_type` is the source module specifier.
+    FactoryMixin = 11,
+    /// A JavaScript name is assigned after declaration. Metadata only.
+    Mutation = 12,
+    /// A top-level JavaScript object is assigned to `module.exports` in its initializer.
+    /// Metadata only; `name` is the local object name.
+    CommonJsObject = 13,
+    /// A `this.member()` inside a function assigned to a named object property.
+    /// Metadata only; `decl_type` identifies that object and `init_ctor` the call column.
+    AssignedThisCall = 14,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

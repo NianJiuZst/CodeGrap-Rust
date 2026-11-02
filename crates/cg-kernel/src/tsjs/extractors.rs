@@ -1670,13 +1670,13 @@ impl<'t> Walker<'t> {
                     let recv_ident = receiver.filter(|r| {
                         matches!(r.kind(), "identifier" | "simple_identifier" | "field_identifier")
                     });
-                    if let Some(r) = recv_ident {
+                    if let Some(r) = receiver.filter(|r| matches!(r.kind(), "this" | "super")) {
+                        // Preserve the receiver: an unrelated bare function of the
+                        // same name cannot stand in for `this.m()` or `super.m()`.
+                        callee_name = format!("{}.{method_name}", self.text(r));
+                    } else if let Some(r) = recv_ident {
                         let receiver_name = self.text(r);
-                        if !matches!(receiver_name, "self" | "this" | "cls" | "super") {
-                            callee_name = format!("{receiver_name}.{method_name}");
-                        } else {
-                            callee_name = method_name.to_string();
-                        }
+                        callee_name = format!("{receiver_name}.{method_name}");
                     } else if receiver.is_some_and(|r| self.is_unresolved_member_chain(r)) {
                         // Retain the call site for effects without guessing a
                         // project method. Mirrors the TS extraction path.
@@ -1715,10 +1715,9 @@ impl<'t> Walker<'t> {
                         };
                         // `new this.constructor().copy(this)`, a static
                         // `new this().init()`: an instance of the enclosing
-                        // class keeps the bare method name, as a call on
-                        // `this` does.
+                        // class keeps the enclosing receiver.
                         callee_name = if ctor == "this" || ctor == "this.constructor" {
-                            method_name.to_string()
+                            format!("this.{method_name}")
                         } else {
                             format!("new {ctor}().{method_name}")
                         };
