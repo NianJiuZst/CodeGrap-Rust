@@ -533,6 +533,46 @@ fn up_to_date_tree_writes_nothing() {
 }
 
 #[test]
+fn typescript_satisfies_receiver_edits_match_full_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "service.ts", "export interface Runner { run(): void }\nexport class First { run() {} }\nexport class Second { run() {} }\n", 0);
+    // Enough independent files and references to exercise a delta rather than
+    // the small-project or affected-reference full-rebuild fallback.
+    for i in 0..40 {
+        write(root, &format!("filler{i}.ts"), &format!("export function filler{i}() {{ helper{i}(); }}\nfunction helper{i}() {{}}\n"), 0);
+    }
+    for (step, (expression, target)) in [
+        ("new First() satisfies Runner", "First"),
+        ("new Second() satisfies Runner", "Second"),
+        ("(new First() as Runner) satisfies object", "Runner"),
+        ("new First() satisfies Runner", "First"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        write(
+            root,
+            "app.ts",
+            &format!(
+                "import {{ Runner, First, Second }} from './service';\nexport function main() {{\n    const service = {expression};\n    service.run();\n}}\n"
+            ),
+            step as u64 + 1,
+        );
+        if step == 0 {
+            index_project(root, &opts()).unwrap();
+        } else {
+            let report = sync(root, &SyncOptions { index: opts(), ..Default::default() }).unwrap();
+            assert!(report.full_rebuild.is_none(), "must exercise incremental resolution: {report:?}");
+        }
+        let snap = Store::at(root).open_snapshot().unwrap();
+        let calls: Vec<_> = dump::dump_edges(&snap.view).into_iter().filter(|edge| edge.starts_with("app.ts::main -calls-> ")).collect();
+        assert_eq!(calls, vec![format!("app.ts::main -calls-> service.ts::{target}::run")]);
+        assert_eq!(canonical_of(root), full_canonical(root), "{expression}");
+    }
+}
+
+#[test]
 fn compaction_preserves_live_graph_and_future_sync_without_source_access() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

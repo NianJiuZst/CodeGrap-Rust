@@ -9,6 +9,9 @@ pub struct Cx<'a> {
     pub rows: FileRows<'a>,
     pub facts: Facts,
     pub parse_timeout: std::time::Duration,
+    /// Rust: the type parameters in scope, innermost last: (name, bounds written as
+    /// `impl A + B`, or `_` for none).
+    pub generics: Vec<Vec<(String, String)>>,
     line_starts: Vec<u32>,
     row_by_start: Option<rustc_hash::FxHashMap<u64, u32>>,
     /// Last (row, byte, UTF-16 column) computed: positions are asked in source order, and on
@@ -26,6 +29,7 @@ impl<'a> Cx<'a> {
             rows,
             facts,
             parse_timeout: std::time::Duration::from_secs(5),
+            generics: Vec::new(),
             line_starts,
             row_by_start: None,
             last_pos: std::cell::Cell::new((usize::MAX, 0, 0)),
@@ -113,13 +117,22 @@ impl<'a> Cx<'a> {
     pub fn lookup_binding(&self, mut scope: u32, name: &str) -> Option<(String, String)> {
         loop {
             if self.facts.scopes[scope as usize].kind != ScopeKind::Class {
-                if let Some(b) = self
-                    .facts
-                    .bindings
-                    .iter()
-                    .rev()
-                    .find(|b| b.scope == scope && b.name == name && !matches!(b.kind, BindKind::MemberFn | BindKind::ReturnType))
-                {
+                if let Some(b) = self.facts.bindings.iter().rev().find(|b| {
+                    b.scope == scope
+                        && b.name == name
+                        && !matches!(
+                            b.kind,
+                            BindKind::MemberFn
+                                | BindKind::ReturnType
+                                | BindKind::Deref
+                                | BindKind::Fixture
+                                | BindKind::TypeAlias
+                                | BindKind::FactoryMixin
+                                | BindKind::Mutation
+                                | BindKind::CommonJsObject
+                                | BindKind::AssignedThisCall
+                        )
+                }) {
                     return Some((b.decl_type.clone(), b.init_ctor.clone()));
                 }
             }

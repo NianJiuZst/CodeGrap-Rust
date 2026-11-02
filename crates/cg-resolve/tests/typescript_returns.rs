@@ -131,3 +131,71 @@ export function useMissing() { const a = missing(); a.unique(); }
     assert!(!graph.contains(&"app.ts::outer -calls-> app.ts::A::run".to_owned()), "{graph:#?}");
     assert!(!graph.contains(&"app.ts::useMissing -calls-> unrelated.ts::Missing::unique".to_owned()), "{graph:#?}");
 }
+
+#[test]
+fn imported_return_annotations_use_the_type_namespace() {
+    let graph = edges(&[
+        (
+            "types.ts",
+            "export interface Result { run(): void; }\nexport class Wrong { run() {} }\nexport function Result(): Wrong { return new Wrong(); }\n",
+        ),
+        ("barrel.ts", "export { Result as Renamed } from './types';\n"),
+        (
+            "factory.ts",
+            "import { Renamed as ReturnType } from './barrel';\nimport * as types from './barrel';\nexport function named(): ReturnType { throw 0; }\nexport function qualified(): types.Renamed { throw 0; }\n",
+        ),
+        (
+            "app.ts",
+            "import { named, qualified } from './factory';\nimport { Renamed } from './barrel';\nexport function fromNamed() { const value = named(); value.run(); }\nexport function fromQualified() { const value = qualified(); value.run(); }\nexport function fromValue() { const value = Renamed(); value.run(); }\n",
+        ),
+    ]);
+    for (caller, target) in [("fromNamed", "Result"), ("fromQualified", "Result"), ("fromValue", "Wrong")] {
+        let prefix = format!("app.ts::{caller} -calls-> ");
+        let targets: Vec<_> = graph.iter().filter(|edge| edge.starts_with(&prefix) && edge.ends_with("::run")).collect();
+        let expected = format!("{prefix}types.ts::{target}::run");
+        assert_eq!(targets, vec![&expected], "{caller}: {graph:#?}");
+    }
+}
+
+#[test]
+fn function_body_types_do_not_shadow_return_annotations() {
+    for declaration in ["class Result { run() {} }", "interface Result { run(): void }", "type Result = { run(): void };"] {
+        // Each body declares the same name as its return annotation, but body
+        // declarations are not visible in the function's signature.
+        let factories = format!(
+            r#"function make(): Result {{ {declaration} throw 0; }}
+const arrow = (): Result => {{ {declaration} throw 0; }};
+const expression = function (): Result {{ {declaration} throw 0; }};
+class Factory {{ make(): Result {{ {declaration} throw 0; }} }}
+function fromNamed() {{ const value = make(); value.run(); }}
+function fromArrow() {{ const value = arrow(); value.run(); }}
+function fromExpression() {{ const value = expression(); value.run(); }}
+function fromMethod() {{ const factory = new Factory(); const value = factory.make(); value.run(); }}
+"#
+        );
+        let nested_factories = factories.replace("Factory", "NestedFactory");
+        let source = format!(
+            r#"import {{ A as Result }} from './types';
+{factories}
+export function outer() {{
+  class Result {{ run() {{}} }}
+  {nested_factories}
+}}
+"#
+        );
+        let graph = edges(&[
+            // Two project methods ensure a missing return type cannot pass
+            // through a unique-member fallback.
+            ("types.ts", "export class A { run() {} }\nexport class B { run() {} }\n"),
+            ("app.ts", &source),
+        ]);
+        for (scope, target) in [("", "types.ts::A::run"), ("outer::", "app.ts::outer::Result::run")] {
+            for caller in ["fromNamed", "fromArrow", "fromExpression", "fromMethod"] {
+                let prefix = format!("app.ts::{scope}{caller} -calls-> ");
+                let calls: Vec<_> = graph.iter().filter(|edge| edge.starts_with(&prefix) && edge.ends_with("::run")).collect();
+                let expected = format!("{prefix}{target}");
+                assert_eq!(calls, vec![&expected], "{declaration}, {scope}{caller}: {graph:#?}");
+            }
+        }
+    }
+}

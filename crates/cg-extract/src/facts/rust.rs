@@ -106,10 +106,41 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
         "function_item" | "function_signature_item" => function(cx, n, scope),
         "closure_expression" => closure(cx, n, scope),
         "impl_item" | "trait_item" => {
+            let generics = generics_of(cx, n);
+            cx.generics.push(generics);
             let sc = cx.push_scope(ScopeKind::Class, scope, n);
+            if n.kind() == "impl_item" {
+                deref_impl(cx, n, scope);
+            }
             walk_children(cx, n, sc);
+            cx.generics.pop();
         }
-        "struct_item" => struct_item(cx, n, scope),
+        "type_item" if cx.facts.scopes[scope as usize].kind != ScopeKind::Class => {
+            // `type Outcome = plugin::Outcome<Config>`: a type whose members are the target's
+            let generics = generics_of(cx, n);
+            cx.generics.push(generics);
+            let target = n.child_by_field_name("type").map(|t| subst_generics(cx, &rust_type_name(cx, t))).unwrap_or_default();
+            cx.generics.pop();
+            if let (Some(name), Some(row), false) = (n.child_by_field_name("name"), cx.row_at(cx.start(n)), target.is_empty()) {
+                let name = cx.text(name).to_owned();
+                let line = cx.line(n);
+                cx.facts.bindings.push(BindingFact {
+                    scope,
+                    name,
+                    kind: BindKind::TypeAlias,
+                    decl_type: target,
+                    init_ctor: String::new(),
+                    line,
+                    node_row: row,
+                });
+            }
+        }
+        "struct_item" => {
+            let generics = generics_of(cx, n);
+            cx.generics.push(generics);
+            struct_item(cx, n, scope);
+            cx.generics.pop();
+        }
         "let_declaration" => {
             let_decl(cx, n, scope);
             walk_children(cx, n, scope);
@@ -158,6 +189,120 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
             walk_children(cx, n, scope);
         }
         _ => walk_children(cx, n, scope),
+    }
+}
+
+/// Bounds that add nothing a call goes through.
+const MARKER_TRAITS: &[&str] =
+    &["Clone", "Copy", "Send", "Sync", "Sized", "Debug", "Default", "Eq", "PartialEq", "Hash", "Ord", "PartialOrd", "Display", "Unpin", "Any"];
+
+/// The traits a `trait_bounds` node names, marker traits and lifetimes left out.
+fn bound_names(cx: &Cx, b: Node) -> Vec<String> {
+    kids(b)
+        .filter_map(|c| match c.kind() {
+            "type_identifier" | "scoped_type_identifier" => Some(cx.text(c)),
+            "generic_type" => c.child_by_field_name("type").map(|t| cx.text(t)),
+            _ => None,
+        })
+        .filter(|b| !MARKER_TRAITS.contains(&b.rsplit("::").next().unwrap_or(b)))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The type parameters a declaration introduces, with the bounds of its parameter list and its
+/// `where` clause: `T: Svc + Clone` -> (`T`, `impl Svc`), an unbounded `U` -> (`U`, `_`).
+fn generics_of(cx: &Cx, n: Node) -> Vec<(String, String)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(tp) = n.child_by_field_name("type_parameters") {
+        for p in kids(tp).filter(|c| c.kind() == "type_parameter") {
+            let Some(name) = p.child_by_field_name("name") else { continue };
+            let bounds = p.child_by_field_name("bounds").map(|b| bound_names(cx, b)).unwrap_or_default();
+            out.push((cx.text(name).to_owned(), bounds));
+        }
+    }
+    for w in kids(n).filter(|c| c.kind() == "where_clause") {
+        for pred in kids(w).filter(|c| c.kind() == "where_predicate") {
+            let (Some(left), Some(b)) = (pred.child_by_field_name("left"), pred.child_by_field_name("bounds")) else { continue };
+            if left.kind() != "type_identifier" {
+                continue;
+            }
+            let name = cx.text(left);
+            match out.iter_mut().find(|(n, _)| n == name) {
+                Some(entry) => entry.1.extend(bound_names(cx, b)),
+                // a bound on a parameter of the enclosing impl
+                None => {
+                    let outer = cx.generics.iter().rev().find_map(|g| g.iter().find(|(n, _)| n == name)).is_some();
+                    if outer {
+                        out.push((name.to_owned(), bound_names(cx, b)));
+                    }
+                }
+            }
+        }
+    }
+    out.into_iter().map(|(n, b)| (n, if b.is_empty() { "_".to_owned() } else { format!("impl {}", b.join(" + ")) })).collect()
+}
+
+/// A written type with the type parameters in scope replaced by their bounds: `Arc<T>` with
+/// `T: Svc` is `Arc<impl Svc>`; a parameter with no bound is `_`, which names no type.
+fn subst_generics(cx: &Cx, ty: &str) -> String {
+    if cx.generics.iter().all(Vec::is_empty) || ty.is_empty() {
+        return ty.to_owned();
+    }
+    let lookup = |w: &str| cx.generics.iter().rev().find_map(|g| g.iter().find(|(n, _)| n == w).map(|(_, b)| b.clone()));
+    let b = ty.as_bytes();
+    let mut out = String::with_capacity(ty.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = &ty[start..i];
+            // a path segment (`T::Output`, `a::T`) is no parameter
+            let in_path = ty[..start].ends_with("::") || ty[i..].starts_with("::") || ty[..start].ends_with('\'');
+            match lookup(word).filter(|_| !in_path) {
+                Some(bound) => out.push_str(&bound),
+                None => out.push_str(word),
+            }
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `impl Deref for Wrapper { type Target = Inner; }`: method calls on a `Wrapper` reach `Inner`.
+fn deref_impl(cx: &mut Cx, n: Node, scope: u32) {
+    let deref = n.child_by_field_name("trait").map(|t| cx.text(t)).is_some_and(|t| t == "Deref" || t.ends_with("::Deref"));
+    let (Some(ty), Some(body)) = (n.child_by_field_name("type"), n.child_by_field_name("body")) else { return };
+    if !deref {
+        return;
+    }
+    let owner = match ty.kind() {
+        "generic_type" => ty.child_by_field_name("type").map(|t| cx.text(t)).unwrap_or(""),
+        _ => cx.text(ty),
+    }
+    .to_owned();
+    for item in kids(body).filter(|c| c.kind() == "type_item") {
+        if item.child_by_field_name("name").map(|nm| cx.text(nm)) != Some("Target") {
+            continue;
+        }
+        let Some(target) = item.child_by_field_name("type") else { continue };
+        let target = subst_generics(cx, &rust_type_name(cx, target));
+        if !owner.is_empty() && !target.is_empty() {
+            let line = cx.line(n);
+            cx.facts.bindings.push(BindingFact {
+                scope,
+                name: owner.clone(),
+                kind: BindKind::Deref,
+                decl_type: target,
+                init_ctor: String::new(),
+                line,
+                node_row: NONE,
+            });
+        }
     }
 }
 
@@ -239,7 +384,7 @@ fn value_path(cx: &Cx, v: Node, depth: u8) -> String {
 
 fn let_decl(cx: &mut Cx, n: Node, scope: u32) {
     let Some(p) = n.child_by_field_name("pattern") else { return };
-    let ty = n.child_by_field_name("type").map(|t| rust_type_name(cx, t)).unwrap_or_default();
+    let ty = n.child_by_field_name("type").map(|t| subst_generics(cx, &rust_type_name(cx, t))).unwrap_or_default();
     let init = n.child_by_field_name("value").map(|v| value_info(cx, v)).unwrap_or_default();
     let line = cx.line(n);
     let target = if p.kind() == "mut_pattern" { p.named_child(0).unwrap_or(p) } else { p };
@@ -259,7 +404,7 @@ fn params(cx: &mut Cx, list: Node, sc: u32) {
                 cx.add_binding(sc, "self", BindKind::Param, "Self", "", line);
             }
             "parameter" => {
-                let ty = p.child_by_field_name("type").map(|t| rust_type_name(cx, t)).unwrap_or_default();
+                let ty = p.child_by_field_name("type").map(|t| subst_generics(cx, &rust_type_name(cx, t))).unwrap_or_default();
                 if let Some(pat) = p.child_by_field_name("pattern") {
                     let target = if pat.kind() == "mut_pattern" { pat.named_child(0).unwrap_or(pat) } else { pat };
                     if target.kind() == "identifier" {
@@ -282,13 +427,21 @@ fn params(cx: &mut Cx, list: Node, sc: u32) {
 }
 
 fn function(cx: &mut Cx, n: Node, scope: u32) {
+    let generics = generics_of(cx, n);
+    cx.generics.push(generics);
+    function_body(cx, n, scope);
+    cx.generics.pop();
+}
+
+fn function_body(cx: &mut Cx, n: Node, scope: u32) {
     if let (Some(name), Some(ret)) = (n.child_by_field_name("name"), n.child_by_field_name("return_type")) {
         if let Some(row) = cx.row_at(cx.start(n)) {
+            let decl_type = subst_generics(cx, cx.text(ret));
             cx.facts.bindings.push(BindingFact {
                 scope,
                 name: cx.text(name).to_owned(),
                 kind: BindKind::ReturnType,
-                decl_type: cx.text(ret).to_owned(),
+                decl_type,
                 init_ctor: String::new(),
                 line: cx.line(n),
                 node_row: row,
@@ -327,7 +480,7 @@ fn struct_item(cx: &mut Cx, n: Node, scope: u32) {
     let Some(body) = n.child_by_field_name("body") else { return };
     for f in kids(body) {
         if f.kind() == "field_declaration" {
-            let ty = f.child_by_field_name("type").map(|t| rust_type_name(cx, t)).unwrap_or_default();
+            let ty = f.child_by_field_name("type").map(|t| subst_generics(cx, &rust_type_name(cx, t))).unwrap_or_default();
             if let Some(nm) = f.child_by_field_name("name") {
                 let t = cx.text(nm).to_owned();
                 let line = cx.line(f);

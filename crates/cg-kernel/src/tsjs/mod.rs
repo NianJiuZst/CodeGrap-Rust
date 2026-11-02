@@ -11,6 +11,7 @@
 
 mod extractors;
 mod fnref;
+mod variance;
 use crate::textutil as util;
 
 use crate::buffers::{
@@ -232,7 +233,11 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
     parser
         .set_language(&grammar)
         .map_err(|e| format!("set_language({language}) failed: {e}"))?;
-    let tree = crate::hooks::parse(&mut parser, source)
+    let tree = if matches!(language, "typescript" | "tsx") {
+        crate::hooks::parse_with_rewrite(&mut parser, source, variance::mask)
+    } else {
+        crate::hooks::parse(&mut parser, source)
+    }
         .ok_or_else(|| "parser returned null tree".to_string())?;
 
     // Files with parse ERRORS defer to the wasm extractor (the `defer:` prefix

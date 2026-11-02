@@ -217,13 +217,29 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
     if let Some(body) = n.child_by_field_name("body") {
         walk(cx, body, sc);
         if let (Some(row), Some(name)) = (row, n.child_by_field_name("name")) {
+            let fixture = n
+                .parent()
+                .filter(|p| p.kind() == "decorated_definition")
+                .is_some_and(|p| kids(p).any(|d| d.kind() == "decorator" && cx.text(d).contains("fixture")));
             let (decl_type, init_ctor) = if let Some(ret) = n.child_by_field_name("return_type") {
                 let raw = cx.text(ret);
                 let ty = py_type_name(raw);
                 (if ty.is_empty() { raw.to_owned() } else { ty }, String::new())
             } else {
-                inferred_return(cx, n, body).unwrap_or_default()
+                inferred_return(cx, n, body, fixture).unwrap_or_default()
             };
+            if fixture {
+                // pytest hands a test what the fixture returns: the decorator changes nothing there
+                cx.facts.bindings.push(BindingFact {
+                    scope,
+                    name: cx.text(name).to_owned(),
+                    kind: BindKind::Fixture,
+                    decl_type: decl_type.clone(),
+                    init_ctor: init_ctor.clone(),
+                    line: cx.line(n),
+                    node_row: row,
+                });
+            }
             if !decl_type.is_empty() || !init_ctor.is_empty() {
                 cx.facts.bindings.push(BindingFact {
                     scope: sc,
@@ -242,11 +258,12 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
     }
 }
 
-/// Infer only a uniform, explicit return expression. A final return rules out
-/// implicit None; nested definitions, generators and arbitrary decorators must
-/// not supply evidence for the enclosing function.
-fn inferred_return(cx: &Cx, function: Node, body: Node) -> Option<(String, String)> {
-    if kids(function).any(|n| n.kind() == "async") || function.parent().is_some_and(|p| p.kind() == "decorated_definition") {
+/// Infer only explicit return expressions, each a call. A final return rules out implicit
+/// None; nested definitions, generators and arbitrary decorators must not supply evidence for
+/// the enclosing function. Different calls in different branches (`return A()` / `return B()`)
+/// are kept as `A()|B()`, for the resolver to type by their common base class.
+fn inferred_return(cx: &Cx, function: Node, body: Node, fixture: bool) -> Option<(String, String)> {
+    if kids(function).any(|n| n.kind() == "async") || (!fixture && function.parent().is_some_and(|p| p.kind() == "decorated_definition")) {
         return None;
     }
     if kids(body).filter(|n| n.kind() != "comment").last()?.kind() != "return_statement" {
@@ -271,10 +288,15 @@ fn inferred_return(cx: &Cx, function: Node, body: Node) -> Option<(String, Strin
                     }
                     _ => return None,
                 };
-                if result.as_ref().is_some_and(|previous| *previous != inferred) {
-                    return None;
+                match result.as_mut() {
+                    Some((_, previous)) if previous.split('|').any(|p| *p == inferred.1) => {}
+                    Some((_, previous)) if previous.split('|').count() < 4 => {
+                        previous.push('|');
+                        previous.push_str(&inferred.1);
+                    }
+                    Some(_) => return None,
+                    None => *result = Some(inferred),
                 }
-                *result = Some(inferred);
                 return Some(());
             }
             _ => {}

@@ -17,6 +17,11 @@ pub fn hooks(project: &ProjectInfo) -> Vec<Arc<dyn FileHook>> {
     let mut v: Vec<Arc<dyn FileHook>> = vec![
         Arc::new(crate::synth::sites::SiteScanner),
         Arc::new(crate::synth::sites::GoTypeSites),
+        Arc::new(crate::synth::gin::GinScanner),
+        Arc::new(crate::synth::js_proto::InheritScanner),
+        Arc::new(crate::synth::redux::ThunkScanner),
+        Arc::new(crate::synth::jvm::TestRequestScanner),
+        Arc::new(crate::synth::bridges::BridgeScanner),
         Arc::new(crate::synth::dynamic::CallbackScanner),
         Arc::new(crate::synth::dynamic::RegistryScanner),
         Arc::new(crate::synth::dynamic::TierScanner),

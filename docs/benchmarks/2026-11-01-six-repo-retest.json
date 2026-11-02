@@ -1,0 +1,1605 @@
+{
+  "cgr_commit": "edb403e75c2c4d44f25ac0c6be2b59a7109537a1",
+  "upstream_commit": "d2e0389b519be398f9bc616b6f7bea8a7edfbc6a",
+  "index_interval_seconds": 30,
+  "method": "strict unique (source stable ID,target stable ID,kind,line,UTF-16 column); NULL distinct; all edges retained; upstream is a reference, not truth",
+  "repositories": {
+    "express": {
+      "repo": "expressjs/express",
+      "commit": "1c6f1b0fe4000977b9a7b4f34097e4d527dd9824",
+      "files": 142,
+      "index": {
+        "upstream": {
+          "samples_ms": [
+            534.7689580000008,
+            536.2367079999899,
+            540.0274999999795
+          ],
+          "median_ms": 536.2367079999899,
+          "median_peak_rss_mib": 225.578125,
+          "samples": [
+            {
+              "wallMs": 534.7689580000008,
+              "peakRssMiB": 225.65625,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:24:48.219992+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 536.2367079999899,
+              "peakRssMiB": 225.578125,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:26:19.099175+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 540.0274999999795,
+              "peakRssMiB": 224.25,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:26:49.670227+00:00",
+              "exit": 0
+            }
+          ]
+        },
+        "rust": {
+          "samples_ms": [
+            135.99691699999994,
+            130.8501670000055,
+            143.69133400001033
+          ],
+          "median_ms": 135.99691699999994,
+          "median_peak_rss_mib": 48.921875,
+          "samples": [
+            {
+              "wallMs": 135.99691699999994,
+              "peakRssMiB": 48.921875,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:25:18.379940+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 130.8501670000055,
+              "peakRssMiB": 48.515625,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:25:48.535241+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 143.69133400001033,
+              "peakRssMiB": 50.125,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:27:19.840774+00:00",
+              "exit": 0
+            }
+          ]
+        }
+      },
+      "strict": {
+        "cgr": 3509,
+        "oracle": 2334,
+        "intersection": 2062,
+        "cgrOnly": 1447,
+        "oracleOnly": 272,
+        "precision": 0.5876318039327444,
+        "recall": 0.8834618680377035,
+        "f1": 0.7058018141365737,
+        "jaccard": 0.5453583708013753
+      },
+      "calls": {
+        "cgr": 2227,
+        "oracle": 1280,
+        "intersection": 1097,
+        "cgrOnly": 1130,
+        "oracleOnly": 183,
+        "precision": 0.49259092950157163,
+        "recall": 0.85703125,
+        "f1": 0.6256059309951526,
+        "jaccard": 0.45518672199170124
+      },
+      "errors": [],
+      "sourceDigests": {
+        "rust": "c39abc479d71163b943ac64b92be04fe71520805fc8e0ffe6948d61d11e61603",
+        "upstream": "c39abc479d71163b943ac64b92be04fe71520805fc8e0ffe6948d61d11e61603"
+      },
+      "graphCounts": {
+        "rust": {
+          "nodeRows": 1145,
+          "uniqueStableIds": 1145,
+          "routeNodes": 279,
+          "edgeRows": 3509,
+          "uniqueEdges": 3509,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": []
+        },
+        "upstream": {
+          "nodeRows": 1143,
+          "uniqueStableIds": 1143,
+          "routeNodes": 277,
+          "edgeRows": 2334,
+          "uniqueEdges": 2334,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": []
+        }
+      },
+      "byKind": {
+        "calls": {
+          "cgr": 2227,
+          "oracle": 1280,
+          "intersection": 1097,
+          "cgrOnly": 1130,
+          "oracleOnly": 183,
+          "precision": 0.49259092950157163,
+          "recall": 0.85703125,
+          "f1": 0.6256059309951526,
+          "jaccard": 0.45518672199170124
+        },
+        "contains": {
+          "cgr": 1003,
+          "oracle": 724,
+          "intersection": 724,
+          "cgrOnly": 279,
+          "oracleOnly": 0,
+          "precision": 0.7218344965104686,
+          "recall": 1.0,
+          "f1": 0.8384481760277939,
+          "jaccard": 0.7218344965104686
+        },
+        "imports": {
+          "cgr": 143,
+          "oracle": 154,
+          "intersection": 143,
+          "cgrOnly": 0,
+          "oracleOnly": 11,
+          "precision": 1.0,
+          "recall": 0.9285714285714286,
+          "f1": 0.962962962962963,
+          "jaccard": 0.9285714285714286
+        },
+        "instantiates": {
+          "cgr": 23,
+          "oracle": 84,
+          "intersection": 23,
+          "cgrOnly": 0,
+          "oracleOnly": 61,
+          "precision": 1.0,
+          "recall": 0.27380952380952384,
+          "f1": 0.4299065420560748,
+          "jaccard": 0.27380952380952384
+        },
+        "references": {
+          "cgr": 113,
+          "oracle": 92,
+          "intersection": 75,
+          "cgrOnly": 38,
+          "oracleOnly": 17,
+          "precision": 0.6637168141592921,
+          "recall": 0.8152173913043478,
+          "f1": 0.7317073170731707,
+          "jaccard": 0.5769230769230769
+        }
+      },
+      "bySourceLanguage": {
+        "javascript": {
+          "cgr": 3509,
+          "oracle": 2334,
+          "intersection": 2062,
+          "cgrOnly": 1447,
+          "oracleOnly": 272,
+          "precision": 0.5876318039327444,
+          "recall": 0.8834618680377035,
+          "f1": 0.7058018141365737,
+          "jaccard": 0.5453583708013753
+        }
+      },
+      "differenceBuckets": {
+        "rust": {
+          "containment_topology": 277,
+          "resolution_or_synthesis_needs_review": 1156,
+          "edge_location_difference": 12,
+          "framework_route_coverage": 2
+        },
+        "upstream": {
+          "resolution_or_synthesis_needs_review": 230,
+          "edge_location_difference": 42
+        }
+      },
+      "designGate": {
+        "minimumPrecision": 0.97,
+        "minimumRecall": 0.95,
+        "passed": false
+      }
+    },
+    "gin": {
+      "repo": "gin-gonic/gin",
+      "commit": "0f09c3a9b4626d9fe9979cf4d0521d6ae32ab646",
+      "files": 99,
+      "index": {
+        "upstream": {
+          "samples_ms": [
+            625.6462910000025,
+            620.8257080000124,
+            617.685707999982
+          ],
+          "median_ms": 620.8257080000124,
+          "median_peak_rss_mib": 246.859375,
+          "samples": [
+            {
+              "wallMs": 625.6462910000025,
+              "peakRssMiB": 247.5625,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:28:51.486890+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 620.8257080000124,
+              "peakRssMiB": 246.859375,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:30:22.469964+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 617.685707999982,
+              "peakRssMiB": 243.765625,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:30:53.118826+00:00",
+              "exit": 0
+            }
+          ]
+        },
+        "rust": {
+          "samples_ms": [
+            130.45850000000314,
+            141.04370900000163,
+            124.39162499998702
+          ],
+          "median_ms": 130.45850000000314,
+          "median_peak_rss_mib": 37.0,
+          "samples": [
+            {
+              "wallMs": 130.45850000000314,
+              "peakRssMiB": 37.0,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:29:21.647492+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 141.04370900000163,
+              "peakRssMiB": 37.21875,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:29:51.821387+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 124.39162499998702,
+              "peakRssMiB": 36.828125,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:31:23.269423+00:00",
+              "exit": 0
+            }
+          ]
+        }
+      },
+      "strict": {
+        "cgr": 8328,
+        "oracle": 8073,
+        "intersection": 7793,
+        "cgrOnly": 535,
+        "oracleOnly": 280,
+        "precision": 0.9357588856868396,
+        "recall": 0.9653164870556175,
+        "f1": 0.9503079080543869,
+        "jaccard": 0.9053206319702602
+      },
+      "calls": {
+        "cgr": 3592,
+        "oracle": 3807,
+        "intersection": 3583,
+        "cgrOnly": 9,
+        "oracleOnly": 224,
+        "precision": 0.9974944320712695,
+        "recall": 0.9411610191752036,
+        "f1": 0.9685092580078389,
+        "jaccard": 0.9389412997903563
+      },
+      "errors": [],
+      "sourceDigests": {
+        "rust": "62fea02b516804db33f5a7ed817a55b306d40d485847dcaeef87987ad8566b09",
+        "upstream": "62fea02b516804db33f5a7ed817a55b306d40d485847dcaeef87987ad8566b09"
+      },
+      "graphCounts": {
+        "rust": {
+          "nodeRows": 2677,
+          "uniqueStableIds": 2677,
+          "routeNodes": 241,
+          "edgeRows": 8328,
+          "uniqueEdges": 8328,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": []
+        },
+        "upstream": {
+          "nodeRows": 2667,
+          "uniqueStableIds": 2667,
+          "routeNodes": 231,
+          "edgeRows": 8073,
+          "uniqueEdges": 8073,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": []
+        }
+      },
+      "byKind": {
+        "calls": {
+          "cgr": 3592,
+          "oracle": 3807,
+          "intersection": 3583,
+          "cgrOnly": 9,
+          "oracleOnly": 224,
+          "precision": 0.9974944320712695,
+          "recall": 0.9411610191752036,
+          "f1": 0.9685092580078389,
+          "jaccard": 0.9389412997903563
+        },
+        "contains": {
+          "cgr": 2972,
+          "oracle": 2767,
+          "intersection": 2731,
+          "cgrOnly": 241,
+          "oracleOnly": 36,
+          "precision": 0.9189098250336474,
+          "recall": 0.9869895193350199,
+          "f1": 0.9517337515246559,
+          "jaccard": 0.9079122340425532
+        },
+        "extends": {
+          "cgr": 13,
+          "oracle": 11,
+          "intersection": 11,
+          "cgrOnly": 2,
+          "oracleOnly": 0,
+          "precision": 0.8461538461538461,
+          "recall": 1.0,
+          "f1": 0.9166666666666666,
+          "jaccard": 0.8461538461538461
+        },
+        "implements": {
+          "cgr": 95,
+          "oracle": 93,
+          "intersection": 92,
+          "cgrOnly": 3,
+          "oracleOnly": 1,
+          "precision": 0.968421052631579,
+          "recall": 0.989247311827957,
+          "f1": 0.9787234042553192,
+          "jaccard": 0.9583333333333334
+        },
+        "imports": {
+          "cgr": 31,
+          "oracle": 0,
+          "intersection": 0,
+          "cgrOnly": 31,
+          "oracleOnly": 0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "jaccard": 0.0
+        },
+        "instantiates": {
+          "cgr": 833,
+          "oracle": 833,
+          "intersection": 833,
+          "cgrOnly": 0,
+          "oracleOnly": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "jaccard": 1.0
+        },
+        "references": {
+          "cgr": 792,
+          "oracle": 562,
+          "intersection": 543,
+          "cgrOnly": 249,
+          "oracleOnly": 19,
+          "precision": 0.6856060606060606,
+          "recall": 0.9661921708185054,
+          "f1": 0.8020679468242246,
+          "jaccard": 0.6695437731196054
+        }
+      },
+      "bySourceLanguage": {
+        "go": {
+          "cgr": 8328,
+          "oracle": 8073,
+          "intersection": 7793,
+          "cgrOnly": 535,
+          "oracleOnly": 280,
+          "precision": 0.9357588856868396,
+          "recall": 0.9653164870556175,
+          "f1": 0.9503079080543869,
+          "jaccard": 0.9053206319702602
+        }
+      },
+      "differenceBuckets": {
+        "rust": {
+          "resolution_or_synthesis_needs_review": 278,
+          "containment_topology": 231,
+          "framework_route_coverage": 10,
+          "edge_location_difference": 16
+        },
+        "upstream": {
+          "edge_location_difference": 20,
+          "resolution_or_synthesis_needs_review": 224,
+          "containment_topology": 36
+        }
+      },
+      "designGate": {
+        "minimumPrecision": 0.97,
+        "minimumRecall": 0.95,
+        "passed": false
+      }
+    },
+    "tokio": {
+      "repo": "tokio-rs/tokio",
+      "commit": "b499257ef62bd631b83a988d371f4330f545670c",
+      "files": 814,
+      "index": {
+        "upstream": {
+          "samples_ms": [
+            2590.529375000003,
+            2592.165625000007,
+            2620.6055829999855
+          ],
+          "median_ms": 2592.165625000007,
+          "median_peak_rss_mib": 733.625,
+          "samples": [
+            {
+              "wallMs": 2590.529375000003,
+              "peakRssMiB": 733.625,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:32:59.224811+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 2592.165625000007,
+              "peakRssMiB": 746.359375,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:34:33.033807+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 2620.6055829999855,
+              "peakRssMiB": 727.5,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:35:05.684144+00:00",
+              "exit": 0
+            }
+          ]
+        },
+        "rust": {
+          "samples_ms": [
+            562.7617499999928,
+            555.2923340000007,
+            550.6952080000076
+          ],
+          "median_ms": 555.2923340000007,
+          "median_peak_rss_mib": 83.265625,
+          "samples": [
+            {
+              "wallMs": 562.7617499999928,
+              "peakRssMiB": 84.078125,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:33:29.817078+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 555.2923340000007,
+              "peakRssMiB": 82.546875,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:34:00.407744+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 550.6952080000076,
+              "peakRssMiB": 83.265625,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:35:36.259651+00:00",
+              "exit": 0
+            }
+          ]
+        }
+      },
+      "strict": {
+        "cgr": 39286,
+        "oracle": 39682,
+        "intersection": 34334,
+        "cgrOnly": 4952,
+        "oracleOnly": 5348,
+        "precision": 0.8739500076363081,
+        "recall": 0.8652285671085127,
+        "f1": 0.8695674197143146,
+        "jaccard": 0.769234216068468
+      },
+      "calls": {
+        "cgr": 11717,
+        "oracle": 15605,
+        "intersection": 10754,
+        "cgrOnly": 963,
+        "oracleOnly": 4851,
+        "precision": 0.9178117265511649,
+        "recall": 0.6891380967638577,
+        "f1": 0.7872044506258693,
+        "jaccard": 0.6490825688073395
+      },
+      "errors": [],
+      "sourceDigests": {
+        "rust": "714f5d8b2c0dc196ff30e98fbeba0bc5efc48caf695cfeb3f4d1360296f2f30b",
+        "upstream": "714f5d8b2c0dc196ff30e98fbeba0bc5efc48caf695cfeb3f4d1360296f2f30b"
+      },
+      "graphCounts": {
+        "rust": {
+          "nodeRows": 14460,
+          "uniqueStableIds": 14460,
+          "routeNodes": 0,
+          "edgeRows": 39286,
+          "uniqueEdges": 39286,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": []
+        },
+        "upstream": {
+          "nodeRows": 14460,
+          "uniqueStableIds": 14460,
+          "routeNodes": 0,
+          "edgeRows": 39682,
+          "uniqueEdges": 39682,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": []
+        }
+      },
+      "byKind": {
+        "calls": {
+          "cgr": 11717,
+          "oracle": 15605,
+          "intersection": 10754,
+          "cgrOnly": 963,
+          "oracleOnly": 4851,
+          "precision": 0.9178117265511649,
+          "recall": 0.6891380967638577,
+          "f1": 0.7872044506258693,
+          "jaccard": 0.6490825688073395
+        },
+        "contains": {
+          "cgr": 17053,
+          "oracle": 17053,
+          "intersection": 17053,
+          "cgrOnly": 0,
+          "oracleOnly": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "jaccard": 1.0
+        },
+        "extends": {
+          "cgr": 2,
+          "oracle": 2,
+          "intersection": 2,
+          "cgrOnly": 0,
+          "oracleOnly": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "jaccard": 1.0
+        },
+        "implements": {
+          "cgr": 132,
+          "oracle": 132,
+          "intersection": 132,
+          "cgrOnly": 0,
+          "oracleOnly": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "jaccard": 1.0
+        },
+        "imports": {
+          "cgr": 3329,
+          "oracle": 2326,
+          "intersection": 2080,
+          "cgrOnly": 1249,
+          "oracleOnly": 246,
+          "precision": 0.6248122559327125,
+          "recall": 0.8942390369733448,
+          "f1": 0.735632183908046,
+          "jaccard": 0.5818181818181818
+        },
+        "instantiates": {
+          "cgr": 943,
+          "oracle": 818,
+          "intersection": 774,
+          "cgrOnly": 169,
+          "oracleOnly": 44,
+          "precision": 0.8207847295864263,
+          "recall": 0.9462102689486552,
+          "f1": 0.8790459965928449,
+          "jaccard": 0.78419452887538
+        },
+        "references": {
+          "cgr": 6110,
+          "oracle": 3746,
+          "intersection": 3539,
+          "cgrOnly": 2571,
+          "oracleOnly": 207,
+          "precision": 0.579214402618658,
+          "recall": 0.9447410571276028,
+          "f1": 0.7181412337662338,
+          "jaccard": 0.5602342884280513
+        }
+      },
+      "bySourceLanguage": {
+        "rust": {
+          "cgr": 39286,
+          "oracle": 39682,
+          "intersection": 34334,
+          "cgrOnly": 4952,
+          "oracleOnly": 5348,
+          "precision": 0.8739500076363081,
+          "recall": 0.8652285671085127,
+          "f1": 0.8695674197143146,
+          "jaccard": 0.769234216068468
+        }
+      },
+      "differenceBuckets": {
+        "rust": {
+          "resolution_or_synthesis_needs_review": 4868,
+          "edge_location_difference": 84
+        },
+        "upstream": {
+          "resolution_or_synthesis_needs_review": 5310,
+          "edge_location_difference": 38
+        }
+      },
+      "designGate": {
+        "minimumPrecision": 0.97,
+        "minimumRecall": 0.95,
+        "passed": false
+      }
+    },
+    "django": {
+      "repo": "django/django",
+      "commit": "a05e16a7230fe33d3f43f4a3aaed103cebb42efc",
+      "files": 2984,
+      "index": {
+        "upstream": {
+          "samples_ms": [
+            10594.84558300001,
+            10597.831250000014,
+            10630.045917000018
+          ],
+          "median_ms": 10597.831250000014,
+          "median_peak_rss_mib": 1896.84375,
+          "samples": [
+            {
+              "wallMs": 10594.84558300001,
+              "peakRssMiB": 1909.4375,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:37:29.724504+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 10597.831250000014,
+              "peakRssMiB": 1896.328125,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:39:14.408978+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 10630.045917000018,
+              "peakRssMiB": 1896.84375,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:39:55.061824+00:00",
+              "exit": 0
+            }
+          ]
+        },
+        "rust": {
+          "samples_ms": [
+            1901.2507910000095,
+            2087.7622079999865,
+            1933.9729170000055
+          ],
+          "median_ms": 1933.9729170000055,
+          "median_peak_rss_mib": 237.40625,
+          "samples": [
+            {
+              "wallMs": 1901.2507910000095,
+              "peakRssMiB": 239.3125,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:38:01.658097+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 2087.7622079999865,
+              "peakRssMiB": 228.59375,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:38:33.779399+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 1933.9729170000055,
+              "peakRssMiB": 237.40625,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:40:27.021799+00:00",
+              "exit": 0
+            }
+          ]
+        }
+      },
+      "strict": {
+        "cgr": 185112,
+        "oracle": 194105,
+        "intersection": 174372,
+        "cgrOnly": 10740,
+        "oracleOnly": 19733,
+        "precision": 0.9419810709192272,
+        "recall": 0.8983385281162257,
+        "f1": 0.9196423156134877,
+        "jaccard": 0.8512387414874661
+      },
+      "calls": {
+        "cgr": 48198,
+        "oracle": 56826,
+        "intersection": 44022,
+        "cgrOnly": 4176,
+        "oracleOnly": 12804,
+        "precision": 0.9133574007220217,
+        "recall": 0.7746806039488966,
+        "f1": 0.8383226691042048,
+        "jaccard": 0.7216484705419495
+      },
+      "errors": [
+        "django/views/templates/i18n_catalog.js",
+        "tests/i18n/commands/javascript.js",
+        "tests/test_runner_apps/tagged/tests_syntax_error.py"
+      ],
+      "sourceDigests": {
+        "rust": "3d77c24c790cfce7a0ebd2b6b8adc0ac91fb6f7df15daf98bba248334ad915ff",
+        "upstream": "3d77c24c790cfce7a0ebd2b6b8adc0ac91fb6f7df15daf98bba248334ad915ff"
+      },
+      "graphCounts": {
+        "rust": {
+          "nodeRows": 62660,
+          "uniqueStableIds": 62660,
+          "routeNodes": 745,
+          "edgeRows": 185112,
+          "uniqueEdges": 185112,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": [
+            "django/views/templates/i18n_catalog.js",
+            "tests/i18n/commands/javascript.js",
+            "tests/test_runner_apps/tagged/tests_syntax_error.py"
+          ]
+        },
+        "upstream": {
+          "nodeRows": 62755,
+          "uniqueStableIds": 62755,
+          "routeNodes": 840,
+          "edgeRows": 194105,
+          "uniqueEdges": 194105,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": []
+        }
+      },
+      "byKind": {
+        "calls": {
+          "cgr": 48198,
+          "oracle": 56826,
+          "intersection": 44022,
+          "cgrOnly": 4176,
+          "oracleOnly": 12804,
+          "precision": 0.9133574007220217,
+          "recall": 0.7746806039488966,
+          "f1": 0.8383226691042048,
+          "jaccard": 0.7216484705419495
+        },
+        "contains": {
+          "cgr": 59676,
+          "oracle": 58931,
+          "intersection": 58931,
+          "cgrOnly": 745,
+          "oracleOnly": 0,
+          "precision": 0.98751591929754,
+          "recall": 1.0,
+          "f1": 0.9937187518443262,
+          "jaccard": 0.98751591929754
+        },
+        "decorates": {
+          "cgr": 261,
+          "oracle": 536,
+          "intersection": 260,
+          "cgrOnly": 1,
+          "oracleOnly": 276,
+          "precision": 0.9961685823754789,
+          "recall": 0.48507462686567165,
+          "f1": 0.6524466750313677,
+          "jaccard": 0.48417132216014896
+        },
+        "extends": {
+          "cgr": 9384,
+          "oracle": 9359,
+          "intersection": 9283,
+          "cgrOnly": 101,
+          "oracleOnly": 76,
+          "precision": 0.9892369991474851,
+          "recall": 0.9918794743028101,
+          "f1": 0.9905564744171158,
+          "jaccard": 0.9812896405919662
+        },
+        "imports": {
+          "cgr": 19854,
+          "oracle": 24349,
+          "intersection": 19844,
+          "cgrOnly": 10,
+          "oracleOnly": 4505,
+          "precision": 0.9994963231590611,
+          "recall": 0.8149821347899298,
+          "f1": 0.8978576114743342,
+          "jaccard": 0.8146475635288805
+        },
+        "instantiates": {
+          "cgr": 30943,
+          "oracle": 31205,
+          "intersection": 30482,
+          "cgrOnly": 461,
+          "oracleOnly": 723,
+          "precision": 0.9851016384965905,
+          "recall": 0.9768306361160071,
+          "f1": 0.9809487030958358,
+          "jaccard": 0.9626097391524032
+        },
+        "references": {
+          "cgr": 16796,
+          "oracle": 12899,
+          "intersection": 11550,
+          "cgrOnly": 5246,
+          "oracleOnly": 1349,
+          "precision": 0.6876637294593951,
+          "recall": 0.8954182494767036,
+          "f1": 0.7779087388449233,
+          "jaccard": 0.6365389914577019
+        }
+      },
+      "bySourceLanguage": {
+        "javascript": {
+          "cgr": 590,
+          "oracle": 657,
+          "intersection": 563,
+          "cgrOnly": 27,
+          "oracleOnly": 94,
+          "precision": 0.9542372881355933,
+          "recall": 0.8569254185692542,
+          "f1": 0.9029671210906175,
+          "jaccard": 0.8230994152046783
+        },
+        "python": {
+          "cgr": 184522,
+          "oracle": 193448,
+          "intersection": 173809,
+          "cgrOnly": 10713,
+          "oracleOnly": 19639,
+          "precision": 0.941941882268781,
+          "recall": 0.8984791778669203,
+          "f1": 0.9196973304759636,
+          "jaccard": 0.8513330165898482
+        }
+      },
+      "differenceBuckets": {
+        "rust": {
+          "resolution_or_synthesis_needs_review": 9121,
+          "framework_route_coverage": 1451,
+          "edge_location_difference": 168
+        },
+        "upstream": {
+          "resolution_or_synthesis_needs_review": 18946,
+          "framework_route_coverage": 709,
+          "edge_location_difference": 78
+        }
+      },
+      "designGate": {
+        "minimumPrecision": 0.97,
+        "minimumRecall": 0.95,
+        "passed": false
+      }
+    },
+    "zod": {
+      "repo": "colinhacks/zod",
+      "commit": "2554b70c3d4a80273381e61d527d820720626440",
+      "files": 523,
+      "index": {
+        "upstream": {
+          "samples_ms": [
+            2286.973125000003,
+            2289.8676249999994,
+            2283.4838330000193
+          ],
+          "median_ms": 2286.973125000003,
+          "median_peak_rss_mib": 627.21875,
+          "samples": [
+            {
+              "wallMs": 2286.973125000003,
+              "peakRssMiB": 624.609375,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:42:02.491949+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 2289.8676249999994,
+              "peakRssMiB": 629.03125,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:43:35.811319+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 2283.4838330000193,
+              "peakRssMiB": 627.21875,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:44:08.112866+00:00",
+              "exit": 0
+            }
+          ]
+        },
+        "rust": {
+          "samples_ms": [
+            477.7486250000038,
+            474.0685419999977,
+            466.14479199999437
+          ],
+          "median_ms": 474.0685419999977,
+          "median_peak_rss_mib": 93.84375,
+          "samples": [
+            {
+              "wallMs": 477.7486250000038,
+              "peakRssMiB": 94.03125,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:42:32.994188+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 474.0685419999977,
+              "peakRssMiB": 93.84375,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:43:03.496450+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 466.14479199999437,
+              "peakRssMiB": 93.59375,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:44:38.603319+00:00",
+              "exit": 0
+            }
+          ]
+        }
+      },
+      "strict": {
+        "cgr": 24070,
+        "oracle": 35716,
+        "intersection": 22088,
+        "cgrOnly": 1982,
+        "oracleOnly": 13628,
+        "precision": 0.9176568342334857,
+        "recall": 0.6184343151528726,
+        "f1": 0.7389020840999565,
+        "jaccard": 0.5859196774364688
+      },
+      "calls": {
+        "cgr": 7205,
+        "oracle": 18140,
+        "intersection": 6399,
+        "cgrOnly": 806,
+        "oracleOnly": 11741,
+        "precision": 0.8881332408049966,
+        "recall": 0.35275633958103636,
+        "f1": 0.5049516669954626,
+        "jaccard": 0.3377493930117175
+      },
+      "errors": [
+        "packages/zod/src/v4/classic/schemas.ts",
+        "packages/zod/src/v4/core/checks.ts",
+        "packages/zod/src/v4/core/schemas.ts",
+        "packages/zod/src/v4/mini/schemas.ts"
+      ],
+      "sourceDigests": {
+        "rust": "f945f7166058bdcb65c068596e496753342777b6838526034f7598a9f998300d",
+        "upstream": "f945f7166058bdcb65c068596e496753342777b6838526034f7598a9f998300d"
+      },
+      "graphCounts": {
+        "rust": {
+          "nodeRows": 8821,
+          "uniqueStableIds": 8821,
+          "routeNodes": 7,
+          "edgeRows": 24070,
+          "uniqueEdges": 24070,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": [
+            "packages/zod/src/v4/classic/schemas.ts",
+            "packages/zod/src/v4/core/checks.ts",
+            "packages/zod/src/v4/core/schemas.ts",
+            "packages/zod/src/v4/mini/schemas.ts"
+          ]
+        },
+        "upstream": {
+          "nodeRows": 8821,
+          "uniqueStableIds": 8821,
+          "routeNodes": 7,
+          "edgeRows": 35716,
+          "uniqueEdges": 35716,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": []
+        }
+      },
+      "byKind": {
+        "calls": {
+          "cgr": 7205,
+          "oracle": 18140,
+          "intersection": 6399,
+          "cgrOnly": 806,
+          "oracleOnly": 11741,
+          "precision": 0.8881332408049966,
+          "recall": 0.35275633958103636,
+          "f1": 0.5049516669954626,
+          "jaccard": 0.3377493930117175
+        },
+        "contains": {
+          "cgr": 8298,
+          "oracle": 8291,
+          "intersection": 8291,
+          "cgrOnly": 7,
+          "oracleOnly": 0,
+          "precision": 0.9991564232345144,
+          "recall": 1.0,
+          "f1": 0.9995780336367474,
+          "jaccard": 0.9991564232345144
+        },
+        "extends": {
+          "cgr": 677,
+          "oracle": 677,
+          "intersection": 677,
+          "cgrOnly": 0,
+          "oracleOnly": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "jaccard": 1.0
+        },
+        "implements": {
+          "cgr": 1,
+          "oracle": 1,
+          "intersection": 1,
+          "cgrOnly": 0,
+          "oracleOnly": 0,
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "jaccard": 1.0
+        },
+        "imports": {
+          "cgr": 1302,
+          "oracle": 2121,
+          "intersection": 1296,
+          "cgrOnly": 6,
+          "oracleOnly": 825,
+          "precision": 0.9953917050691244,
+          "recall": 0.611032531824611,
+          "f1": 0.7572304995617879,
+          "jaccard": 0.609308885754584
+        },
+        "instantiates": {
+          "cgr": 390,
+          "oracle": 307,
+          "intersection": 183,
+          "cgrOnly": 207,
+          "oracleOnly": 124,
+          "precision": 0.46923076923076923,
+          "recall": 0.5960912052117264,
+          "f1": 0.5251076040172168,
+          "jaccard": 0.3560311284046693
+        },
+        "navigates": {
+          "cgr": 3,
+          "oracle": 3,
+          "intersection": 0,
+          "cgrOnly": 3,
+          "oracleOnly": 3,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "jaccard": 0.0
+        },
+        "references": {
+          "cgr": 6194,
+          "oracle": 6176,
+          "intersection": 5241,
+          "cgrOnly": 953,
+          "oracleOnly": 935,
+          "precision": 0.8461414271876009,
+          "recall": 0.8486075129533679,
+          "f1": 0.8473726758286176,
+          "jaccard": 0.7351662224715949
+        }
+      },
+      "bySourceLanguage": {
+        "javascript": {
+          "cgr": 79,
+          "oracle": 80,
+          "intersection": 79,
+          "cgrOnly": 0,
+          "oracleOnly": 1,
+          "precision": 1.0,
+          "recall": 0.9875,
+          "f1": 0.9937106918238994,
+          "jaccard": 0.9875
+        },
+        "tsx": {
+          "cgr": 392,
+          "oracle": 393,
+          "intersection": 352,
+          "cgrOnly": 40,
+          "oracleOnly": 41,
+          "precision": 0.8979591836734694,
+          "recall": 0.8956743002544529,
+          "f1": 0.8968152866242037,
+          "jaccard": 0.812933025404157
+        },
+        "typescript": {
+          "cgr": 23599,
+          "oracle": 35243,
+          "intersection": 21657,
+          "cgrOnly": 1942,
+          "oracleOnly": 13586,
+          "precision": 0.9177083774736218,
+          "recall": 0.6145050080867123,
+          "f1": 0.7361068624451923,
+          "jaccard": 0.582412263009278
+        }
+      },
+      "differenceBuckets": {
+        "rust": {
+          "resolution_or_synthesis_needs_review": 756,
+          "containment_topology": 7,
+          "edge_location_difference": 47,
+          "stable_id_representation_only": 10,
+          "syntax_or_extraction_error_file": 1162
+        },
+        "upstream": {
+          "resolution_or_synthesis_needs_review": 13386,
+          "edge_location_difference": 232,
+          "stable_id_representation_only": 10
+        }
+      },
+      "designGate": {
+        "minimumPrecision": 0.97,
+        "minimumRecall": 0.95,
+        "passed": false
+      }
+    },
+    "okhttp": {
+      "repo": "square/okhttp",
+      "commit": "16fb6aef3aee1c4645fc8d24af01f8a4dc128ebf",
+      "files": 690,
+      "index": {
+        "upstream": {
+          "samples_ms": [
+            3178.3140840000074,
+            3136.5523749999793,
+            3116.3804169999876
+          ],
+          "median_ms": 3136.5523749999793,
+          "median_peak_rss_mib": 814.21875,
+          "samples": [
+            {
+              "wallMs": 3178.3140840000074,
+              "peakRssMiB": 813.171875,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:50:42.903452+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 3136.5523749999793,
+              "peakRssMiB": 817.109375,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:52:17.339106+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 3116.3804169999876,
+              "peakRssMiB": 814.21875,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:52:50.505380+00:00",
+              "exit": 0
+            }
+          ]
+        },
+        "rust": {
+          "samples_ms": [
+            613.8847499999969,
+            596.2155420000101,
+            618.3804579999901
+          ],
+          "median_ms": 613.8847499999969,
+          "median_peak_rss_mib": 108.96875,
+          "samples": [
+            {
+              "wallMs": 613.8847499999969,
+              "peakRssMiB": 108.96875,
+              "iteration": 0,
+              "timeUtc": "2026-11-01T18:51:13.552322+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 596.2155420000101,
+              "peakRssMiB": 113.984375,
+              "iteration": 1,
+              "timeUtc": "2026-11-01T18:51:44.174627+00:00",
+              "exit": 0
+            },
+            {
+              "wallMs": 618.3804579999901,
+              "peakRssMiB": 108.390625,
+              "iteration": 2,
+              "timeUtc": "2026-11-01T18:53:21.162983+00:00",
+              "exit": 0
+            }
+          ]
+        }
+      },
+      "strict": {
+        "cgr": 49187,
+        "oracle": 52935,
+        "intersection": 43522,
+        "cgrOnly": 5665,
+        "oracleOnly": 9413,
+        "precision": 0.884827291764084,
+        "recall": 0.8221781430055729,
+        "f1": 0.8523530678991795,
+        "jaccard": 0.7426962457337883
+      },
+      "calls": {
+        "cgr": 18963,
+        "oracle": 23629,
+        "intersection": 15258,
+        "cgrOnly": 3705,
+        "oracleOnly": 8371,
+        "precision": 0.8046195222274957,
+        "recall": 0.6457319395657878,
+        "f1": 0.716472577009767,
+        "jaccard": 0.5582058974171362
+      },
+      "errors": [
+        "build-logic/src/main/kotlin/AlpnVersions.kt",
+        "build-logic/src/main/kotlin/BndBuildAction.kt",
+        "build-logic/src/main/kotlin/okhttp.quality-conventions.gradle.kts",
+        "mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/MockResponse.kt",
+        "mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt",
+        "okcurl/src/main/kotlin/okhttp3/curl/logging/LoggingUtil.kt",
+        "okhttp-brotli/src/test/java/okhttp3/brotli/BrotliInterceptorTest.kt",
+        "okhttp-idna-mapping-table/src/main/kotlin/okhttp3/internal/idn/GenerateIdnaMappingTableCode.kt",
+        "okhttp-idna-mapping-table/src/main/kotlin/okhttp3/internal/idn/MappingTables.kt",
+        "okhttp-logging-interceptor/src/main/kotlin/okhttp3/logging/HttpLoggingInterceptor.kt",
+        "okhttp-logging-interceptor/src/main/kotlin/okhttp3/logging/LoggingEventListener.kt",
+        "okhttp-sse/src/main/kotlin/okhttp3/sse/EventSource.kt",
+        "okhttp-testing-support/src/main/kotlin/okhttp3/internal/dns/DnsTesting.kt",
+        "okhttp-testing-support/src/main/kotlin/okhttp3/testing/PlatformRule.kt",
+        "okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerHeader.kt",
+        "okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt",
+        "okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerWriter.kt",
+        "okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerTest.kt",
+        "okhttp-urlconnection/src/main/kotlin/okhttp3/JavaNetCookieJar.kt",
+        "okhttp-zstd/src/test/java/okhttp3/zstd/ZstdInterceptorTest.kt",
+        "okhttp/build.gradle.kts",
+        "okhttp/src/androidHostTest/kotlin/okhttp3/android/AndroidDnsRobolectricTest.kt",
+        "okhttp/src/androidHostTest/kotlin/okhttp3/android/ShadowNetwork.kt",
+        "okhttp/src/androidMain/kotlin/okhttp3/internal/platform/Android10Platform.kt",
+        "okhttp/src/androidMain/kotlin/okhttp3/internal/platform/android/Android17SocketAdapter.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/Authenticator.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/Call.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/Dns.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/EventListener.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/FormBody.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/Interceptor.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/MultipartReader.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/WebSocket.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/-UtilCommon.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheStrategy.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/dns/-DnsMessage.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/dns/-DnsMessageReader.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/dns/-DnsMessageWriter.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/dns/DnsQuery.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http2/Hpack.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http2/Http2Stream.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/idn/Punycode.kt",
+        "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/tls/TrustRootIndex.kt",
+        "okhttp/src/jvmTest/kotlin/okhttp3/CacheTest.kt",
+        "okhttp/src/jvmTest/kotlin/okhttp3/ResponseJvmTest.kt",
+        "okhttp/src/jvmTest/kotlin/okhttp3/SocksProxy.kt",
+        "okhttp/src/jvmTest/kotlin/okhttp3/URLConnectionTest.kt",
+        "okhttp/src/jvmTest/kotlin/okhttp3/internal/tls/HostnameVerifierTest.kt",
+        "samples/guide/src/main/java/okhttp3/recipes/kt/UploadProgress.kt",
+        "settings.gradle.kts"
+      ],
+      "sourceDigests": {
+        "rust": "d7c1886c5bf8dcd8a989169a860de05a5bf99e687029921a62ae36785943834a",
+        "upstream": "d7c1886c5bf8dcd8a989169a860de05a5bf99e687029921a62ae36785943834a"
+      },
+      "graphCounts": {
+        "rust": {
+          "nodeRows": 20475,
+          "uniqueStableIds": 20475,
+          "routeNodes": 0,
+          "edgeRows": 49187,
+          "uniqueEdges": 49187,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": [
+            "build-logic/src/main/kotlin/AlpnVersions.kt",
+            "build-logic/src/main/kotlin/BndBuildAction.kt",
+            "build-logic/src/main/kotlin/okhttp.quality-conventions.gradle.kts",
+            "mockwebserver-deprecated/src/main/kotlin/okhttp3/mockwebserver/MockResponse.kt",
+            "mockwebserver/src/main/kotlin/mockwebserver3/MockResponse.kt",
+            "okcurl/src/main/kotlin/okhttp3/curl/logging/LoggingUtil.kt",
+            "okhttp-brotli/src/test/java/okhttp3/brotli/BrotliInterceptorTest.kt",
+            "okhttp-idna-mapping-table/src/main/kotlin/okhttp3/internal/idn/GenerateIdnaMappingTableCode.kt",
+            "okhttp-idna-mapping-table/src/main/kotlin/okhttp3/internal/idn/MappingTables.kt",
+            "okhttp-logging-interceptor/src/main/kotlin/okhttp3/logging/HttpLoggingInterceptor.kt",
+            "okhttp-logging-interceptor/src/main/kotlin/okhttp3/logging/LoggingEventListener.kt",
+            "okhttp-sse/src/main/kotlin/okhttp3/sse/EventSource.kt",
+            "okhttp-testing-support/src/main/kotlin/okhttp3/internal/dns/DnsTesting.kt",
+            "okhttp-testing-support/src/main/kotlin/okhttp3/testing/PlatformRule.kt",
+            "okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerHeader.kt",
+            "okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerReader.kt",
+            "okhttp-tls/src/main/kotlin/okhttp3/tls/internal/der/DerWriter.kt",
+            "okhttp-tls/src/test/java/okhttp3/tls/internal/der/DerTest.kt",
+            "okhttp-urlconnection/src/main/kotlin/okhttp3/JavaNetCookieJar.kt",
+            "okhttp-zstd/src/test/java/okhttp3/zstd/ZstdInterceptorTest.kt",
+            "okhttp/build.gradle.kts",
+            "okhttp/src/androidHostTest/kotlin/okhttp3/android/AndroidDnsRobolectricTest.kt",
+            "okhttp/src/androidHostTest/kotlin/okhttp3/android/ShadowNetwork.kt",
+            "okhttp/src/androidMain/kotlin/okhttp3/internal/platform/Android10Platform.kt",
+            "okhttp/src/androidMain/kotlin/okhttp3/internal/platform/android/Android17SocketAdapter.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/Authenticator.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/Call.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/Dns.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/EventListener.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/FormBody.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/Interceptor.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/MultipartReader.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/WebSocket.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/-UtilCommon.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/cache/CacheStrategy.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/dns/-DnsMessage.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/dns/-DnsMessageReader.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/dns/-DnsMessageWriter.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/dns/DnsQuery.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http2/Hpack.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/http2/Http2Stream.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/idn/Punycode.kt",
+            "okhttp/src/commonJvmAndroid/kotlin/okhttp3/internal/tls/TrustRootIndex.kt",
+            "okhttp/src/jvmTest/kotlin/okhttp3/CacheTest.kt",
+            "okhttp/src/jvmTest/kotlin/okhttp3/ResponseJvmTest.kt",
+            "okhttp/src/jvmTest/kotlin/okhttp3/SocksProxy.kt",
+            "okhttp/src/jvmTest/kotlin/okhttp3/URLConnectionTest.kt",
+            "okhttp/src/jvmTest/kotlin/okhttp3/internal/tls/HostnameVerifierTest.kt",
+            "samples/guide/src/main/java/okhttp3/recipes/kt/UploadProgress.kt",
+            "settings.gradle.kts"
+          ]
+        },
+        "upstream": {
+          "nodeRows": 20523,
+          "uniqueStableIds": 20523,
+          "routeNodes": 0,
+          "edgeRows": 52935,
+          "uniqueEdges": 52935,
+          "duplicateEdges": 0,
+          "duplicateNodeIds": 0,
+          "errorFiles": []
+        }
+      },
+      "byKind": {
+        "calls": {
+          "cgr": 18963,
+          "oracle": 23629,
+          "intersection": 15258,
+          "cgrOnly": 3705,
+          "oracleOnly": 8371,
+          "precision": 0.8046195222274957,
+          "recall": 0.6457319395657878,
+          "f1": 0.716472577009767,
+          "jaccard": 0.5582058974171362
+        },
+        "contains": {
+          "cgr": 19785,
+          "oracle": 19833,
+          "intersection": 19571,
+          "cgrOnly": 214,
+          "oracleOnly": 262,
+          "precision": 0.9891837250442255,
+          "recall": 0.986789693944436,
+          "f1": 0.9879852592256045,
+          "jaccard": 0.9762557988726492
+        },
+        "decorates": {
+          "cgr": 59,
+          "oracle": 60,
+          "intersection": 59,
+          "cgrOnly": 0,
+          "oracleOnly": 1,
+          "precision": 1.0,
+          "recall": 0.9833333333333333,
+          "f1": 0.9915966386554621,
+          "jaccard": 0.9833333333333333
+        },
+        "extends": {
+          "cgr": 311,
+          "oracle": 312,
+          "intersection": 309,
+          "cgrOnly": 2,
+          "oracleOnly": 3,
+          "precision": 0.9935691318327974,
+          "recall": 0.9903846153846154,
+          "f1": 0.9919743178170144,
+          "jaccard": 0.9840764331210191
+        },
+        "implements": {
+          "cgr": 213,
+          "oracle": 269,
+          "intersection": 213,
+          "cgrOnly": 0,
+          "oracleOnly": 56,
+          "precision": 1.0,
+          "recall": 0.79182156133829,
+          "f1": 0.8838174273858921,
+          "jaccard": 0.79182156133829
+        },
+        "imports": {
+          "cgr": 2276,
+          "oracle": 1879,
+          "intersection": 1665,
+          "cgrOnly": 611,
+          "oracleOnly": 214,
+          "precision": 0.7315465729349736,
+          "recall": 0.8861096327833954,
+          "f1": 0.8014440433212996,
+          "jaccard": 0.6686746987951807
+        },
+        "instantiates": {
+          "cgr": 5158,
+          "oracle": 4413,
+          "intersection": 4139,
+          "cgrOnly": 1019,
+          "oracleOnly": 274,
+          "precision": 0.8024428072896471,
+          "recall": 0.9379107183322003,
+          "f1": 0.8649043987044195,
+          "jaccard": 0.7619661266568483
+        },
+        "references": {
+          "cgr": 2422,
+          "oracle": 2540,
+          "intersection": 2308,
+          "cgrOnly": 114,
+          "oracleOnly": 232,
+          "precision": 0.9529314616019818,
+          "recall": 0.9086614173228347,
+          "f1": 0.9302700523982266,
+          "jaccard": 0.8696307460437076
+        }
+      },
+      "bySourceLanguage": {
+        "java": {
+          "cgr": 2250,
+          "oracle": 2026,
+          "intersection": 1926,
+          "cgrOnly": 324,
+          "oracleOnly": 100,
+          "precision": 0.856,
+          "recall": 0.9506416584402764,
+          "f1": 0.9008419083255378,
+          "jaccard": 0.8195744680851064
+        },
+        "kotlin": {
+          "cgr": 46937,
+          "oracle": 50909,
+          "intersection": 41596,
+          "cgrOnly": 5341,
+          "oracleOnly": 9313,
+          "precision": 0.8862091739991904,
+          "recall": 0.8170657447602585,
+          "f1": 0.8502340412484926,
+          "jaccard": 0.7394844444444445
+        }
+      },
+      "differenceBuckets": {
+        "rust": {
+          "syntax_or_extraction_error_file": 2397,
+          "resolution_or_synthesis_needs_review": 3207,
+          "edge_location_difference": 24,
+          "other_node_coverage": 37
+        },
+        "upstream": {
+          "other_node_coverage": 1372,
+          "containment_topology": 3,
+          "resolution_or_synthesis_needs_review": 7989,
+          "edge_location_difference": 49
+        }
+      },
+      "designGate": {
+        "minimumPrecision": 0.97,
+        "minimumRecall": 0.95,
+        "passed": false
+      }
+    }
+  },
+  "express_sync": {
+    "sync_noop": {
+      "upstream": [
+        170.80279199999993,
+        174.88550000000203,
+        166.20925000000852
+      ],
+      "rust": [
+        41.98233299999998,
+        40.788708000008,
+        40.75258400001758
+      ]
+    },
+    "sync_comment": {
+      "upstream": [
+        305.42875000000436,
+        304.41604200001393,
+        303.19812499999443
+      ],
+      "rust": [
+        60.48074999998221,
+        68.17637500000728,
+        58.052874999987125
+      ]
+    },
+    "sync_rename": {
+      "upstream": [
+        306.50012500001367,
+        298.8481669999601,
+        299.58462500007954
+      ],
+      "rust": [
+        181.83170800000426,
+        156.4394999999763,
+        175.3764579999597
+      ]
+    }
+  },
+  "limitations": [
+    "Sync and explore incomplete: resource preflight rejected restart",
+    "OkHttp excludes nine properties files from both sides; first OkHttp index samples rejected",
+    "Three index measurements per implementation; warm cache; alternating order"
+  ],
+  "environment": {
+    "machine": "Apple M5, 10 cores, 16 GiB RAM, macOS 26.5.2",
+    "rust": "1.94.1 release",
+    "node": "24.18.0",
+    "threads": 2,
+    "memoryMiB": 2048,
+    "power": "AC",
+    "warming": "one warmup, 3 timed CLI rebuilds per implementation, alternating order, warm OS file cache",
+    "rss": "median /usr/bin/time -l peak, in MiB",
+    "guard": "unmodified scripts/bench-local.sh restricted tier, 3072 MiB process-tree limit",
+    "timeGapSeconds": 30,
+    "sourceVerification": "identical indexed paths and SHA-256 source-byte digest"
+  }
+}

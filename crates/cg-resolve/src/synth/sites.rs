@@ -34,13 +34,31 @@ pub const PASS_SPRING: u16 = 13;
 pub const PASS_REACT_TABLE: u16 = 14;
 /// Nest modules, router registrations and application bootstrap configuration.
 pub const PASS_NEST: u16 = 15;
+/// Go types a struct or interface embeds, with the import path they are written through.
+pub const PASS_GO_EMBEDS: u16 = 16;
+/// Go func-typed struct fields, func types and the values put in struct fields.
+pub const PASS_GO_FIELDS: u16 = 17;
+/// Gin's handler-chain dispatcher and the handlers registration calls pass (`gin`).
+pub const PASS_GIN: u16 = 18;
+/// What a Redux thunk constant's body dispatches (`redux`).
+pub const PASS_THUNK: u16 = 19;
+/// Requests Spring tests make (`jvm`).
+pub const PASS_TEST_REQUEST: u16 = 20;
+/// Tauri commands and React Native native modules across the language bridge (`bridges`).
+pub const PASS_BRIDGE: u16 = 21;
 
 pub const ROLE_EMIT: u8 = 0;
 pub const ROLE_ON: u8 = 1;
 pub const ROLE_GO_ALIAS: u8 = 0;
 pub const ROLE_GO_GENERIC: u8 = 1;
+/// `PASS_GO_FIELDS` roles.
+pub const ROLE_GO_FUNC_FIELD: u8 = 0;
+pub const ROLE_GO_FIELD_LITERAL: u8 = 1;
+pub const ROLE_GO_FIELD_ASSIGN: u8 = 2;
+pub const ROLE_GO_FUNC_TYPE: u8 = 3;
 
-/// Go true aliases and generic type parameters, from the facts of the file.
+/// Go true aliases and generic type parameters, embedded types and the facts the
+/// func-field pass reads, from the facts of the file.
 pub struct GoTypeSites;
 
 impl FileHook for GoTypeSites {
@@ -51,17 +69,51 @@ impl FileHook for GoTypeSites {
         lang == Lang::Go
     }
     fn run(&self, ctx: &HookCtx<'_>, out: &mut HookOut) {
+        let site = |pass: u16, role: u8, key_a: &str, key_b: &str, node_row: u32, line: u32, payload: String| SiteFact {
+            pass,
+            role,
+            key_kind: 0,
+            key_a: key_a.to_owned(),
+            key_b: key_b.to_owned(),
+            node_row,
+            line,
+            payload,
+        };
         for t in &ctx.facts.go_types {
-            out.sites.push(SiteFact {
-                pass: PASS_GO_TYPES,
-                role: if t.alias { ROLE_GO_ALIAS } else { ROLE_GO_GENERIC },
-                key_kind: 0,
-                key_a: t.name.clone(),
-                key_b: String::new(),
-                node_row: cg_core::NONE,
-                line: 0,
-                payload: t.type_params.join(","),
-            });
+            if t.alias || !t.type_params.is_empty() {
+                let role = if t.alias { ROLE_GO_ALIAS } else { ROLE_GO_GENERIC };
+                out.sites.push(site(PASS_GO_TYPES, role, &t.name, "", cg_core::NONE, 0, t.type_params.join(",")));
+            }
+            if t.func_type {
+                out.sites.push(site(PASS_GO_FIELDS, ROLE_GO_FUNC_TYPE, &t.name, "", cg_core::NONE, 0, String::new()));
+            }
+        }
+        // the import path an embedded type is written through (`io.Reader` -> `io`)
+        for e in &ctx.facts.go_embeds {
+            let path = if e.qualifier.is_empty() {
+                String::new()
+            } else {
+                match ctx.facts.imports.iter().find(|i| i.local == e.qualifier) {
+                    Some(i) => i.spec.clone(),
+                    None => continue,
+                }
+            };
+            out.sites.push(site(PASS_GO_EMBEDS, 0, &e.qualifier, &e.name, e.row, 0, path));
+        }
+        for f in &ctx.facts.go_fields {
+            match f {
+                cg_extract::facts::GoFieldFact::FuncField { row, field } => {
+                    out.sites.push(site(PASS_GO_FIELDS, ROLE_GO_FUNC_FIELD, field, "", *row, 0, String::new()));
+                }
+                cg_extract::facts::GoFieldFact::Literal { ty, field, value, line, col } => {
+                    let row = super::scan::enclosing_row(ctx, *line, super::scan::FN_KINDS).unwrap_or(cg_core::NONE);
+                    out.sites.push(site(PASS_GO_FIELDS, ROLE_GO_FIELD_LITERAL, ty, field, row, *line, format!("{col}|{value}")));
+                }
+                cg_extract::facts::GoFieldFact::Assign { receiver, field, value, line, col } => {
+                    let row = super::scan::enclosing_row(ctx, *line, super::scan::FN_KINDS).unwrap_or(cg_core::NONE);
+                    out.sites.push(site(PASS_GO_FIELDS, ROLE_GO_FIELD_ASSIGN, receiver, field, row, *line, format!("{col}|{value}")));
+                }
+            }
         }
     }
 }

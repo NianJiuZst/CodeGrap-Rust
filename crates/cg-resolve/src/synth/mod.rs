@@ -2,8 +2,16 @@
 //! view (hierarchy, members, persisted sites), so the same code serves full builds and the
 //! incremental sync, which re-runs it and rewrites the files whose synthesised edges changed.
 
+pub mod bridges;
 pub mod dynamic;
+pub mod gin;
 pub mod go;
+pub mod go_fields;
+pub mod go_std;
+pub mod js_alias;
+pub mod js_proto;
+pub mod jvm;
+pub mod redux;
 pub mod scan;
 pub mod sites;
 
@@ -423,6 +431,16 @@ const GLOBAL_PASSES: &[&str] = &[
     "event-bus",
     "celery-dispatch",
     "spring-event",
+    "go-func-field",
+    "go-grpc-stub-impl",
+    "gin-middleware-chain",
+    "const-alias",
+    "redux-thunk",
+    "rtk-query",
+    "test-request",
+    "kotlin-expect-actual",
+    "tauri-command",
+    "rn-native-module",
 ];
 
 /// Merge order of a synthesis pass (upstream `SYNTH_PASSES`): of two synthesized edges
@@ -433,13 +451,23 @@ pub(crate) fn order_of(by: &str) -> u16 {
         "go-implements" | "go-method-contains" => 10,
         "callback" => 100,
         "http-client" | "queue-job" | "event-bus" => 120,
+        "tauri-command" => 125,
+        "test-request" => 130,
         "event-emitter" => 150,
         "react-render" => 160,
         "jsx-render" => 170,
         "interface-impl" => 260,
+        "kotlin-expect-actual" => 270,
+        "go-grpc-stub-impl" => 280,
+        "rn-native-module" => 320,
+        "gin-middleware-chain" => 340,
+        "redux-thunk" => 350,
+        "const-alias" => 360,
+        "rtk-query" => 400,
         "object-registry" => 390,
         "celery-dispatch" => 430,
         "spring-event" => 440,
+        "go-func-field" => 480,
         "next-link" => 510,
         "next-proxy" => 520,
         "react-router-link" => 530,
@@ -475,9 +503,18 @@ fn dedupe_pairs(out: &mut Out) {
 fn run_global<'e, 'v>(e: &'e Engine<'v>, out: &mut Out, wcx: &mut WorkerCx<'e, 'v>) {
     dynamic::callbacks(e, out, wcx);
     dynamic::cross_tier(e, out, wcx);
+    redux::thunks(e, out, wcx);
+    js_alias::const_aliases(e, out, wcx);
     dynamic::registries(e, out, wcx);
+    redux::rtk_query(e, out);
     dynamic::celery(e, out);
     dynamic::spring_events(e, out);
+    bridges::link(e, out);
+    jvm::test_requests(e, out);
+    jvm::kotlin_expect_actual(e, out);
+    go_fields::func_fields(e, out, wcx);
+    go::grpc_stubs(e, out);
+    gin::middleware_chain(e, out);
     crate::frameworks::nav::navigation(e, out);
     crate::frameworks::nav::next_proxy(e, out);
     dedupe_pairs(out);

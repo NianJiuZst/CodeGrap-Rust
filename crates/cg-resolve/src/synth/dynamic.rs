@@ -761,8 +761,8 @@ impl FileHook for TierScanner {
 }
 
 /// An HTTP route: its node, method and path segments.
-struct HttpRoute {
-    node: NodeIdx,
+pub(crate) struct HttpRoute {
+    pub(crate) node: NodeIdx,
     method: String,
     segs: Vec<String>,
     excluded: Vec<(Option<String>, Vec<String>)>,
@@ -831,7 +831,7 @@ fn mount_prefixes(e: &Engine<'_>) -> FxHashMap<FileId, String> {
     prefix_of
 }
 
-fn http_routes(e: &Engine<'_>) -> Vec<HttpRoute> {
+pub(crate) fn http_routes(e: &Engine<'_>) -> Vec<HttpRoute> {
     let view = e.view;
     let prefixes = mount_prefixes(e);
     let nest_paths = crate::frameworks::nest::effective_paths(e);
@@ -910,7 +910,7 @@ fn score_path(client: &[String], route: &[String]) -> Option<u32> {
 }
 
 /// Segments of a client path (`${…}` as `*`), and whether a base URL hides its prefix.
-fn client_path(raw: &str, base: Option<&str>) -> Option<(Vec<String>, bool)> {
+pub(crate) fn client_path(raw: &str, base: Option<&str>) -> Option<(Vec<String>, bool)> {
     let mut p = &raw[..raw.find(['?', '#']).unwrap_or(raw.len())];
     let mut suffix = false;
     let owned;
@@ -962,7 +962,7 @@ fn client_path(raw: &str, base: Option<&str>) -> Option<(Vec<String>, bool)> {
     Some((segs, suffix))
 }
 
-fn match_http<'r>(method: &str, segs: &[String], suffix: bool, routes: &'r [HttpRoute]) -> Option<&'r HttpRoute> {
+pub(crate) fn match_http<'r>(method: &str, segs: &[String], suffix: bool, routes: &'r [HttpRoute]) -> Option<&'r HttpRoute> {
     let mut best: Option<(&HttpRoute, u32)> = None;
     let mut tied = false;
     for r in routes {

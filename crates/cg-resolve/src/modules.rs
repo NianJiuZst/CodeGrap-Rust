@@ -51,10 +51,18 @@ pub struct Modules<'v> {
     rs_mod_to_file: FxHashMap<(u32, String), FileId>,
     /// Rust: per file (crate index, module path).
     rs_file_mod: FxHashMap<FileId, (u32, String)>,
+    /// TypeScript: the declaration file a `declare module 'name' { ... }` block declares each
+    /// module in (upstream `ambient-modules.ts`), first by path.
+    ambient: FxHashMap<&'v str, FileId>,
 }
 
 fn dir_of(p: &str) -> &str {
     parent_dir(p)
+}
+
+/// A TypeScript declaration file: `.d.ts`, `.d.mts`, `.d.cts`.
+fn is_declaration_file(path: &str) -> bool {
+    path.ends_with(".d.ts") || path.ends_with(".d.mts") || path.ends_with(".d.cts")
 }
 
 impl<'v> Modules<'v> {
@@ -72,6 +80,7 @@ impl<'v> Modules<'v> {
             go_dir_pkgs: FxHashMap::default(),
             rs_mod_to_file: FxHashMap::default(),
             rs_file_mod: FxHashMap::default(),
+            ambient: FxHashMap::default(),
         };
         let mut files: Vec<FileId> = view.files().collect();
         // Delta file ids are appended, unlike a fresh build's path-ordered ids. Package
@@ -91,6 +100,14 @@ impl<'v> Modules<'v> {
                 Lang::Java | Lang::Kotlin => m.index_jvm(f),
                 Lang::Go => m.index_go(f, path),
                 Lang::Rust => m.index_rust(f, path),
+                Lang::TypeScript if is_declaration_file(path) => {
+                    // a script declaration file (no top-level import or export) declares its modules
+                    for ex in view.exports_of(f) {
+                        if view.text_str(ex.name) == cg_extract::facts::js::AMBIENT_MODULE && view.text_str(ex.from_name) == "script" {
+                            m.ambient.entry(view.text_str(ex.from_spec)).or_insert(f);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -395,6 +412,13 @@ impl<'v> Modules<'v> {
                         return ImportTarget::File(f);
                     }
                 }
+            }
+        }
+        // a module the repository declares itself (`declare module 'mammoth' { ... }`): the
+        // checker reads it before the package, and only TypeScript reads it at all
+        if from_lang.is_typescript() {
+            if let Some(f) = self.ambient.get(spec) {
+                return ImportTarget::File(*f);
             }
         }
         ImportTarget::External

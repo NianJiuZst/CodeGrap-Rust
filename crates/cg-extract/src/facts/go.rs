@@ -48,8 +48,16 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
             // `type A = B` names another type; a defined `type A B` is a type of its own
             if let Some(name) = n.child_by_field_name("name") {
                 let name = cx.text(name).to_owned();
-                cx.facts.go_types.push(GoTypeFact { name, alias: true, type_params: Vec::new() });
+                cx.facts.go_types.push(GoTypeFact { name, alias: true, type_params: Vec::new(), func_type: false });
             }
+        }
+        "composite_literal" => {
+            field_literal(cx, n);
+            walk_children(cx, n, scope);
+        }
+        "assignment_statement" => {
+            field_assignment(cx, n);
+            walk_children(cx, n, scope);
         }
         "short_var_declaration" => {
             let (l, r) = (n.child_by_field_name("left"), n.child_by_field_name("right"));
@@ -193,15 +201,35 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
 }
 
 fn type_spec(cx: &mut Cx, n: Node, scope: u32) {
-    if let (Some(name), Some(tp)) = (n.child_by_field_name("name"), n.child_by_field_name("type_parameters")) {
-        let params: Vec<String> = kids(tp)
-            .filter(|d| d.kind() == "type_parameter_declaration")
-            .flat_map(|d| kids(d).filter(|c| c.kind() == "identifier").map(|c| cx.text(c).to_owned()).collect::<Vec<_>>())
-            .collect();
-        let name = cx.text(name).to_owned();
-        cx.facts.go_types.push(GoTypeFact { name, alias: false, type_params: params });
+    let ty = n.child_by_field_name("type");
+    let func_type = ty.is_some_and(|t| t.kind() == "function_type");
+    if let Some(name) = n.child_by_field_name("name") {
+        let params: Vec<String> = n
+            .child_by_field_name("type_parameters")
+            .map(|tp| {
+                kids(tp)
+                    .filter(|d| d.kind() == "type_parameter_declaration")
+                    .flat_map(|d| kids(d).filter(|c| c.kind() == "identifier").map(|c| cx.text(c).to_owned()).collect::<Vec<_>>())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !params.is_empty() || func_type {
+            let name = cx.text(name).to_owned();
+            cx.facts.go_types.push(GoTypeFact { name, alias: false, type_params: params, func_type });
+        }
     }
-    let Some(ty) = n.child_by_field_name("type") else { return };
+    let Some(ty) = ty else { return };
+    let row = cx.row_at(cx.start(n));
+    if ty.kind() == "interface_type" {
+        // embedded interfaces (`io.Reader`, `error`); a union or `~T` constrains, it embeds nothing
+        for elem in kids(ty).filter(|c| c.kind() == "type_elem") {
+            let types: Vec<Node> = kids(elem).filter(|c| c.is_named()).collect();
+            if let ([t], Some(row)) = (types.as_slice(), row) {
+                embed(cx, row, *t);
+            }
+        }
+        return;
+    }
     if ty.kind() != "struct_type" {
         return;
     }
@@ -219,11 +247,131 @@ fn type_spec(cx: &mut Cx, n: Node, scope: u32) {
             // embedded field: promoted fields / methods; named after its type
             let simple = tname.rsplit('.').next().unwrap_or("").to_owned();
             cx.add_binding(sc, &simple, BindKind::Field, &tname, "embedded", line);
+            if let (Some(t), Some(row)) = (ftype, row) {
+                embed(cx, row, t);
+            }
         } else {
+            let func = ftype.is_some_and(|t| t.kind() == "function_type");
             for nm in names {
                 let t = cx.text(nm).to_owned();
                 cx.add_binding(sc, &t, BindKind::Field, &tname, "", line);
+                if let (true, Some(row)) = (func, row) {
+                    cx.facts.go_fields.push(GoFieldFact::FuncField { row, field: t });
+                }
             }
+        }
+    }
+}
+
+/// Record an embedded type: `io.Reader`, `*os.File`, `Base`, `error`.
+fn embed(cx: &mut Cx, row: u32, t: Node) {
+    let t = match t.kind() {
+        "pointer_type" | "parenthesized_type" => match t.named_child(0) {
+            Some(inner) => inner,
+            None => return,
+        },
+        "generic_type" => match t.child_by_field_name("type") {
+            Some(inner) => inner,
+            None => return,
+        },
+        _ => t,
+    };
+    let (qualifier, name) = match t.kind() {
+        "type_identifier" => (String::new(), cx.text(t).to_owned()),
+        "qualified_type" => match (t.child_by_field_name("package"), t.child_by_field_name("name")) {
+            (Some(p), Some(nm)) => (cx.text(p).to_owned(), cx.text(nm).to_owned()),
+            _ => return,
+        },
+        _ => return,
+    };
+    cx.facts.go_embeds.push(GoEmbedFact { row, qualifier, name });
+}
+
+/// A value a struct field can be given: a name (`h`, `d.refresh`, `pkg.Handle`, `o.opts.F`) or
+/// a conversion of one (`HandlerFunc(h.serve)`, kept as written for the linker to check).
+fn field_value(cx: &Cx, v: Node) -> Option<String> {
+    let v = if v.kind() == "literal_element" { v.named_child(0)? } else { v };
+    match v.kind() {
+        "identifier" => Some(cx.text(v).to_owned()),
+        "selector_expression" => {
+            let text = cx.text(v);
+            let plain = text.split('.').all(|s| {
+                let s = s.trim();
+                s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+            });
+            (plain && text.split('.').count() <= 3).then(|| text.split_whitespace().collect())
+        }
+        "parenthesized_expression" => field_value(cx, v.named_child(0)?),
+        "call_expression" => {
+            let callee = v.child_by_field_name("function")?;
+            let args: Vec<Node> = kids(v.child_by_field_name("arguments")?).filter(|a| a.is_named()).collect();
+            if !matches!(callee.kind(), "identifier" | "selector_expression") || args.len() != 1 {
+                return None;
+            }
+            let inner = field_value(cx, args[0])?;
+            Some(format!("{}({inner})", cx.text(callee)))
+        }
+        _ => None,
+    }
+}
+
+/// `T{F: v}` / `&T{a, v}`: the values a composite literal puts in the fields of `T`.
+fn field_literal(cx: &mut Cx, n: Node) {
+    let Some(ty) = n.child_by_field_name("type") else { return };
+    let ty_text = match ty.kind() {
+        "type_identifier" | "qualified_type" => cx.text(ty).to_owned(),
+        "generic_type" => match ty.child_by_field_name("type") {
+            Some(t) => cx.text(t).to_owned(),
+            None => return,
+        },
+        _ => return,
+    };
+    let Some(body) = n.child_by_field_name("body") else { return };
+    for (i, el) in kids(body).filter(|c| c.is_named() && c.kind() != "comment").enumerate() {
+        let (field, value) = match el.kind() {
+            "keyed_element" => {
+                let key = el.child_by_field_name("key").and_then(|k| k.named_child(0));
+                let Some(key) = key.filter(|k| matches!(k.kind(), "identifier" | "field_identifier")) else { continue };
+                let Some(value) = el.child_by_field_name("value") else { continue };
+                (cx.text(key).to_owned(), value)
+            }
+            "literal_element" => (format!("#{i}"), el),
+            _ => continue,
+        };
+        let pos = cx.start(value);
+        if let Some(value) = field_value(cx, value) {
+            cx.facts.go_fields.push(GoFieldFact::Literal { ty: ty_text.clone(), field, value, line: (pos >> 32) as u32, col: pos as u32 });
+        }
+    }
+}
+
+/// `x.F = v` / `x.y.F = v`: a value put in field `F` of what `x` (or `x.y`) holds.
+fn field_assignment(cx: &mut Cx, n: Node) {
+    if n.child_by_field_name("operator").map(|o| cx.text(o)) != Some("=") {
+        return;
+    }
+    let (Some(left), Some(right)) = (n.child_by_field_name("left"), n.child_by_field_name("right")) else { return };
+    let lefts: Vec<Node> = kids(left).filter(|c| c.is_named()).collect();
+    let rights: Vec<Node> = kids(right).filter(|c| c.is_named()).collect();
+    if lefts.len() != rights.len() {
+        return;
+    }
+    for (l, r) in lefts.into_iter().zip(rights) {
+        if l.kind() != "selector_expression" {
+            continue;
+        }
+        let (Some(operand), Some(field)) = (l.child_by_field_name("operand"), l.child_by_field_name("field")) else { continue };
+        let receiver = match operand.kind() {
+            "identifier" => cx.text(operand).to_owned(),
+            "selector_expression" => match (operand.child_by_field_name("operand"), operand.child_by_field_name("field")) {
+                (Some(o), Some(f)) if o.kind() == "identifier" => format!("{}.{}", cx.text(o), cx.text(f)),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if let Some(value) = field_value(cx, r) {
+            let pos = cx.start(r);
+            cx.facts.go_fields.push(GoFieldFact::Assign { receiver, field: cx.text(field).to_owned(), value, line: (pos >> 32) as u32, col: pos as u32 });
         }
     }
 }
