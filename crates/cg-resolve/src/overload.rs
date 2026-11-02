@@ -858,7 +858,7 @@ mod tests {
 
 #[cfg(test)]
 mod cpp_tests {
-    use super::cpp_fit;
+    use super::{cpp_fit, swift_labels_fit};
 
     fn fit(sig: &str, args: &[&str]) -> i32 {
         cpp_fit(Some(sig), args)

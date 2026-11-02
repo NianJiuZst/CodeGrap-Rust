@@ -692,6 +692,24 @@ fn cpp_macro_namespace_calls_pick_the_overload_their_arguments_fit() {
 }
 
 #[test]
+fn cpp_bases_in_macro_namespaces_and_calls_through_field_chains_are_typed() {
+    let (_d, view) = project(&[
+        (
+            "base.h",
+            "#define FMT_BEGIN_NAMESPACE namespace fmt {\n#define FMT_END_NAMESPACE }\nFMT_BEGIN_NAMESPACE\nnamespace detail {\ntemplate <typename T> class buffer {\n public:\n  int size() const { return 0; }\n};\n}\nclass file {\n public:\n  void close() {}\n};\nstruct pipe {\n  file read_end;\n};\nFMT_END_NAMESPACE\n",
+        ),
+        (
+            "t.cc",
+            "#include \"base.h\"\ntemplate <typename T> struct mock_buffer : fmt::detail::buffer<T> {};\nclass other {\n public:\n  int size() const { return 1; }\n  void close() {}\n};\nvoid use() {\n  mock_buffer<int> buffer;\n  buffer.size();\n  fmt::pipe p;\n  p.read_end.close();\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "t.cc::mock_buffer -extends-> base.h::detail::buffer"), "{edges:?}");
+    assert!(has(&edges, "t.cc::use -calls-> base.h::detail::buffer::size"), "{edges:?}");
+    assert!(has(&edges, "t.cc::use -calls-> base.h::file::close"), "{edges:?}");
+}
+
+#[test]
 fn ruby_bare_calls_are_method_calls_and_modules_reach_by_name() {
     let (_d, view) = project(&[(
         "lib/app.rb",

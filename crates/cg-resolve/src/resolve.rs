@@ -3116,6 +3116,8 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 TypeRes::Node(n) => NameRes::Found(n, by::QUALIFIED, 90),
                 TypeRes::External => NameRes::External,
                 TypeRes::Builtin => NameRes::Builtin,
+                // `fmt::detail::buffer<T>` with `fmt` opened by a macro
+                TypeRes::Unknown if self.family == LangFamily::C => self.cpp_scoped(name, true).map_or(NameRes::NotFound, |n| NameRes::Found(n, by::QUALIFIED, 90)),
                 TypeRes::Unknown => NameRes::NotFound,
             }
         } else if let Some(n) = self.cpp_nested_type(r.from, name) {

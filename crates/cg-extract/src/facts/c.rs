@@ -78,8 +78,26 @@ fn walk(cx: &mut Cx, n: Node, scope: u32, depth: u32) {
                 walk(cx, body, scope, depth + 1);
             }
         }
+        "call_expression" => {
+            field_chain_call(cx, n);
+            walk_children(cx, n, scope, depth);
+        }
         _ => walk_children(cx, n, scope, depth),
     }
+}
+
+/// The kernel names a call on a member of a member (`pipe.write_end.close()`) by its method
+/// alone: give it the field chain it is called on, rooted in a name or `this`.
+fn field_chain_call(cx: &mut Cx, n: Node) {
+    let Some(f) = n.child_by_field_name("function").filter(|f| f.kind() == "field_expression") else { return };
+    let (Some(method), Some(recv)) = (f.child_by_field_name("field"), f.child_by_field_name("argument")) else { return };
+    if recv.kind() != "field_expression" {
+        return;
+    }
+    let Some(path) = member_path(cx, f).filter(|p| !p.contains("()") && !p.contains("::")) else { return };
+    let pos = cx.start(n);
+    let tail = cx.text(method).to_owned();
+    cx.facts.call_names.push(CallNameFact { line: (pos >> 32) as u32, col: pos as u32, kernel_name: tail.clone(), tail, name: path });
 }
 
 // ---------------------------------------------------------------------------------------------
