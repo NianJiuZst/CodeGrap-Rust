@@ -64,6 +64,9 @@ const FILES: &[(&str, &str)] = &[
     ("win/use.js", "function setup() {\n  Filter.init();\n}\n"),
     ("esm/anon.ts", "export default function () {\n  return 1;\n}\n"),
     ("esm/use.ts", "import anon from './anon';\nexport function run() {\n  return anon();\n}\n"),
+    ("ov/doc.ts", "export class Doc {\n  write(fn: () => void): void;\n  write(line: string): void;\n  write(arg: any) {}\n}\nexport function emit(doc: Doc) {\n  doc.write('a');\n}\n"),
+    ("fwd/express.js", "var Router = require('router');\nexports = module.exports = createApplication;\nfunction createApplication() {}\nexports.Router = Router;\n"),
+    ("fwd/use.js", "var express = require('./express');\nfunction make() {\n  return express.Router();\n}\n"),
 ];
 
 /// One-sided edits of the links above: (file, from, to).
@@ -115,6 +118,14 @@ const EDITS: &[(&str, &str, &str)] = &[
     // `import anon` names the file whatever its default export is called
     ("esm/anon.ts", "export default function ()", "export default function named()"),
     ("esm/anon.ts", "export default function named()", "export default function ()"),
+    // `doc.write(..)` names the first overload
+    ("ov/doc.ts", "  write(fn: () => void): void;\n  write(line: string): void;\n", "  write(line: string): void;\n  write(fn: () => void): void;\n"),
+    ("ov/doc.ts", "  write(line: string): void;\n  write(fn: () => void): void;\n", "  write(fn: () => void): void;\n  write(line: string): void;\n"),
+    // `express.Router()` reaches the variable `exports.Router` forwards
+    ("fwd/express.js", "var Router = require('router');", "var Rtr = require('router');"),
+    ("fwd/express.js", "var Rtr = require('router');", "var Router = require('router');"),
+    ("fwd/express.js", "exports.Router = Router;", "exports.Router = createApplication;"),
+    ("fwd/express.js", "exports.Router = createApplication;", "exports.Router = Router;"),
 ];
 
 struct Rng(u64);

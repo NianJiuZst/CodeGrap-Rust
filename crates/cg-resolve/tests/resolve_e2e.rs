@@ -559,6 +559,67 @@ fn typescript_type_parameters_name_no_declaration() {
     assert!(!edges.iter().any(|e| e.starts_with("src/schema.ts") && e.contains("-> src/output.ts")), "{edges:#?}");
 }
 
+/// `from -kind-> path:line#kind@qname` for every edge of the given kinds out of `from`.
+fn keyed_edges(view: &View, kinds: &[cg_core::EdgeKind]) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in view.files() {
+        for n in view.nodes_in_file(f) {
+            let n = cg_core::NodeIdx(n);
+            for e in view.out_edges(n).filter(|e| kinds.contains(&e.kind)) {
+                out.push(format!("{} -{:?}-> {}", dump::node_label(view, n), e.kind, dump::node_key(view, e.dst)));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn typescript_receiver_calls_name_the_first_overload() {
+    let (_d, view) = project(&[(
+        "src/doc.ts",
+        "type ModeWriter = (doc: Doc) => void;\nexport class Doc {\n  write(fn: ModeWriter): void;\n  write(line: string): void;\n  write(arg: any) {}\n  f(s: string): void;\n  f(n: number, m?: number): void;\n  f(a: any, b?: any): void {}\n  run(n: number) {\n    this.f('x');\n    this.f(n, 2);\n  }\n}\nexport function emit(doc: Doc) {\n  doc.write(`a`);\n  doc.write('b');\n}\n",
+    )]);
+    let edges = keyed_edges(&view, &[cg_core::EdgeKind::Calls]);
+    // through a typed receiver, the method's first declaration stands for its overloads, as upstream links it
+    let writes: Vec<_> = edges.iter().filter(|e| e.starts_with("src/doc.ts::emit -Calls-> ")).collect();
+    assert!(writes.len() == 2 && writes.iter().all(|w| w.contains("src/doc.ts:3:")), "{edges:#?}");
+    // `this.f(..)` keeps the overload its arguments fit
+    for line in [6, 7] {
+        assert!(edges.iter().any(|e| e.starts_with("src/doc.ts::Doc::run -Calls-> ") && e.contains(&format!("src/doc.ts:{line}:"))), "{edges:#?}");
+    }
+}
+
+#[test]
+fn typescript_new_of_a_bare_interface_links_nothing() {
+    let (_d, view) = project(&[
+        ("src/types.ts", "export interface File {\n  name: string;\n}\nexport type Blob = { size: number };\n"),
+        ("src/use.test.ts", "export function make() {\n  return [new File([], \"a.txt\"), new Blob()];\n}\n"),
+    ]);
+    let edges = keyed_edges(&view, &[cg_core::EdgeKind::Instantiates, cg_core::EdgeKind::Calls]);
+    // the DOM's `File`, not the project's interface: an interface makes no value
+    assert!(!edges.iter().any(|e| e.starts_with("src/use.test.ts::make ")), "{edges:#?}");
+}
+
+#[test]
+fn commonjs_member_call_reaches_the_variable_a_module_exports() {
+    let (_d, view) = project(&[
+        (
+            "lib/express.js",
+            "var bodyParser = require('body-parser');\nvar Router = require('router');\nexports = module.exports = createApplication;\nfunction createApplication() {\n  return {};\n}\nexports.Router = Router;\nexports.json = bodyParser.json;\n",
+        ),
+        ("test/app.js", "var express = require('../lib/express');\nfunction make() {\n  var app = express();\n  express.json();\n  return express.Router();\n}\n"),
+        // the package root forwards the whole module
+        ("index.js", "module.exports = require('./lib/express');\n"),
+        ("test/root.js", "var express = require('..');\nfunction viaRoot() {\n  return express.Router();\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "test/app.js::make -calls-> lib/express.js::createApplication"), "{edges:#?}");
+    assert!(has(&edges, "test/app.js::make -calls-> lib/express.js::Router"), "{edges:#?}");
+    assert!(has(&edges, "test/root.js::viaRoot -calls-> lib/express.js::Router"), "{edges:#?}");
+    // `exports.json = bodyParser.json` is a dependency's function, not the `bodyParser` variable
+    assert!(!has(&edges, "test/app.js::make -calls-> lib/express.js::bodyParser"), "{edges:#?}");
+}
+
 #[test]
 fn javascript_window_global_members_answer_unbound_receivers() {
     let (_d, view) = project(&[

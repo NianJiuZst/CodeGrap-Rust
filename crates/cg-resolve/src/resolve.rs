@@ -3238,7 +3238,13 @@ impl<'e, 'v> FileCx<'e, 'v> {
         match parse_shape(name) {
             Shape::Bare(n) if self.swift_extended_builtin(n, r) => Outcome::st(status::BUILTIN),
             Shape::Bare(n) => self.call_bare(wcx, r, n, Accept::Callable, args),
-            Shape::Member { root, path, method } => self.call_member(wcx, r, root, &path, method, args),
+            Shape::Member { root, path, method } => {
+                let o = self.js_first_overload(self.call_member(wcx, r, root, &path, method, args));
+                if o.status == status::RESOLVED || !path.is_empty() {
+                    return o;
+                }
+                self.js_required_export(r, root, method).map_or(o, |n| Outcome::found(n, by::IMPORT, 90))
+            }
             Shape::This { kw, fields, method } if self.family == LangFamily::Js && kw != "this" => self.call_member(wcx, r, kw, &fields, method, args),
             Shape::This { kw, fields, method } => self.call_this(wcx, r, kw, &fields, method, args),
             Shape::Super { method } => self.call_super(wcx, r, method, args),
@@ -3250,11 +3256,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
                     None => Outcome::st(status::NO_CANDIDATE),
                 },
             },
-            Shape::CallResult { inner, method } => self.call_result(wcx, r, inner, method, args),
+            Shape::CallResult { inner, method } => self.js_first_overload(self.call_result(wcx, r, inner, method, args)),
             Shape::ValueResult { inner, method } => {
                 let value = self.expression_value(wcx, inner, self.scope_at(r.line, r.col), r.line, 0);
                 match value.and_then(|v| v.method_receiver(method)) {
-                    Some(t) => self.member_call(wcx, t, &[], method, 85, args.map(|a| (a, r))),
+                    Some(t) => self.js_first_overload(self.member_call(wcx, t, &[], method, 85, args.map(|a| (a, r)))),
                     None => Outcome::st(status::NO_CANDIDATE),
                 }
             }
@@ -3470,6 +3476,56 @@ impl<'e, 'v> FileCx<'e, 'v> {
         })
     }
 
+    /// TS `doc.write(..)` on a typed receiver: the method's first declaration stands for its
+    /// overload signatures, as upstream links it (`this.write(..)` keeps the overload that fits).
+    fn js_first_overload(&self, o: Outcome) -> Outcome {
+        if self.family != LangFamily::Js || o.status != status::RESOLVED || kind_of(self.view, NodeIdx(o.target)) != NodeKind::Method {
+            return o;
+        }
+        let view = self.view;
+        let m = view.node(NodeIdx(o.target));
+        view.by_name(m.name())
+            .filter(|&n| view.node(n).parent() == m.parent() && kind_of(view, n) == NodeKind::Method)
+            .min_by_key(|&n| (view.node(n).start_line(), view.node(n).start_col()))
+            .map_or(o, |n| Outcome::found(n, o.by, o.conf))
+    }
+
+    /// CommonJS `var express = require('./express'); express.Router()`: the variable the module
+    /// exports under that name (`exports.Router = Router`).
+    fn js_required_export(&self, r: &RefRec, root: &str, method: &str) -> Option<NodeIdx> {
+        if self.family != LangFamily::Js {
+            return None;
+        }
+        let i = self.visible_import(root, self.scope_at(r.line, r.col))?;
+        if self.imports[i as usize].kind != ImportKind::Require as u8 {
+            return None;
+        }
+        let Some(ImportTarget::File(tf)) = self.e.imp_targets[self.file.idx()].get(i as usize).copied() else { return None };
+        let view = self.view;
+        let variable = |n: NodeIdx| matches!(kind_of(view, n), NodeKind::Variable | NodeKind::Constant);
+        if let Some(Bound::Node(n)) = self.e.lookup_export(tf, method, 0) {
+            return variable(n).then_some(n);
+        }
+        // `var Router = require('router'); exports.Router = Router` forwards a dependency: the
+        // variable holding it is what the project can link. The file may sit behind a package
+        // root's `module.exports = require('./lib/express')`.
+        let mut files = vec![tf];
+        let mut i = 0;
+        while i < files.len() && files.len() < 8 {
+            for &s in &self.e.stars[files[i].idx()] {
+                if !files.contains(&s) {
+                    files.push(s);
+                }
+            }
+            i += 1;
+        }
+        files.into_iter().find_map(|f| {
+            let spec_of = |name: &str| view.imports_of(f).iter().find(|i| view.text_str(i.local) == name).map(|i| view.text_str(i.spec));
+            let forwarded = view.exports_of(f).iter().any(|e| view.text_str(e.name) == method && spec_of(method) == Some(view.text_str(e.from_spec)));
+            self.e.lookup_top_level(f, method).filter(|&n| forwarded && variable(n))
+        })
+    }
+
     /// JS `interface X` and `const X` in one file: importing `X` names whichever comes first
     /// (as upstream does); `new X()` and calls still take the value.
     fn js_first_twin(&self, o: Outcome) -> Outcome {
@@ -3579,7 +3635,15 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 if o.status == status::NO_CANDIDATE {
                     self.resolve_type_ref(wcx, r, name, Accept::Callable)
                 } else {
-                    self.js_value_twin(o)
+                    let o = self.js_value_twin(o);
+                    // `new File([], name)` with only `interface File` in reach: a global's value (the
+                    // DOM's), since an interface makes none
+                    let bare_type = o.status == status::RESOLVED && matches!(kind_of(self.view, NodeIdx(o.target)), NodeKind::Interface | NodeKind::TypeAlias);
+                    if self.family == LangFamily::Js && bare_type {
+                        Outcome::st(status::NO_CANDIDATE)
+                    } else {
+                        o
+                    }
                 }
             }
             RefKind::Edge(EdgeKind::References) => {
