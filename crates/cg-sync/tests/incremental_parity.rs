@@ -58,6 +58,12 @@ const FILES: &[(&str, &str)] = &[
     ("cjs/app.js", "var compileETag = require('./utils').compileETag;\nfunction setup(v) {\n  compileETag(v);\n}\nmodule.exports = setup;\n"),
     ("barrel/core.ts", "export function _lt() {}\nexport function _gte() {}\n"),
     ("barrel/checks.ts", "export {\n  _lt as lt,\n  _gte as gte,\n} from './core';\n"),
+    ("twin/schema.ts", "export interface Shape {\n  kind: string;\n}\nexport const Shape: any = null;\n"),
+    ("twin/use.ts", "import { Shape } from './schema';\nexport function make() {\n  return new Shape();\n}\n"),
+    ("win/filter.js", "window.Filter = {\n  init: function () {}\n};\n"),
+    ("win/use.js", "function setup() {\n  Filter.init();\n}\n"),
+    ("esm/anon.ts", "export default function () {\n  return 1;\n}\n"),
+    ("esm/use.ts", "import anon from './anon';\nexport function run() {\n  return anon();\n}\n"),
 ];
 
 /// One-sided edits of the links above: (file, from, to).
@@ -90,6 +96,25 @@ const EDITS: &[(&str, &str, &str)] = &[
     ("barrel/core.ts", "export function _lt()", "export function _ltX()"),
     ("barrel/core.ts", "export function _ltX()", "export function _lt()"),
     ("barrel/checks.ts", "_gte as gte,\n", ""),
+    // `import { Shape }` names whichever of the twins comes first
+    (
+        "twin/schema.ts",
+        "export interface Shape {\n  kind: string;\n}\nexport const Shape: any = null;\n",
+        "export const Shape: any = null;\nexport interface Shape {\n  kind: string;\n}\n",
+    ),
+    (
+        "twin/schema.ts",
+        "export const Shape: any = null;\nexport interface Shape {\n  kind: string;\n}\n",
+        "export interface Shape {\n  kind: string;\n}\nexport const Shape: any = null;\n",
+    ),
+    // `Filter.init()` reaches the `window.Filter` global of another script
+    ("win/filter.js", "window.Filter =", "window.Filtr ="),
+    ("win/filter.js", "window.Filtr =", "window.Filter ="),
+    ("win/filter.js", "  init: function", "  start: function"),
+    ("win/filter.js", "  start: function", "  init: function"),
+    // `import anon` names the file whatever its default export is called
+    ("esm/anon.ts", "export default function ()", "export default function named()"),
+    ("esm/anon.ts", "export default function named()", "export default function ()"),
 ];
 
 struct Rng(u64);

@@ -370,6 +370,15 @@ fn synthesised_edges_for_dynamic_dispatch() {
     let has = |needle: &str| edges.iter().any(|e| e == needle);
     assert!(has("ui/App.tsx::App -calls-> ui/Child.tsx::Child"), "jsx-render: {edges:#?}");
     assert!(synth_meta(&v, "ui/App.tsx::App", "ui/Child.tsx::Child").unwrap().contains("jsx-render"));
+    // like the other synthesised edges, a render sits on the rendering component's first line
+    let render_lines: Vec<_> = v
+        .files()
+        .flat_map(|f| v.nodes_in_file(f))
+        .flat_map(|n| v.out_edges(cg_core::NodeIdx(n)))
+        .filter(|e| e.kind == cg_core::EdgeKind::Calls && cg_store::dump::node_label(&v, e.dst) == "ui/Child.tsx::Child")
+        .map(|e| e.line)
+        .collect();
+    assert_eq!(render_lines, [Some(2)]);
     assert!(has("ui/Comp.jsx::Comp::handle -calls-> ui/Comp.jsx::Comp::render"), "react-render: {edges:#?}");
     assert!(has("bus/bus.ts::fire -calls-> bus/bus.ts::onTick"), "event-emitter: {edges:#?}");
     assert!(synth_meta(&v, "bus/bus.ts::fire", "bus/bus.ts::onTick").unwrap().contains("\"event\":\"tick\""));
@@ -500,6 +509,91 @@ fn typescript_new_makes_the_value_beside_a_same_named_interface() {
         assert!(made.iter().any(|m| m.starts_with(&format!("{from} -> ")) && m.contains("@ZodUnknown:")), "{made:#?}");
     }
     assert!(!made.iter().any(|m| m.contains("#interface@")), "{made:#?}");
+}
+
+#[test]
+fn typescript_import_of_a_type_and_value_twin_names_its_first_declaration() {
+    let (_d, view) = project(&[
+        (
+            "src/schemas.ts",
+            "function ctor(): any {\n  return null;\n}\nexport interface TypeFirst {\n  kind: string;\n}\nexport const TypeFirst: any = ctor();\nexport const ValueFirst: any = ctor();\nexport type ValueFirst = { kind: string };\n",
+        ),
+        ("src/index.ts", "export { TypeFirst, ValueFirst } from \"./schemas\";\n"),
+        ("src/use.ts", "import { TypeFirst, ValueFirst } from \"./schemas\";\nexport function make() {\n  return [new TypeFirst(), new ValueFirst()];\n}\n"),
+    ]);
+    let mut edges = Vec::new();
+    for f in view.files() {
+        for n in view.nodes_in_file(f) {
+            let n = cg_core::NodeIdx(n);
+            for e in view.out_edges(n).filter(|e| matches!(e.kind, cg_core::EdgeKind::Imports | cg_core::EdgeKind::Instantiates)) {
+                edges.push(format!("{} -{:?}-> {}", dump::node_label(&view, n), e.kind, dump::node_key(&view, e.dst)));
+            }
+        }
+    }
+    let to = |from: &str, kind: &str, name: &str| {
+        edges.iter().filter(|e| e.starts_with(&format!("{from} -{kind}-> ")) && e.contains(&format!("@{name}:"))).collect::<Vec<_>>()
+    };
+    // `import` and `export .. from` name the declaration that comes first, as upstream does
+    for from in ["src/use.ts", "src/index.ts"] {
+        let (t, v) = (to(from, "Imports", "TypeFirst"), to(from, "Imports", "ValueFirst"));
+        assert!(t.len() == 1 && t[0].contains("#interface@"), "{edges:#?}");
+        assert!(v.len() == 1 && v[0].contains("#constant@"), "{edges:#?}");
+    }
+    // `new` still makes the value
+    for name in ["TypeFirst", "ValueFirst"] {
+        let made = to("src/use.ts::make", "Instantiates", name);
+        assert!(made.len() == 1 && made[0].contains("#constant@"), "{edges:#?}");
+    }
+}
+
+#[test]
+fn typescript_type_parameters_name_no_declaration() {
+    let (_d, view) = project(&[
+        ("src/output.ts", "export class Output {\n  run() {}\n}\nexport interface T {\n  kind: string;\n}\n"),
+        (
+            "src/schema.ts",
+            "export class Schema<Output> {\n  parse(data: unknown): Output {\n    return data as Output;\n  }\n}\nexport function make<T>(value: T): T {\n  return value;\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(!edges.iter().any(|e| e.starts_with("src/schema.ts") && e.contains("-> src/output.ts")), "{edges:#?}");
+}
+
+#[test]
+fn javascript_window_global_members_answer_unbound_receivers() {
+    let (_d, view) = project(&[
+        (
+            "static/filter.js",
+            "'use strict';\n{\n  window.SelectFilter = {\n    init: function (id) {\n      SelectFilter.refresh(id);\n    },\n    refresh: function (id) {}\n  };\n}\n",
+        ),
+        ("static/inlines.js", "function update(row) {\n  SelectFilter.init(row);\n}\nfunction shadowed(SelectFilter) {\n  SelectFilter.init(1);\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "static/inlines.js::update -calls-> static/filter.js::window.SelectFilter::init"), "{edges:#?}");
+    assert!(has(&edges, "static/filter.js::window.SelectFilter::init -calls-> static/filter.js::window.SelectFilter::refresh"), "{edges:#?}");
+    // a parameter of that name is not the global
+    assert!(!edges.iter().any(|e| e.starts_with("static/inlines.js::shadowed -calls-> ")), "{edges:#?}");
+}
+
+#[test]
+fn javascript_default_import_names_the_module_file() {
+    let (_d, view) = project(&[
+        ("src/anon.ts", "export default function () {\n  return 1;\n}\n"),
+        ("src/named.ts", "export default function named() {\n  return 2;\n}\n"),
+        ("src/use.ts", "import anon from \"./anon\";\nimport named from \"./named\";\nexport function run() {\n  return anon() + named();\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    // the statement and the bound name both link the file, as upstream does
+    let user = view.files().find(|&f| view.file(f).path() == "src/use.ts").unwrap();
+    let mut sites: Vec<_> = view
+        .out_edges(view.file(user).rec.node_start)
+        .filter(|e| e.kind == cg_core::EdgeKind::Imports)
+        .map(|e| format!("{:?}:{:?} {}", e.line, e.col, dump::node_label(&view, e.dst)))
+        .collect();
+    sites.sort();
+    assert_eq!(sites, ["Some(1):Some(0) src/anon.ts", "Some(1):Some(7) src/anon.ts", "Some(2):Some(0) src/named.ts", "Some(2):Some(7) src/named.ts"]);
+    // calls still reach the function
+    assert!(has(&edges, "src/use.ts::run -calls-> src/named.ts::named"), "{edges:#?}");
 }
 
 #[test]

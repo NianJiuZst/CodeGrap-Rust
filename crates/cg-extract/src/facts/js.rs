@@ -658,6 +658,7 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
         }
     }
     let sc = cx.push_scope(ScopeKind::Function, scope, n);
+    type_params(cx, n, sc);
     return_annotation(cx, n, sc);
     let line = cx.line(n);
     if let Some(p) = n.child_by_field_name("parameter") {
@@ -689,6 +690,15 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
         } else {
             walk(cx, ch, sc);
         }
+    }
+}
+
+/// `class Schema<Output>`, `function f<T>()`: `Output` and `T` inside name no declaration.
+fn type_params(cx: &mut Cx, n: Node, sc: u32) {
+    let Some(params) = n.child_by_field_name("type_parameters") else { return };
+    for name in kids(params).filter_map(|p| p.child_by_field_name("name")) {
+        let name = cx.text(name).to_owned();
+        cx.add_binding(sc, &name, BindKind::TypeParam, "", "", 0);
     }
 }
 
@@ -787,6 +797,7 @@ fn factory_mixin(cx: &mut Cx, n: Node, scope: u32) {
 
 fn class(cx: &mut Cx, n: Node, scope: u32) {
     let sc = cx.push_scope(ScopeKind::Class, scope, n);
+    type_params(cx, n, sc);
     let Some(body) = n.child_by_field_name("body") else {
         walk_children(cx, n, scope);
         return;

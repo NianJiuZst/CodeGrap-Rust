@@ -2586,6 +2586,15 @@ impl<'e, 'v> FileCx<'e, 'v> {
         if is_builtin(self.family, root) {
             return Outcome::st(status::BUILTIN);
         }
+        // JS `window.SelectFilter = { init: .. }` in one script, `SelectFilter.init()` in another
+        if self.family == LangFamily::Js && path.is_empty() {
+            let mut globals = view.by_qname(&format!("window.{root}"));
+            if let (Some(g), None) = (globals.next(), globals.next()) {
+                if let Some(m) = self.e.direct_member(g, method) {
+                    return Outcome::found(m, by::GLOBAL, 80);
+                }
+            }
+        }
         if matches!(self.family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby) {
             if let Some(n) = self.qualified_callable(r.from, root, path, method, false) {
                 return Outcome::found(self.cpp_function_overload(n, args), by::QUALIFIED, 90);
@@ -3447,8 +3456,35 @@ impl<'e, 'v> FileCx<'e, 'v> {
             // a JS re-export (`export { a as b } from 'm'`) binds no local: the reference names `a`
             let reexport = local.is_empty() && self.family == LangFamily::Js && imported == name;
             let bound = (!local.is_empty() && local == name) || reexport || format!("{spec}::{imported}") == name || format!("{spec}.{imported}") == name;
-            bound.then(|| self.bound_outcome(self.e.bind_import(self.file, i as usize)))
+            if !bound {
+                return None;
+            }
+            // JS `import x from "./m"` names the module, as upstream does; calls of `x` still
+            // reach its default export
+            if self.family == LangFamily::Js && imp.kind == ImportKind::Default as u8 && imported == "default" {
+                if let Some(ImportTarget::File(tf)) = self.e.imp_targets[self.file.idx()].get(i as usize) {
+                    return Some(Outcome::found(self.file_node(*tf), by::IMPORT, 95));
+                }
+            }
+            Some(self.js_first_twin(self.bound_outcome(self.e.bind_import(self.file, i as usize))))
         })
+    }
+
+    /// JS `interface X` and `const X` in one file: importing `X` names whichever comes first
+    /// (as upstream does); `new X()` and calls still take the value.
+    fn js_first_twin(&self, o: Outcome) -> Outcome {
+        if self.family != LangFamily::Js || o.status != status::RESOLVED {
+            return o;
+        }
+        let view = self.view;
+        let t = view.node(NodeIdx(o.target));
+        let is_type = |n| matches!(kind_of(view, n), NodeKind::Interface | NodeKind::TypeAlias | NodeKind::Class | NodeKind::Enum);
+        let is_value = |n| matches!(kind_of(view, n), NodeKind::Variable | NodeKind::Constant | NodeKind::Function);
+        let twins: Vec<_> = view.by_name(t.name()).filter(|&n| view.hot(n).file == t.file() && view.node(n).parent() == t.parent()).collect();
+        if !(twins.iter().any(|&n| is_type(n)) && twins.iter().any(|&n| is_value(n))) {
+            return o;
+        }
+        twins.into_iter().min_by_key(|&n| (view.node(n).start_line(), view.node(n).start_col())).map_or(o, |n| Outcome::found(n, o.by, o.conf))
     }
 
     /// A name on a continuation line of a multi-line import (`from m import (\n    a,\n)`,

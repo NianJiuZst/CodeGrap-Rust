@@ -447,7 +447,9 @@ fn jsx_render<'e, 'v>(e: &'e Engine<'v>, out: &mut Out, wcx: &mut WorkerCx<'e, '
             if let NameRes::Found(t, ..) = cx.resolve_name(wcx, tag, Accept::Callable, 0, u32::MAX, None, false) {
                 let k = view.node(t).kind();
                 if matches!(k, NodeKind::Function | NodeKind::Class | NodeKind::Component | NodeKind::Variable | NodeKind::Constant) && t != s.node {
-                    out.push(EdgeKind::Calls, s.node, t, 0, "jsx-render", Some(path_line(view, f, s.line)), Some(("via", tag)), order_of("jsx-render"));
+                    // like the other synthesised edges, on the rendering component's first line
+                    let line = view.node(s.node).start_line();
+                    out.push(EdgeKind::Calls, s.node, t, line, "jsx-render", Some(path_line(view, f, s.line)), Some(("via", tag)), order_of("jsx-render"));
                 }
             }
         }

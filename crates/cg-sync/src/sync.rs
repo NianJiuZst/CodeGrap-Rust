@@ -272,6 +272,26 @@ fn js_value_fact_sig(view: &View, f: FileId) -> JsValueFactSig {
         .collect()
 }
 
+/// JS `interface X` beside `const X`: importing `X` names whichever comes first, so swapping
+/// same-named declarations changes what importers link.
+fn js_twin_order_sig(view: &View, f: FileId) -> Vec<(String, u8)> {
+    if view.file(f).lang().family() != LangFamily::Js {
+        return Vec::new();
+    }
+    let mut count: FxHashMap<&str, u32> = FxHashMap::default();
+    for n in view.nodes_in_file(f) {
+        *count.entry(view.node(NodeIdx(n)).qname()).or_default() += 1;
+    }
+    let mut twins: Vec<_> = view
+        .nodes_in_file(f)
+        .map(|n| view.node(NodeIdx(n)))
+        .filter(|n| count[n.qname()] > 1)
+        .map(|n| (n.start_line(), n.start_col(), n.qname().to_owned(), n.kind() as u8))
+        .collect();
+    twins.sort();
+    twins.into_iter().map(|(_, _, q, k)| (q, k)).collect()
+}
+
 /// These facts change resolution even when the kernel's declaration identity
 /// stays the same (e.g. `obj.old = function internal` -> `obj.new = ...`, or the target of a
 /// Rust `impl Deref`, which has no node of its own).
@@ -609,7 +629,10 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
         }
         if states[i] == DeltaState::Replaced {
             pair_nodes(&base_view, &view1, *f, &mut remap);
-            if export_sig(&base_view, *f) != export_sig(&view1, *f) || reexported_import_sig(&base_view, *f) != reexported_import_sig(&view1, *f) {
+            if export_sig(&base_view, *f) != export_sig(&view1, *f)
+                || reexported_import_sig(&base_view, *f) != reexported_import_sig(&view1, *f)
+                || js_twin_order_sig(&base_view, *f) != js_twin_order_sig(&view1, *f)
+            {
                 export_changed.push(*f);
             }
         }
