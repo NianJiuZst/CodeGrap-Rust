@@ -633,6 +633,32 @@ fn typescript_namespace_type_goes_through_the_star_exports() {
     assert!(!edges.iter().any(|e| e.ends_with("-references-> classic/in-out.ts::output")), "{edges:#?}");
 }
 
+#[test]
+fn typescript_variable_and_field_annotations_and_enum_members_name_their_types() {
+    let (_d, view) = project(&[
+        ("core/core.ts", "export type output<T> = T;\n"),
+        ("core/index.ts", "export * from \"./core.js\";\n"),
+        ("classic/in-out.ts", "import type * as core from \"../core/index.js\";\nexport type output<T> = core.output<T>;\n"),
+        (
+            "classic/parse.ts",
+            "import * as core from \"../core/index.js\";\nconst make = (): any => null;\nexport const parse: (x: unknown) => core.output<number> = make();\nexport class Box {\n  value?: core.output<string>;\n}\n",
+        ),
+        (
+            "v3/types.ts",
+            "export enum Kind {\n  ZodLiteral = \"ZodLiteral\",\n}\nexport class ZodLiteral {}\nexport interface ZodLiteralDef {\n  typeName: Kind.ZodLiteral;\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    // Zod's `export const decode: (.., _ctx?: core.ParseContext<..>) => ..`
+    assert!(has(&edges, "classic/parse.ts::parse -references-> core/core.ts::output"), "{edges:#?}");
+    let field = edges.iter().any(|e| e.starts_with("classic/parse.ts::Box") && e.ends_with("-references-> core/core.ts::output"));
+    assert!(field, "{edges:#?}");
+    assert!(!edges.iter().any(|e| e.ends_with("-references-> classic/in-out.ts::output")), "{edges:#?}");
+    // v3's `typeName: ZodFirstPartyTypeKind.ZodLiteral` beside `class ZodLiteral`
+    assert!(has(&edges, "v3/types.ts::ZodLiteralDef::typeName -references-> v3/types.ts::Kind::ZodLiteral"), "{edges:#?}");
+    assert!(!edges.iter().any(|e| e.ends_with("-references-> v3/types.ts::ZodLiteral")), "{edges:#?}");
+}
+
 fn edges_of(view: &View) -> Vec<String> {
     let mut edges = dump::dump_edges(view);
     edges.dedup();

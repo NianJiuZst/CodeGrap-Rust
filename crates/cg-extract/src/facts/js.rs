@@ -802,8 +802,10 @@ fn class(cx: &mut Cx, n: Node, scope: u32) {
                     let line = cx.line(m);
                     cx.add_binding(sc, &nm, BindKind::Field, if ty.is_empty() { &vt } else { &ty }, &init, line);
                 }
-                if let Some(v) = m.child_by_field_name("value") {
-                    walk(cx, v, sc);
+                for c in ["type", "value"] {
+                    if let Some(v) = m.child_by_field_name(c) {
+                        walk(cx, v, sc);
+                    }
                 }
             }
             "method_definition" => {
@@ -874,6 +876,9 @@ fn var_decl(cx: &mut Cx, n: Node, scope: u32) {
         }
         let Some(name) = d.child_by_field_name("name") else { continue };
         let ty = d.child_by_field_name("type").map(|t| ts_type_name(cx, t)).unwrap_or_default();
+        if let Some(t) = d.child_by_field_name("type") {
+            walk(cx, t, scope); // `core.ParseContext` inside the annotation
+        }
         let value = d.child_by_field_name("value");
         if let Some(v) = value {
             // `var app = exports = module.exports = {}` ties subsequent

@@ -3561,7 +3561,13 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 // `errorUtil.ErrMessage`: the kernel flattens a TS `namespace`'s members into its file,
                 // where no path walk enters; the last segment, as the kernel names it
                 match name.rsplit_once('.') {
-                    Some((_, tail)) if o.status == status::NO_CANDIDATE && self.family == LangFamily::Js => self.resolve_kind(wcx, r, tail, kind),
+                    Some((path, tail)) if o.status == status::NO_CANDIDATE && self.family == LangFamily::Js => match self.lookup_type(wcx, path) {
+                        // `typeName: ZodFirstPartyTypeKind.ZodLiteral` names the enum's member, not `class ZodLiteral`
+                        TypeRes::Node(e) if kind_of(self.view, e) == NodeKind::Enum => {
+                            self.e.direct_member(e, tail).map_or(o, |m| Outcome::found(m, by::QUALIFIED, 90))
+                        }
+                        _ => self.resolve_kind(wcx, r, tail, kind),
+                    },
                     _ => o,
                 }
             }
