@@ -47,8 +47,12 @@ pub struct Engine<'v> {
     pub stars: Vec<Vec<FileId>>,
     /// Per package: top-level definitions by name.
     pub pkg_defs: Vec<FxHashMap<&'v str, SmallVec<[NodeIdx; 2]>>>,
-    /// Direct supertypes (`extends` / `implements` resolved in round 1).
+    /// Direct supertypes (`extends` / `implements` resolved in round 1), in the order written.
     pub supers: FxHashMap<NodeIdx, SmallVec<[NodeIdx; 3]>>,
+    /// Python classes' method resolution order (C3), past the class itself.
+    mro: FxHashMap<NodeIdx, Vec<NodeIdx>>,
+    /// Rust methods of `impl Trait for X` blocks: an inherent `X::m` shadows them.
+    trait_methods: rustc_hash::FxHashSet<NodeIdx>,
     /// C++ namespaces opened by a `#define` anywhere in the project.
     pub macro_namespaces: rustc_hash::FxHashSet<&'v str>,
     /// JavaScript functions with syntax evidence that they implement an object member.
@@ -126,6 +130,14 @@ impl<'v> Engine<'v> {
             stars: vec![Vec::new(); n_files],
             pkg_defs: Vec::new(),
             supers: FxHashMap::default(),
+            mro: FxHashMap::default(),
+            trait_methods: files
+                .iter()
+                .filter(|f| view.file(**f).lang() == Lang::Rust)
+                .flat_map(|&f| view.bindings_of(f))
+                .filter(|b| b.kind == BindKind::TraitImpl as u8 && b.node.is_some())
+                .map(|b| b.node)
+                .collect(),
             macro_namespaces: files
                 .iter()
                 .filter(|f| view.file(**f).lang() == Lang::Cpp)
@@ -614,8 +626,12 @@ impl<'v> Engine<'v> {
         self.supers.get(&n).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
-    /// Breadth-first ancestors of a type (excluding itself), cycle-safe, depth-limited.
+    /// Breadth-first ancestors of a type (excluding itself), cycle-safe, depth-limited; a
+    /// Python class's in its method resolution order.
     pub fn ancestors(&self, n: NodeIdx) -> Vec<NodeIdx> {
+        if let Some(mro) = self.mro.get(&n) {
+            return mro.clone();
+        }
         let mut out = Vec::new();
         let mut frontier = vec![n];
         let mut seen = rustc_hash::FxHashSet::default();
@@ -638,17 +654,59 @@ impl<'v> Engine<'v> {
         out
     }
 
-    /// Install the hierarchy from resolved `extends` / `implements` outcomes.
-    pub fn set_hierarchy(&mut self, edges: impl Iterator<Item = (NodeIdx, NodeIdx)>) {
-        for (sub, sup) in edges {
+    /// Install the hierarchy from resolved `extends` / `implements` outcomes, each with the
+    /// (line, column) it is written at: a class's bases are in the order written.
+    pub fn set_hierarchy(&mut self, edges: impl Iterator<Item = (NodeIdx, NodeIdx, (u32, u32))>) {
+        let mut written: Vec<_> = edges.filter(|(sub, sup, _)| sub != sup).map(|(sub, sup, pos)| (sub, pos, sup)).collect();
+        written.sort();
+        for (sub, _, sup) in written {
             let v = self.supers.entry(sub).or_default();
-            if !v.contains(&sup) && sub != sup {
+            if !v.contains(&sup) {
                 v.push(sup);
             }
         }
-        for v in self.supers.values_mut() {
-            v.sort();
+        let view = self.view;
+        let python: Vec<NodeIdx> = self.supers.keys().copied().filter(|n| view.file(view.hot(*n).file).lang() == Lang::Python).collect();
+        let mut memo = FxHashMap::default();
+        for t in python {
+            if let Some(mro) = self.c3(t, &mut memo, 0) {
+                self.mro.insert(t, mro[1..].to_vec());
+            }
         }
+    }
+
+    /// Python's C3 linearization of `t`, `t` first. `None` for a cycle or for bases no order
+    /// satisfies (Python refuses such a class); breadth-first lookup stands in then.
+    fn c3(&self, t: NodeIdx, memo: &mut FxHashMap<NodeIdx, Option<Vec<NodeIdx>>>, depth: u8) -> Option<Vec<NodeIdx>> {
+        if let Some(m) = memo.get(&t) {
+            return m.clone();
+        }
+        if depth > 16 {
+            return None;
+        }
+        memo.insert(t, None);
+        let bases = self.direct_supers(t).to_vec();
+        let mut seqs = Vec::with_capacity(bases.len() + 1);
+        for b in &bases {
+            seqs.push(self.c3(*b, memo, depth + 1)?);
+        }
+        seqs.push(bases);
+        let mut out = vec![t];
+        loop {
+            seqs.retain(|s| !s.is_empty());
+            if seqs.is_empty() {
+                break;
+            }
+            let head = seqs.iter().map(|s| s[0]).find(|h| !seqs.iter().any(|s| s[1..].contains(h)))?;
+            out.push(head);
+            for s in &mut seqs {
+                if s[0] == head {
+                    s.remove(0);
+                }
+            }
+        }
+        memo.insert(t, Some(out.clone()));
+        Some(out)
     }
 
     /// Hierarchy from refs already resolved in the view (incremental runs).
@@ -659,7 +717,7 @@ impl<'v> Engine<'v> {
                 if r.status == status::RESOLVED
                     && matches!(cg_core::RefKind::from_wire(r.kind), Some(cg_core::RefKind::Edge(EdgeKind::Extends | EdgeKind::Implements)))
                 {
-                    pairs.push((r.from, r.target));
+                    pairs.push((r.from, r.target, (r.line, r.col)));
                 }
             }
         }
@@ -671,29 +729,49 @@ impl<'v> Engine<'v> {
     /// qualified name for methods declared outside the type body: Go receivers, Rust impls).
     pub fn direct_member(&self, t: NodeIdx, name: &str) -> Option<NodeIdx> {
         let tn = self.view.node(t);
+        // Rust: an inherent method shadows a trait's, wherever either impl is written
+        let mut of_trait = None;
         for e in self.view.out_edges(t) {
             if e.kind == EdgeKind::Contains {
                 let c = self.view.node(e.dst);
                 if c.name() == name && c.kind() != NodeKind::File {
-                    return Some(e.dst);
+                    if !self.trait_methods.contains(&e.dst) {
+                        return Some(e.dst);
+                    }
+                    of_trait.get_or_insert(e.dst);
                 }
             }
         }
         let q = format!("{}::{}", tn.qname(), name);
         let tfile = tn.file();
         let tpkg = self.modules.pkg_of(tfile);
+        let family = self.view.file(tfile).lang().family();
         let mut best = None;
         let mut cross: SmallVec<[NodeIdx; 4]> = SmallVec::new();
+        let mut owned: SmallVec<[NodeIdx; 2]> = SmallVec::new();
         for cand in self.view.by_qname(&q) {
             let cf = self.view.hot(cand).file;
             // Go: same package; Rust: the owning module or a proved type import.
             if cf == tfile || (!tpkg.is_none() && self.modules.pkg_of(cf) == tpkg) || self.rust_type_owner(t, cf) {
-                return Some(cand);
+                if family != LangFamily::Rust {
+                    return Some(cand);
+                }
+                owned.push(cand);
+                continue;
             }
             best.get_or_insert(cand);
             cross.push(cand);
         }
-        match self.view.file(tfile).lang().family() {
+        // Rust impls of one type in several files: inherent first, then by path and line, so
+        // a base/delta split cannot decide
+        let by_place = owned.into_iter().min_by_key(|c| {
+            let h = self.view.hot(*c);
+            (self.trait_methods.contains(c), self.view.file(h.file).path(), self.view.node(*c).start_line())
+        });
+        if let Some(m) = by_place.or(of_trait) {
+            return Some(m);
+        }
+        match family {
             // Java/Kotlin nested types (pre-existing behaviour), then a Kotlin extension function
             LangFamily::Jvm => best.filter(|_| tn.qname().contains("::")).or_else(|| self.kotlin_extension(t, name)),
             // Swift extensions (emitted as class nodes) add members in other files and other

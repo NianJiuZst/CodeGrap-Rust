@@ -112,6 +112,7 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
             bind_type_params(cx, sc);
             if n.kind() == "impl_item" {
                 deref_impl(cx, n, scope);
+                trait_impl(cx, n, sc);
             }
             walk_children(cx, n, sc);
             cx.generics.pop();
@@ -322,6 +323,17 @@ fn deref_impl(cx: &mut Cx, n: Node, scope: u32) {
                 node_row: NONE,
             });
         }
+    }
+}
+
+/// `impl Trait for X { fn m() }`: `m` is the trait's, which an inherent `X::m` shadows.
+fn trait_impl(cx: &mut Cx, n: Node, scope: u32) {
+    let (Some(_), Some(body)) = (n.child_by_field_name("trait"), n.child_by_field_name("body")) else { return };
+    for f in kids(body).filter(|c| c.kind() == "function_item") {
+        let (Some(name), Some(row)) = (f.child_by_field_name("name"), cx.row_at(cx.start(f))) else { continue };
+        let name = cx.text(name).to_owned();
+        let line = cx.line(f);
+        cx.facts.bindings.push(BindingFact { scope, name, kind: BindKind::TraitImpl, decl_type: String::new(), init_ctor: String::new(), line, node_row: row });
     }
 }
 
