@@ -3444,7 +3444,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
             let local = view.text_str(imp.local);
             let spec = view.text_str(imp.spec);
             let imported = view.text_str(imp.imported);
-            let bound = (!local.is_empty() && local == name) || format!("{spec}::{imported}") == name || format!("{spec}.{imported}") == name;
+            // a JS re-export (`export { a as b } from 'm'`) binds no local: the reference names `a`
+            let reexport = local.is_empty() && self.family == LangFamily::Js && imported == name;
+            let bound = (!local.is_empty() && local == name) || reexport || format!("{spec}::{imported}") == name || format!("{spec}.{imported}") == name;
             bound.then(|| self.bound_outcome(self.e.bind_import(self.file, i as usize)))
         })
     }

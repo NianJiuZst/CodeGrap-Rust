@@ -378,6 +378,7 @@ fn export_stmt(cx: &mut Cx, n: Node) {
         });
     }
     let is_default = kids(n).any(|c| c.kind() == "default");
+    let stmt_type_only = kids(n).any(|c| c.kind() == "type");
     let mut had_clause = false;
     for ch in kids(n) {
         match ch.kind() {
@@ -389,6 +390,20 @@ fn export_stmt(cx: &mut Cx, n: Node) {
                     }
                     let name = sp.child_by_field_name("name").map(|c| unquote(cx.text(c)).to_owned()).unwrap_or_default();
                     let alias = sp.child_by_field_name("alias").map(|c| unquote(cx.text(c)).to_owned());
+                    if let Some(spec) = &source {
+                        // `export { a as b } from 'x'` imports `a` without binding it here (no local)
+                        let line = cx.line(n);
+                        let type_only = stmt_type_only || kids(sp).any(|c| c.kind() == "type");
+                        cx.add_import(ImportFact {
+                            local: String::new(),
+                            imported: name.clone(),
+                            spec: spec.clone(),
+                            kind: ImportKind::Named,
+                            type_only,
+                            scope: 0,
+                            line,
+                        });
+                    }
                     cx.facts.exports.push(ExportFact {
                         name: alias.unwrap_or_else(|| name.clone()),
                         node_row: NONE,
@@ -828,6 +843,16 @@ fn require_target(cx: &Cx, v: Node) -> Option<String> {
     Some(unquote(cx.text(first)).to_owned())
 }
 
+/// `require('./utils').compileETag`: the module and the member it reads.
+fn require_member(cx: &Cx, v: Node) -> Option<(String, String)> {
+    if v.kind() != "member_expression" {
+        return None;
+    }
+    let spec = require_target(cx, v.child_by_field_name("object")?)?;
+    let prop = v.child_by_field_name("property").filter(|p| p.kind() == "property_identifier")?;
+    Some((spec, cx.text(prop).to_owned()))
+}
+
 fn var_decl(cx: &mut Cx, n: Node, scope: u32) {
     for d in kids(n) {
         if d.kind() != "variable_declarator" {
@@ -875,6 +900,12 @@ fn var_decl(cx: &mut Cx, n: Node, scope: u32) {
                     }
                     _ => {}
                 }
+                continue;
+            }
+            // `var compileETag = require('./utils').compileETag`, like `const { compileETag } = require('./utils')`
+            if let Some((spec, imported)) = require_member(cx, v).filter(|_| name.kind() == "identifier") {
+                let local = cx.text(name).to_owned();
+                cx.add_import(ImportFact { local, imported, spec, kind: ImportKind::Require, type_only: false, scope, line: cx.line(d) });
                 continue;
             }
             let is_fn = matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "generator_function");

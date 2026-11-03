@@ -54,6 +54,10 @@ const FILES: &[(&str, &str)] = &[
     ),
     ("py/tasks.py", "from celery import shared_task\n\n@shared_task\ndef send(to):\n    pass\n"),
     ("py/views.py", "from .tasks import send\n\ndef signup():\n    send.delay('a')\n"),
+    ("cjs/utils.js", "exports.compileETag = function(val) {\n  return val;\n};\nexports.compileTrust = function(val) {\n  return val;\n};\n"),
+    ("cjs/app.js", "var compileETag = require('./utils').compileETag;\nfunction setup(v) {\n  compileETag(v);\n}\nmodule.exports = setup;\n"),
+    ("barrel/core.ts", "export function _lt() {}\nexport function _gte() {}\n"),
+    ("barrel/checks.ts", "export {\n  _lt as lt,\n  _gte as gte,\n} from './core';\n"),
 ];
 
 /// One-sided edits of the links above: (file, from, to).
@@ -80,6 +84,12 @@ const EDITS: &[(&str, &str, &str)] = &[
     ("go/x/x.go", "func (p Prefix) Match(path string)", "func (p Prefix) Match(path []byte)"),
     ("py/tasks.py", "@shared_task\n", ""),
     ("app/about/page.tsx", "About", "AboutPage"),
+    ("cjs/utils.js", "exports.compileETag =", "exports.compileETagX ="),
+    ("cjs/utils.js", "exports.compileETagX =", "exports.compileETag ="),
+    ("cjs/app.js", ").compileETag;", ").compileTrust;"),
+    ("barrel/core.ts", "export function _lt()", "export function _ltX()"),
+    ("barrel/core.ts", "export function _ltX()", "export function _lt()"),
+    ("barrel/checks.ts", "_gte as gte,\n", ""),
 ];
 
 struct Rng(u64);

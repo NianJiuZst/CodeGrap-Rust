@@ -544,6 +544,35 @@ fn rust_type_parameters_name_no_same_named_struct() {
     assert!(!edges.iter().any(|e| e.contains("-references->") && (e.ends_with("::T") || e.ends_with("::U"))), "{edges:#?}");
 }
 
+#[test]
+fn typescript_reexport_lists_import_each_name() {
+    let (_d, view) = project(&[
+        ("core.ts", "export function _lt() {}\nexport function _gte() {}\nexport function _gt() {}\n"),
+        ("checks.ts", "export {\n  _lt as lt,\n  _gte as gte,\n  _gte as minimum,\n} from \"./core\";\nexport { _gt } from \"./core\";\n"),
+    ]);
+    let edges = edges_of(&view);
+    for e in ["checks.ts -imports-> core.ts", "checks.ts -imports-> core.ts::_lt", "checks.ts -imports-> core.ts::_gte", "checks.ts -imports-> core.ts::_gt"] {
+        assert!(has(&edges, e), "{e}: {edges:#?}");
+    }
+}
+
+#[test]
+fn commonjs_require_member_binds_the_export() {
+    let (_d, view) = project(&[
+        ("lib/utils.js", "exports.compileETag = function(val) {\n  return val;\n};\nexports.methods = ['get'];\n"),
+        ("lib/trust.js", "exports.compileTrust = function(val) {\n  return val;\n};\n"),
+        (
+            "lib/application.js",
+            "var compileETag = require('./utils').compileETag;\nvar { compileTrust } = require('./trust');\nfunction setup(val) {\n  compileETag(val);\n  compileTrust(val);\n}\nmodule.exports = setup;\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    // the destructured form already binds the export; the member form must do the same
+    assert!(has(&edges, "lib/application.js::setup -calls-> lib/trust.js::compileTrust"), "{edges:#?}");
+    assert!(has(&edges, "lib/application.js -imports-> lib/utils.js"), "{edges:#?}");
+    assert!(has(&edges, "lib/application.js::setup -calls-> lib/utils.js::compileETag"), "{edges:#?}");
+}
+
 fn edges_of(view: &View) -> Vec<String> {
     let mut edges = dump::dump_edges(view);
     edges.dedup();
