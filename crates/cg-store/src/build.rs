@@ -465,7 +465,9 @@ pub fn build_draft_at(batches: &[FileBatch], delta: Option<(&[FileId], BuildBase
             let from_row = r.from_row().filter(|x| *x < kcount as u32).or_else(|| row_by_id(&mut id_to_row, &rows, r.from_id()?));
             let from = nstart + from_row.unwrap_or(0);
             let is_call = r.kind() == RefKind::Edge(EdgeKind::Calls);
-            let name = if is_call { call_names.get(&(r.line(), r.col(), r.name())).copied().flatten().unwrap_or_else(|| r.name()) } else { r.name() };
+            // Rust `mio::Interest::AIO` references `Interest` as the path writes it
+            let renamed = is_call || (b.lang == cg_core::Lang::Rust && r.kind() == RefKind::Edge(EdgeKind::References));
+            let name = if renamed { call_names.get(&(r.line(), r.col(), r.name())).copied().flatten().unwrap_or_else(|| r.name()) } else { r.name() };
             let args = if is_call && r.candidates().is_none() {
                 call_args.get(&(r.line(), r.col(), tail_of(name))).copied().flatten().map(|call| {
                     let mut joined = String::from(cg_extract::facts::args::ARGS_MARK);

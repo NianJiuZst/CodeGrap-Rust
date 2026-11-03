@@ -183,6 +183,25 @@ fn pointer_method(method: &str) -> bool {
     )
 }
 
+/// `A<B, C>, D` -> [`A<B, C>`, `D`]: the items of a written type list, nested lists whole.
+fn type_list(s: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start) = (Vec::new(), 0u32, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out.retain(|t| !t.is_empty());
+    out
+}
+
 /// Paths here contain no source arguments except bounded constructor paths.
 /// Find the final complete call, allowing earlier calls in its receiver.
 fn split_call(value: &str) -> Option<(&str, &str)> {
@@ -476,6 +495,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
                             || b.kind == BindKind::CommonJsObject as u8
                             || b.kind == BindKind::AssignedThisCall as u8
                             || b.kind == BindKind::MacroNamespace as u8
+                            || b.kind == BindKind::TypeParam as u8
                         {
                             continue;
                         }
@@ -490,6 +510,18 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
             s = self.scope_parent(s)?;
         }
+    }
+
+    /// A type parameter `name` of an item enclosing `scope` (Rust `fn new<T>(value: T)`).
+    fn type_param(&self, name: &str, scope: u32) -> bool {
+        let mut s = Some(scope);
+        while let Some(c) = s {
+            if self.bindings.get(&(c, name)).is_some_and(|l| l.iter().any(|b| b.kind == BindKind::TypeParam as u8)) {
+                return true;
+            }
+            s = self.scope_parent(c);
+        }
+        false
     }
 
     fn visible_import(&self, name: &str, scope: u32) -> Option<u32> {
@@ -899,6 +931,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
             return Some(value);
         }
         if self.family == LangFamily::Rust {
+            if let Some((call, index)) = init.rsplit_once('.').and_then(|(c, i)| Some((c, i.parse::<usize>().ok()?))).filter(|(c, _)| c.ends_with([')', '?'])) {
+                return self.tuple_element(wcx, call, index, scope, line, depth + 1);
+            }
             if let Some((callee, args)) = split_call(init) {
                 if let Some(owner) = callee.strip_suffix("::new") {
                     if self.std_wrapper(wcx, owner) == Some(StdWrapper::Pointer) {
@@ -919,6 +954,62 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         self.type_value(wcx, init, None, depth + 1)
+    }
+
+    /// `let (tx, rx) = mpsc::channel()`: element `index` of the tuple a Rust function returns,
+    /// through the `Result` or `Option` a `?` opens.
+    fn tuple_element(&self, wcx: &mut WorkerCx<'e, 'v>, call: &str, index: usize, scope: u32, line: u32, depth: u8) -> Option<ValueType> {
+        if depth >= 16 {
+            return None;
+        }
+        let (call, tried) = match call.strip_suffix('?') {
+            Some(c) => (c, true),
+            None => (call, false),
+        };
+        let (callee, _) = split_call(call)?;
+        let f = self.rust_callee(wcx, callee, scope, line)?;
+        let node = self.view.node(f);
+        let cx = wcx.file_cx(self.e, node.file());
+        let mut ty = match self.e.return_types.get(&f) {
+            Some(b) => self.view.text_str(b.decl_type),
+            None => node.return_type()?,
+        }
+        .trim();
+        if tried {
+            let open = ty.find('<')?;
+            if !matches!(cx.std_wrapper(wcx, ty[..open].trim()), Some(StdWrapper::Result | StdWrapper::Option)) {
+                return None;
+            }
+            ty = *type_list(ty[open + 1..].strip_suffix('>')?).first()?;
+        }
+        let elems = type_list(ty.strip_prefix('(')?.strip_suffix(')')?);
+        cx.type_value(wcx, elems.get(index)?, None, depth + 1)
+    }
+
+    /// The function a Rust call path names: `helper`, `mpsc::channel`, `Pair::new`.
+    fn rust_callee(&self, wcx: &mut WorkerCx<'e, 'v>, callee: &str, scope: u32, line: u32) -> Option<NodeIdx> {
+        // a method's tuple (`stream.into_split()`) stays untyped: its receiver is not modelled here
+        if callee.contains('.') {
+            return None;
+        }
+        let Some((head, rest)) = callee.split_once("::") else {
+            return match self.resolve_name(wcx, callee, Accept::Callable, scope, line, None, true) {
+                NameRes::Found(n, ..) => Some(n),
+                _ => None,
+            };
+        };
+        if let Some(Bound::Node(n)) = self.rust_path_bound(callee) {
+            return Some(n);
+        }
+        let start = match self.resolve_name(wcx, head, Accept::Any, scope, line, None, false) {
+            NameRes::Found(n, ..) => Bound::Node(n),
+            NameRes::Module(m) => Bound::Module(m),
+            _ => return None,
+        };
+        match self.walk_path(start, &rest.split("::").collect::<Vec<_>>())? {
+            Bound::Node(n) if kind_of(self.view, n).is_callable() => Some(n),
+            _ => None,
+        }
     }
 
     /// A pytest fixture's value (upstream `pythonFixtureReturnType`): in a test file or a
@@ -1544,6 +1635,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
             return None;
         }
         let cands = self.e.member_overloads(t, name);
+        // Kotlin `val socketFactory` beside `fun socketFactory()`, a Java field beside its method:
+        // a call names the one method, whichever member is declared first
+        if cands.len() == 1 && self.family == LangFamily::Jvm {
+            return cands.first().copied();
+        }
         self.pick_overload(wcx, &cands, args, r)
     }
 
@@ -3176,6 +3272,8 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 }
                 TypeRes::Unknown => NameRes::NotFound,
             }
+        } else if self.type_param(name, scope) {
+            NameRes::Local
         } else if let Some(n) = self.cpp_nested_type(r.from, name) {
             NameRes::Found(n, by::RECEIVER, 95)
         } else {
@@ -3278,9 +3376,14 @@ impl<'e, 'v> FileCx<'e, 'v> {
     }
 
     fn resolve_import_ref(&self, name: &str, r: &RefRec) -> Outcome {
-        let Some(idxs) = self.imports_by_line.get(&r.line) else { return Outcome::st(status::NO_CANDIDATE) };
+        let Some(idxs) = self.imports_by_line.get(&r.line) else { return self.continued_import_ref(name, r) };
         let view = self.view;
         let tgt = |i: u32| self.e.imp_targets[self.file.idx()].get(i as usize).copied().unwrap_or(ImportTarget::External);
+        // Rust `crate`, `self`, `super` (alone in `use super::Addr`, or a path's root) name this
+        // crate's own modules, which the path's bound names already reach: no dependency
+        if self.family == LangFamily::Rust && matches!(name, "crate" | "self" | "super") {
+            return Outcome::st(status::BUILTIN);
+        }
         // 1. the module specifier itself (C facts keep `<..>` around angle includes and Ruby
         // facts prefix `require_relative` specs with `./`; the kernel's reference names carry
         // neither, and Ruby also emits the `.rb` path form)
@@ -3309,16 +3412,8 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         // 2. a name bound by the import
-        for &i in idxs {
-            let imp = &self.imports[i as usize];
-            let local = view.text_str(imp.local);
-            let spec = view.text_str(imp.spec);
-            let imported = view.text_str(imp.imported);
-            let full_rs = format!("{spec}::{imported}");
-            let full_dot = format!("{spec}.{imported}");
-            if (!local.is_empty() && local == name) || full_rs == name || full_dot == name {
-                return self.bound_outcome(self.e.bind_import(self.file, i as usize));
-            }
+        if let Some(o) = self.import_bound_name(name, idxs) {
+            return o;
         }
         // 3. Rust: the root crate / module segment of a `use` path
         if self.family == LangFamily::Rust {
@@ -3340,6 +3435,42 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         Outcome::st(status::NO_CANDIDATE)
+    }
+
+    fn import_bound_name(&self, name: &str, idxs: &[u32]) -> Option<Outcome> {
+        let view = self.view;
+        idxs.iter().find_map(|&i| {
+            let imp = &self.imports[i as usize];
+            let local = view.text_str(imp.local);
+            let spec = view.text_str(imp.spec);
+            let imported = view.text_str(imp.imported);
+            let bound = (!local.is_empty() && local == name) || format!("{spec}::{imported}") == name || format!("{spec}.{imported}") == name;
+            bound.then(|| self.bound_outcome(self.e.bind_import(self.file, i as usize)))
+        })
+    }
+
+    /// A name on a continuation line of a multi-line import (`from m import (\n    a,\n)`,
+    /// `import {\n  a,\n} from "m"`, `use m::{\n    a,\n}`): the facts carry the statement's first
+    /// line, the nearest import line above the reference.
+    fn continued_import_ref(&self, name: &str, r: &RefRec) -> Outcome {
+        let start = self.imports.iter().map(|i| i.line).filter(|&l| l < r.line).max();
+        start.and_then(|l| self.import_bound_name(name, &self.imports_by_line[&l])).unwrap_or_else(|| Outcome::st(status::NO_CANDIDATE))
+    }
+
+    /// TypeScript `interface ZodUnknown` beside `const ZodUnknown`: `new ZodUnknown()` makes the
+    /// value; the type only describes it.
+    fn js_value_twin(&self, o: Outcome) -> Outcome {
+        let (view, target) = (self.view, NodeIdx(o.target));
+        if self.family != LangFamily::Js || o.status != status::RESOLVED || !matches!(kind_of(view, target), NodeKind::Interface | NodeKind::TypeAlias) {
+            return o;
+        }
+        let ty = view.node(target);
+        let twin = view.by_name(ty.name()).find(|&n| {
+            view.hot(n).file == ty.file()
+                && view.node(n).parent() == ty.parent()
+                && matches!(kind_of(view, n), NodeKind::Variable | NodeKind::Constant | NodeKind::Function | NodeKind::Class)
+        });
+        twin.map_or(o, |n| Outcome::found(n, o.by, o.conf))
     }
 
     /// Resolve one reference. `name` is the reference's text.
@@ -3382,7 +3513,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 if o.status == status::NO_CANDIDATE {
                     self.resolve_type_ref(wcx, r, name, Accept::Callable)
                 } else {
-                    o
+                    self.js_value_twin(o)
                 }
             }
             RefKind::Edge(EdgeKind::References) => {

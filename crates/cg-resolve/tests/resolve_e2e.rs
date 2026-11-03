@@ -378,6 +378,172 @@ fn synthesised_edges_for_dynamic_dispatch() {
     assert!(has("g/g.go::Greeter::Greet -calls-> g/g.go::En::Greet"), "go interface-impl: {edges:#?}");
 }
 
+#[test]
+fn names_on_continuation_lines_of_multi_line_imports() {
+    let (_d, view) = project(&[
+        ("pkg/core.py", "class Engine:\n    pass\n\ndef make():\n    pass\n"),
+        ("app.py", "from pkg.core import (\n    Engine,\n    make,\n)\n"),
+        ("lib.ts", "export function a() {}\nexport class B {}\n"),
+        ("main.ts", "import {\n  a,\n  B,\n} from \"./lib\";\n"),
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod util;\npub mod server;\n"),
+        ("src/util.rs", "pub fn helper() {}\npub struct Thing;\n"),
+        ("src/server.rs", "use crate::util::{\n    helper,\n    Thing,\n};\n"),
+    ]);
+    let edges = edges_of(&view);
+    for e in [
+        "app.py -imports-> pkg/core.py::Engine",
+        "app.py -imports-> pkg/core.py::make",
+        "main.ts -imports-> lib.ts::a",
+        "main.ts -imports-> lib.ts::B",
+        "src/server.rs -imports-> src/util.rs::helper",
+        "src/server.rs -imports-> src/util.rs::Thing",
+    ] {
+        assert!(has(&edges, e), "{e}");
+    }
+}
+
+#[test]
+fn kotlin_call_takes_the_method_beside_a_same_named_property() {
+    let (_d, view) = project(&[(
+        "src/com/x/Client.kt",
+        "package com.x\nclass Factory\nclass Client {\n    val socketFactory: Factory = Factory()\n    fun socketFactory(): Factory = socketFactory\n    var method: String = \"GET\"\n    fun method(m: String, body: String?): Client = this\n    fun put(body: String): Client = method(\"PUT\", body)\n}\nclass User {\n    fun run(c: Client) {\n        c.socketFactory()\n    }\n}\n",
+    )]);
+    let mut calls = Vec::new();
+    for f in view.files() {
+        for n in view.nodes_in_file(f) {
+            let n = cg_core::NodeIdx(n);
+            for e in view.out_edges(n).filter(|e| e.kind == cg_core::EdgeKind::Calls) {
+                calls.push(format!("{} -> {}", view.node(n).name(), dump::node_key(&view, e.dst)));
+            }
+        }
+    }
+    assert!(calls.iter().any(|c| c.starts_with("run -> ") && c.contains("#method@com.x::Client::socketFactory")), "{calls:#?}");
+    assert!(calls.iter().any(|c| c.starts_with("put -> ") && c.contains("#method@com.x::Client::method")), "{calls:#?}");
+    assert!(!calls.iter().any(|c| c.contains("#field@") || c.contains("#property@")), "{calls:#?}");
+}
+
+#[test]
+fn kotlin_extension_function_is_a_member_of_its_receiver_and_subtypes() {
+    let (_d, view) = project(&[
+        ("src/com/x/Lockable.kt", "package com.x\ninterface Lockable\ninline fun Lockable.awaitNanos(nanos: Long) {}\n"),
+        (
+            "src/com/x/TaskRunner.kt",
+            "package com.x\nclass TaskRunner : Lockable {\n    fun direct(l: Lockable) {\n        l.awaitNanos(6L)\n    }\n    fun subtype(r: TaskRunner) {\n        r.awaitNanos(5L)\n    }\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    for from in ["direct", "subtype"] {
+        assert!(
+            has(&edges, &format!("src/com/x/TaskRunner.kt::com.x::TaskRunner::{from} -calls-> src/com/x/Lockable.kt::Lockable::awaitNanos")),
+            "{from}: {edges:#?}"
+        );
+    }
+}
+
+#[test]
+fn rust_use_through_crate_self_or_super_imports_no_module_file() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod util;\npub mod net;\n"),
+        ("src/util.rs", "pub struct Thing;\n"),
+        ("src/net/mod.rs", "pub mod tcp;\npub struct Addr;\n"),
+        ("src/net/tcp.rs", "use crate::util::Thing;\nuse super::Addr;\nuse self::inner::Deep;\nmod inner {\n    pub struct Deep;\n}\n"),
+        ("tests/it.rs", "use demo::util::Thing;\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/net/tcp.rs -imports-> src/util.rs::Thing"), "{edges:#?}");
+    assert!(has(&edges, "src/net/tcp.rs -imports-> src/net/mod.rs::Addr"), "{edges:#?}");
+    // the bare `crate` / `super` / `self` root names no file the module depends on
+    assert!(!edges.iter().any(|e| e.starts_with("src/net/tcp.rs -imports-> ") && !e.contains("::")), "{edges:#?}");
+    // a path through the crate's name, from another crate of the package, still does
+    assert!(has(&edges, "tests/it.rs -imports-> src/lib.rs"), "{edges:#?}");
+}
+
+#[test]
+fn rust_path_member_receiver_is_the_type_the_path_names() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod other;\npub mod user;\npub enum Kind {\n    A,\n}\n"),
+        (
+            "src/user.rs",
+            "use crate::Kind;\npub fn local() {\n    let _k = Kind::A;\n}\npub fn dependency() {\n    let _k = mio::Kind::A;\n}\npub fn module() {\n    let _k = crate::other::Kind::A;\n}\n",
+        ),
+        ("src/other.rs", "pub enum Kind {\n    A,\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/user.rs::local -references-> src/lib.rs::Kind"), "{edges:#?}");
+    assert!(!edges.iter().any(|e| e.starts_with("src/user.rs::dependency -references-> ")), "{edges:#?}");
+    assert!(has(&edges, "src/user.rs::module -references-> src/other.rs::Kind"), "{edges:#?}");
+}
+
+#[test]
+fn typescript_new_makes_the_value_beside_a_same_named_interface() {
+    let (_d, view) = project(&[
+        (
+            "src/schemas.ts",
+            "function ctor(name: string): any {\n  return null;\n}\nexport interface ZodUnknown {\n  kind: string;\n}\nexport const ZodUnknown: any = ctor(\"ZodUnknown\");\nexport function local(): ZodUnknown {\n  return new ZodUnknown();\n}\n",
+        ),
+        ("src/use.ts", "import { ZodUnknown } from \"./schemas\";\nexport function make(): ZodUnknown {\n  return new ZodUnknown();\n}\n"),
+    ]);
+    // the interface and the const share a label: tell them apart by kind
+    let mut made = Vec::new();
+    for f in view.files() {
+        for n in view.nodes_in_file(f) {
+            let n = cg_core::NodeIdx(n);
+            for e in view.out_edges(n).filter(|e| e.kind == cg_core::EdgeKind::Instantiates) {
+                made.push(format!("{} -> {}", view.node(n).name(), dump::node_key(&view, e.dst)));
+            }
+        }
+    }
+    for from in ["local", "make"] {
+        assert!(made.iter().any(|m| m.starts_with(&format!("{from} -> ")) && m.contains("@ZodUnknown:")), "{made:#?}");
+    }
+    assert!(!made.iter().any(|m| m.contains("#interface@")), "{made:#?}");
+}
+
+#[test]
+fn rust_tuple_destructuring_types_each_element() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod chan;\npub mod user;\n"),
+        (
+            "src/chan.rs",
+            "pub struct Sender;\nimpl Sender {\n    pub fn send(&self) {}\n}\npub struct Receiver;\nimpl Receiver {\n    pub fn recv(&self) {}\n}\npub struct Other;\nimpl Other {\n    pub fn send(&self) {}\n    pub fn recv(&self) {}\n}\npub fn channel() -> (Sender, Receiver) {\n    (Sender, Receiver)\n}\npub fn try_channel() -> Result<(Sender, Receiver), ()> {\n    Ok((Sender, Receiver))\n}\n",
+        ),
+        (
+            "src/user.rs",
+            "use crate::chan;\npub fn plain() {\n    let (tx, rx) = chan::channel();\n    tx.send();\n    rx.recv();\n}\npub fn tried() -> Result<(), ()> {\n    let (_, mut rx) = chan::try_channel()?;\n    rx.recv();\n    Ok(())\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    for e in [
+        "src/user.rs::plain -calls-> src/chan.rs::Sender::send",
+        "src/user.rs::plain -calls-> src/chan.rs::Receiver::recv",
+        "src/user.rs::tried -calls-> src/chan.rs::Receiver::recv",
+    ] {
+        assert!(has(&edges, e), "{e}: {edges:#?}");
+    }
+    assert!(!edges.iter().any(|e| e.contains("-calls-> src/chan.rs::Other::")), "{edges:#?}");
+}
+
+#[test]
+fn rust_type_parameters_name_no_same_named_struct() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod cell;\nmod spot;\n"),
+        (
+            "src/cell.rs",
+            "pub struct Real;\npub struct Cell<T> {\n    value: T,\n}\nimpl<T> Cell<T> {\n    pub fn new(value: T) -> Option<Box<T>> {\n        None\n    }\n    pub fn map<U>(self, f: U, r: Real) -> U {\n        f\n    }\n}\npub fn free<T>(t: T) {}\n",
+        ),
+        // Tokio's only `T` is local to a test fn in another file (`bucket_computation_spot_check::T`)
+        ("src/spot.rs", "#[cfg(test)]\nmod tests {\n    #[test]\n    fn spot_check() {\n        struct T;\n        struct U;\n    }\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/cell.rs::Cell::map -references-> src/cell.rs::Real"), "{edges:#?}");
+    assert!(!edges.iter().any(|e| e.contains("-references->") && (e.ends_with("::T") || e.ends_with("::U"))), "{edges:#?}");
+}
+
 fn edges_of(view: &View) -> Vec<String> {
     let mut edges = dump::dump_edges(view);
     edges.dedup();

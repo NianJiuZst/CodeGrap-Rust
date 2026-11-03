@@ -694,8 +694,8 @@ impl<'v> Engine<'v> {
             cross.push(cand);
         }
         match self.view.file(tfile).lang().family() {
-            // Java/Kotlin nested types (pre-existing behaviour)
-            LangFamily::Jvm => best.filter(|_| tn.qname().contains("::")),
+            // Java/Kotlin nested types (pre-existing behaviour), then a Kotlin extension function
+            LangFamily::Jvm => best.filter(|_| tn.qname().contains("::")).or_else(|| self.kotlin_extension(t, name)),
             // Swift extensions (emitted as class nodes) add members in other files and other
             // modules (a test target extending the library's type). Pick deterministically:
             // posting order (base before delta) must never decide.
@@ -713,6 +713,23 @@ impl<'v> Engine<'v> {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// Kotlin `fun Lockable.awaitNanos()` outside any type body: the kernel names it
+    /// `Lockable::awaitNanos`, without the package. One in `t`'s package first, else the only one.
+    fn kotlin_extension(&self, t: NodeIdx, name: &str) -> Option<NodeIdx> {
+        let view = self.view;
+        let tn = view.node(t);
+        let mut cands: SmallVec<[NodeIdx; 4]> = view
+            .by_qname(&format!("{}::{}", tn.name(), name))
+            .filter(|&c| view.file(view.hot(c).file).lang() == Lang::Kotlin && view.node(c).parent().is_none_or(|p| !view.node(p).kind().is_type()))
+            .collect();
+        cands.sort_by_key(|&c| (view.file(view.hot(c).file).path(), view.node(c).start_line()));
+        let tpkg = self.modules.pkg_of(tn.file());
+        match cands.as_slice() {
+            [only] => Some(*only),
+            _ => cands.iter().copied().find(|&c| self.modules.pkg_of(view.hot(c).file) == tpkg),
         }
     }
 
