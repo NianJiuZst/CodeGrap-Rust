@@ -3528,6 +3528,16 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
             RefKind::Edge(EdgeKind::Extends | EdgeKind::Implements | EdgeKind::TypeOf | EdgeKind::Returns) => self.resolve_type_ref(wcx, r, name, Accept::Type),
             RefKind::Edge(EdgeKind::Instantiates) if self.swift_extended_builtin(name, r) => Outcome::st(status::BUILTIN),
+            // JS `new Class(..)` where `Class` is a parameter or a local: the value it holds, never a
+            // same-named class elsewhere (type lookup does not see lexical bindings)
+            RefKind::Edge(EdgeKind::Instantiates)
+                if self.family == LangFamily::Js
+                    && self
+                        .lookup_binding(name, self.scope_at(r.line, r.col), r.line, false)
+                        .is_some_and(|b| b.kind == BindKind::Param as u8 || b.kind == BindKind::Local as u8) =>
+            {
+                self.resolve_type_ref(wcx, r, name, Accept::Callable)
+            }
             RefKind::Edge(EdgeKind::Instantiates) => {
                 let o = self.resolve_type_ref(wcx, r, name, Accept::Type);
                 if o.status == status::NO_CANDIDATE {
@@ -3538,7 +3548,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
             RefKind::Edge(EdgeKind::References) => {
                 let o = self.resolve_type_ref(wcx, r, name, Accept::Type);
-                if matches!(o.status, status::NO_CANDIDATE) {
+                let o = if matches!(o.status, status::NO_CANDIDATE) {
                     let any = self.resolve_type_ref(wcx, r, name, Accept::Any);
                     if self.stray_csharp_member(any, r) {
                         o
@@ -3547,6 +3557,12 @@ impl<'e, 'v> FileCx<'e, 'v> {
                     }
                 } else {
                     o
+                };
+                // `errorUtil.ErrMessage`: the kernel flattens a TS `namespace`'s members into its file,
+                // where no path walk enters; the last segment, as the kernel names it
+                match name.rsplit_once('.') {
+                    Some((_, tail)) if o.status == status::NO_CANDIDATE && self.family == LangFamily::Js => self.resolve_kind(wcx, r, tail, kind),
+                    _ => o,
                 }
             }
             RefKind::FunctionRef => self.resolve_call_name(wcx, r, name),

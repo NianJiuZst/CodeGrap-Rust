@@ -112,6 +112,10 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
             }
             walk_children(cx, n, scope);
         }
+        "nested_type_identifier" => {
+            namespace_type(cx, n);
+            walk_children(cx, n, scope);
+        }
         _ => walk_children(cx, n, scope),
     }
 }
@@ -841,6 +845,16 @@ fn require_target(cx: &Cx, v: Node) -> Option<String> {
         return None;
     }
     Some(unquote(cx.text(first)).to_owned())
+}
+
+/// `core.output<T>`: the kernel names the type by its last segment (`output`); the path as
+/// written keeps the namespace's type apart from a same-named one beside the reference.
+fn namespace_type(cx: &mut Cx, n: Node) {
+    let Some(name) = n.child_by_field_name("name") else { return };
+    let pos = cx.start(name);
+    let tail = cx.text(name).to_owned();
+    let path: String = cx.text(n).chars().filter(|c| !c.is_whitespace()).collect();
+    cx.facts.call_names.push(CallNameFact { line: (pos >> 32) as u32, col: pos as u32, kernel_name: tail.clone(), tail, name: path });
 }
 
 /// `require('./utils').compileETag`: the module and the member it reads.

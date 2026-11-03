@@ -592,6 +592,47 @@ fn javascript_calls_through_declared_variables_link_the_variable() {
     assert!(!edges.iter().any(|e| e.starts_with("bench.ts::apply -calls-> ") || e.starts_with("bench.ts::local -calls-> bench.ts::g")), "{edges:#?}");
 }
 
+#[test]
+fn typescript_new_of_a_parameter_names_no_same_named_class() {
+    let (_d, view) = project(&[
+        ("util.ts", "export abstract class Class {}\nexport class Widget {}\n"),
+        (
+            "api.ts",
+            "import { Widget } from \"./util\";\nexport function make(Class: new (d: object) => object) {\n  return new Class({});\n}\nexport function build() {\n  return new Widget();\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "api.ts::build -instantiates-> util.ts::Widget"), "{edges:#?}");
+    // Zod's `_nonoptional(Class: util.SchemaClass<..>)`: the parameter holds the class
+    assert!(!edges.iter().any(|e| e.starts_with("api.ts::make -instantiates-> ")), "{edges:#?}");
+}
+
+#[test]
+fn typescript_namespace_type_goes_through_the_star_exports() {
+    let (_d, view) = project(&[
+        ("core/core.ts", "export type output<T> = T;\nexport interface $ZodType {\n  kind: string;\n}\n"),
+        ("core/index.ts", "export * from \"./core.js\";\n"),
+        ("helpers/errorUtil.ts", "export namespace errorUtil {\n  export type ErrMessage = string | { message?: string };\n}\n"),
+        ("helpers/use.ts", "import { errorUtil } from \"./errorUtil.js\";\nexport function min(message?: errorUtil.ErrMessage): void {}\n"),
+        ("classic/in-out.ts", "import type * as core from \"../core/index.js\";\nexport type output<T> = core.output<T>;\n"),
+        (
+            "classic/schemas.ts",
+            "import * as core from \"../core/index.js\";\nexport function parse(x: unknown): core.output<number> {\n  return x as core.output<number>;\n}\nexport function kind(t: core.$ZodType): string {\n  return t.kind;\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    // Zod's `core.output<this>` beside classic's own `output` alias
+    for e in [
+        "classic/schemas.ts::parse -references-> core/core.ts::output",
+        "classic/in-out.ts::output -references-> core/core.ts::output",
+        // a TS `namespace`'s members are flattened into its file: the path falls back to the last segment
+        "helpers/use.ts::min -references-> helpers/errorUtil.ts::ErrMessage",
+    ] {
+        assert!(has(&edges, e), "{e}: {edges:#?}");
+    }
+    assert!(!edges.iter().any(|e| e.ends_with("-references-> classic/in-out.ts::output")), "{edges:#?}");
+}
+
 fn edges_of(view: &View) -> Vec<String> {
     let mut edges = dump::dump_edges(view);
     edges.dedup();
