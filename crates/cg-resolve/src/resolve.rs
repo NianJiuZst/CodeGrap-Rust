@@ -3479,7 +3479,8 @@ impl<'e, 'v> FileCx<'e, 'v> {
     /// TS `doc.write(..)` on a typed receiver: the method's first declaration stands for its
     /// overload signatures, as upstream links it (`this.write(..)` keeps the overload that fits).
     fn js_first_overload(&self, o: Outcome) -> Outcome {
-        if self.family != LangFamily::Js || o.status != status::RESOLVED || kind_of(self.view, NodeIdx(o.target)) != NodeKind::Method {
+        // overload signatures are TS; plain JS's repeated method is a redefinition, the last wins
+        if !matches!(self.lang, Lang::TypeScript | Lang::Tsx) || o.status != status::RESOLVED || kind_of(self.view, NodeIdx(o.target)) != NodeKind::Method {
             return o;
         }
         let view = self.view;
