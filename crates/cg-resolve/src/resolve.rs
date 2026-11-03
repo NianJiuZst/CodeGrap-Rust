@@ -2431,9 +2431,12 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let scoped_root = self.lang == Lang::Cpp && r_name_is_scoped(view.text_str(r.name));
         if let Some(b) = self.lookup_binding(root, scope, r.line, false).filter(|_| !scoped_root) {
             if b.kind != BindKind::LocalFn as u8 {
+                // With fields, the final method belongs to the last field, not
+                // to the root pointer (arc.field.clone() may call Field::clone).
+                let receiver_method = if path.is_empty() { method } else { "" };
                 return match self.binding_value(wcx, b, 0) {
-                    Some(t) if t.method_receiver(method).is_some() => {
-                        let o = self.member_call(wcx, t.method_receiver(method).unwrap(), path, method, 90, call);
+                    Some(t) if t.method_receiver(receiver_method).is_some() => {
+                        let o = self.member_call(wcx, t.method_receiver(receiver_method).unwrap(), path, method, 90, call);
                         if o.status == status::RESOLVED {
                             o
                         } else {

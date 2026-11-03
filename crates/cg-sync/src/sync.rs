@@ -296,6 +296,15 @@ fn js_twin_order_sig(view: &View, f: FileId) -> Vec<(String, u8)> {
 /// stays the same (e.g. `obj.old = function internal` -> `obj.new = ...`, or the target of a
 /// Rust `impl Deref`, which has no node of its own).
 fn resolver_fact_sig(view: &View, f: FileId) -> ResolverFactSig {
+    let field_owners: FxHashMap<_, _> = if view.file(f).lang().family() == LangFamily::Rust {
+        view.nodes_in_file(f)
+            .map(|n| view.node(NodeIdx(n)))
+            .filter(|n| n.kind().is_type())
+            .map(|n| (cg_core::text::pack_pos(n.start_line(), n.start_col()), n.qname().to_owned()))
+            .collect()
+    } else {
+        FxHashMap::default()
+    };
     view.bindings_of(f)
         .iter()
         .filter(|b| {
@@ -309,15 +318,20 @@ fn resolver_fact_sig(view: &View, f: FileId) -> ResolverFactSig {
                 || b.kind == BindKind::Mutation as u8
                 || b.kind == BindKind::CommonJsObject as u8
                 || b.kind == BindKind::MacroNamespace as u8
+                || (b.kind == BindKind::Field as u8 && view.file(f).lang().family() == LangFamily::Rust)
         })
         .map(|b| {
-            (
-                b.kind,
-                view.text_str(b.name).to_owned(),
-                if b.node.is_some() { view.node(b.node).qname().to_owned() } else { String::new() },
-                view.text_str(b.decl_type).to_owned(),
-                view.text_str(b.init_ctor).to_owned(),
-            )
+            // A Rust field's declared type can redirect a call in an unchanged
+            // importer. Include its owner: two structs may have the same field.
+            let owner = if b.kind == BindKind::Field as u8 {
+                let scope = &view.scopes_of(f)[b.scope.0.wrapping_sub(view.scope_base(f)) as usize];
+                field_owners.get(&scope.start).cloned().unwrap_or_default()
+            } else if b.node.is_some() {
+                view.node(b.node).qname().to_owned()
+            } else {
+                String::new()
+            };
+            (b.kind, view.text_str(b.name).to_owned(), owner, view.text_str(b.decl_type).to_owned(), view.text_str(b.init_ctor).to_owned())
         })
         .collect()
 }
