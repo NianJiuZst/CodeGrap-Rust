@@ -157,6 +157,9 @@ pub enum BindKind {
     /// A Rust type parameter of the fn, impl or trait whose scope holds it. Only a type
     /// reference sees it: `T` in `fn new(value: T)` names no `struct T` elsewhere.
     TypeParam = 16,
+    /// A Rust method of an `impl Trait for X` block, keyed by its node: an inherent `X::m`
+    /// shadows it. Metadata only; not a lexical binding.
+    TraitImpl = 17,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

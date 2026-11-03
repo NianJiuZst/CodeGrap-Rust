@@ -1240,3 +1240,78 @@ fn cpp_receivers_constructors_and_overrides() {
     assert!(has(&edges, "lib.hpp::holder::len -calls-> lib.hpp::detail::buf::size"), "a field receiver: {edges:?}");
     assert!(has(&edges, "lib.hpp::base::run -calls-> lib.hpp::impl::run"), "a virtual call's hop: {edges:?}");
 }
+
+#[test]
+fn javascript_local_class_shadows_a_same_named_outer_class() {
+    let src = "class Factory {\n  run() { return \"outer\"; }\n}\n\nexport function top() {\n  const value = new Factory();\n  return value.run();\n}\n\nexport function nested() {\n  class Factory {\n    run() { return \"inner\"; }\n  }\n  const value = new Factory();\n  new Factory().run();\n  return value.run();\n}\n";
+    for file in ["app.ts", "app.js"] {
+        let (_d, view) = project(&[(file, src)]);
+        let edges = edges_of(&view);
+        for want in [
+            "top -calls-> {f}::Factory::run",
+            "top -instantiates-> {f}::Factory",
+            "nested -calls-> {f}::nested::Factory::run",
+            "nested -instantiates-> {f}::nested::Factory",
+        ] {
+            assert!(has(&edges, &format!("{file}::{}", want.replace("{f}", file))), "{want}: {edges:#?}");
+        }
+        assert!(!has(&edges, &format!("{file}::nested -calls-> {file}::Factory::run")), "{edges:#?}");
+        assert!(!has(&edges, &format!("{file}::nested -instantiates-> {file}::Factory")), "{edges:#?}");
+    }
+}
+
+#[test]
+fn rust_field_calls_look_through_smart_pointers() {
+    for wrap in ["Arc", "Rc", "Box", ""] {
+        let field = if wrap.is_empty() { "Worker".to_owned() } else { format!("{wrap}<Worker>") };
+        let src = format!(
+            "use std::rc::Rc;\nuse std::sync::Arc;\npub struct Worker;\nimpl Worker {{ pub fn execute(&self) -> u8 {{ 7 }} pub fn clone(&self) -> u8 {{ 99 }} }}\npub struct Noise;\nimpl Noise {{ pub fn execute(&self) -> u8 {{ 0 }} }}\npub struct Owner {{ worker: {field} }}\nimpl Owner {{ pub fn run(&self) -> u8 {{ self.worker.execute() }} pub fn dup(&self) {{ self.worker.clone(); }} }}\n"
+        );
+        let (_d, view) = project(&[("Cargo.toml", "[package]\nname = \"demo\"\n"), ("src/main.rs", &src)]);
+        let edges = edges_of(&view);
+        assert!(has(&edges, "src/main.rs::Owner::run -calls-> src/main.rs::Worker::execute"), "{wrap}: {edges:#?}");
+        // `Arc::clone` / `Rc::clone` clone the pointer, not the value
+        let clones = has(&edges, "src/main.rs::Owner::dup -calls-> src/main.rs::Worker::clone");
+        if wrap != "Box" {
+            assert!(clones == wrap.is_empty(), "{wrap}: {edges:#?}");
+        }
+    }
+}
+
+#[test]
+fn python_members_follow_the_c3_method_resolution_order() {
+    let (_d, view) = project(&[
+        ("swap.py", "class Left:\n    def run(self):\n        return 'left'\n\nclass Right:\n    def run(self):\n        return 'right'\n\nclass Derived(Right, Left):\n    def invoke(self):\n        return self.run()\n\ndef caller():\n    value = Derived()\n    return value.run()\n"),
+        ("deep.py", "class Root:\n    def run(self):\n        return 'root'\n\nclass Right:\n    def run(self):\n        return 'right'\n\nclass Left(Root):\n    pass\n\nclass Derived(Left, Right):\n    def invoke(self):\n        return self.run()\n"),
+        // C3, not depth-first: D -> B -> C -> A
+        ("diamond.py", "class A:\n    def run(self):\n        return 'a'\n\nclass B(A):\n    pass\n\nclass C(A):\n    def run(self):\n        return 'c'\n\nclass D(B, C):\n    def invoke(self):\n        return self.run()\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "swap.py::Derived::invoke -calls-> swap.py::Right::run"), "{edges:#?}");
+    assert!(has(&edges, "swap.py::caller -calls-> swap.py::Right::run"), "{edges:#?}");
+    assert!(has(&edges, "deep.py::Derived::invoke -calls-> deep.py::Root::run"), "{edges:#?}");
+    assert!(has(&edges, "diamond.py::D::invoke -calls-> diamond.py::C::run"), "{edges:#?}");
+}
+
+#[test]
+fn rust_inherent_method_shadows_a_trait_method() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        (
+            "src/main.rs",
+            "mod a_trait;\nmod z_inherent;\nmod same;\n\npub trait Action { fn run(&self) -> u8; }\npub struct Worker;\n\npub fn direct(w: &Worker) -> u8 { w.run() }\npub fn associated(w: &Worker) -> u8 { Worker::run(w) }\n",
+        ),
+        ("src/a_trait.rs", "use crate::{Action, Worker};\nimpl Action for Worker { fn run(&self) -> u8 { 1 } }\n"),
+        ("src/z_inherent.rs", "use crate::Worker;\nimpl Worker { pub fn run(&self) -> u8 { 2 } }\n"),
+        // both impls beside the type, the trait's first
+        ("src/same.rs", "use crate::Action;\npub struct Job;\nimpl Action for Job { fn run(&self) -> u8 { 1 } }\nimpl Job { pub fn run(&self) -> u8 { 2 } }\npub fn go(j: &Job) -> u8 { j.run() }\npub trait Speak { fn speak(&self); }\nimpl Speak for Job { fn speak(&self) {} }\npub fn talk(j: &Job) { j.speak() }\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/main.rs::direct -calls-> src/z_inherent.rs::Worker::run"), "{edges:#?}");
+    assert!(has(&edges, "src/main.rs::associated -calls-> src/z_inherent.rs::Worker::run"), "{edges:#?}");
+    assert!(!edges.iter().any(|e| e.ends_with("-calls-> src/a_trait.rs::Worker::run")), "{edges:#?}");
+    let go: Vec<_> = keyed_edges(&view, &[cg_core::EdgeKind::Calls]).into_iter().filter(|e| e.starts_with("src/same.rs::go ")).collect();
+    assert!(go.len() == 1 && go[0].contains("src/same.rs:4:"), "{go:#?}");
+    // with no inherent method of the name, the trait's
+    assert!(has(&edges, "src/same.rs::talk -calls-> src/same.rs::Job::speak"), "{edges:#?}");
+}

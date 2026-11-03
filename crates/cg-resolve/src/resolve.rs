@@ -496,6 +496,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
                             || b.kind == BindKind::AssignedThisCall as u8
                             || b.kind == BindKind::MacroNamespace as u8
                             || b.kind == BindKind::TypeParam as u8
+                            || b.kind == BindKind::TraitImpl as u8
                         {
                             continue;
                         }
@@ -647,6 +648,12 @@ impl<'e, 'v> FileCx<'e, 'v> {
     // ------------------------------------------------------------ type lookup
     /// Type (or namespace) denoted by `name` in this file's context.
     pub fn lookup_type(&self, wcx: &mut WorkerCx<'e, 'v>, name: &str) -> TypeRes {
+        self.lookup_type_at(wcx, name, u32::MAX)
+    }
+
+    /// [`Self::lookup_type`] as written on `line` (`u32::MAX`: anywhere), where a JS class
+    /// declared in the enclosing function shadows the file's.
+    fn lookup_type_at(&self, wcx: &mut WorkerCx<'e, 'v>, name: &str, line: u32) -> TypeRes {
         let name = name.trim();
         if name.is_empty() {
             return TypeRes::Unknown;
@@ -657,7 +664,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 t => t,
             };
         }
-        match self.resolve_name(wcx, name, Accept::Type, 0, u32::MAX, None, true) {
+        match self.resolve_name(wcx, name, Accept::Type, 0, line, None, true) {
             NameRes::Found(n, ..) => TypeRes::Node(n),
             NameRes::External => TypeRes::External,
             NameRes::Builtin => TypeRes::Builtin,
@@ -832,7 +839,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
         }
         let dt = self.view.text_str(b.decl_type);
         if !dt.is_empty() {
-            return self.type_value(wcx, dt, None, depth + 1);
+            return self.type_value(wcx, dt, None, b.line, depth + 1);
         }
         let init = self.view.text_str(b.init_ctor);
         if init.is_empty() && b.kind == BindKind::Param as u8 && self.family == LangFamily::Python {
@@ -953,7 +960,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 return self.binding_value(wcx, other, depth + 1);
             }
         }
-        self.type_value(wcx, init, None, depth + 1)
+        self.type_value(wcx, init, None, line, depth + 1)
     }
 
     /// `let (tx, rx) = mpsc::channel()`: element `index` of the tuple a Rust function returns,
@@ -983,7 +990,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             ty = *type_list(ty[open + 1..].strip_suffix('>')?).first()?;
         }
         let elems = type_list(ty.strip_prefix('(')?.strip_suffix(')')?);
-        cx.type_value(wcx, elems.get(index)?, None, depth + 1)
+        cx.type_value(wcx, elems.get(index)?, None, u32::MAX, depth + 1)
     }
 
     /// The function a Rust call path names: `helper`, `mpsc::channel`, `Pair::new`.
@@ -1040,7 +1047,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
         let cx = wcx.file_cx(self.e, f);
         let declared = self.view.text_str(b.decl_type);
         if !declared.is_empty() {
-            return cx.type_value(wcx, declared, None, depth + 1);
+            return cx.type_value(wcx, declared, None, u32::MAX, depth + 1);
         }
         cx.expression_value(wcx, self.view.text_str(b.init_ctor), b.scope.0.wrapping_sub(cx.scope_base), u32::MAX, depth + 1)
     }
@@ -1113,7 +1120,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
         standard.then_some(wrapper)
     }
 
-    fn type_value(&self, wcx: &mut WorkerCx<'e, 'v>, name: &str, receiver: Option<NodeIdx>, depth: u8) -> Option<ValueType> {
+    fn type_value(&self, wcx: &mut WorkerCx<'e, 'v>, name: &str, receiver: Option<NodeIdx>, line: u32, depth: u8) -> Option<ValueType> {
         if depth >= 16 || name.len() > 4096 {
             return None;
         }
@@ -1161,12 +1168,12 @@ impl<'e, 'v> FileCx<'e, 'v> {
                         _ => {}
                     }
                 }
-                let mut inner = self.type_value(wcx, &args[..end], receiver, depth + 1)?;
+                let mut inner = self.type_value(wcx, &args[..end], receiver, line, depth + 1)?;
                 inner.wrappers.push(wrapper);
                 return Some(inner);
             }
         }
-        match self.lookup_type(wcx, name) {
+        match self.lookup_type_at(wcx, name, line) {
             TypeRes::Node(t) => Some(ValueType::plain(t)),
             _ if self.family == LangFamily::Js => self.es5_constructor(wcx, name).map(ValueType::plain),
             _ => None,
@@ -1196,11 +1203,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 return Some(cx.ts_return_value(n, rt).unwrap_or_else(ValueType::unknown));
             }
             if !rt.is_empty() {
-                return cx.type_value(wcx, rt, receiver, depth + 1);
+                return cx.type_value(wcx, rt, receiver, u32::MAX, depth + 1);
             }
             return cx.expression_value(wcx, self.view.text_str(b.init_ctor), b.scope.0.wrapping_sub(cx.scope_base), u32::MAX, depth + 1);
         }
-        cx.type_value(wcx, node.return_type()?, receiver, depth + 1)
+        cx.type_value(wcx, node.return_type()?, receiver, u32::MAX, depth + 1)
     }
 
     /// TS return facts contain only nominal names. Look in the declaration's
@@ -1287,7 +1294,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             } else if self.family == LangFamily::Rust && owner.contains('.') && !owner.contains("::") {
                 self.path_value(wcx, owner, scope, line, depth + 1)
             } else {
-                self.type_value(wcx, owner, None, depth + 1)
+                self.type_value(wcx, owner, None, line, depth + 1)
             };
             if let Some(t) = receiver {
                 return self.member_return(wcx, t, method, depth + 1);
@@ -1384,7 +1391,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             let next = match self.e.type_aliases.get(&cur) {
                 Some(b) => {
                     let cx = wcx.file_cx(self.e, self.view.hot(cur).file);
-                    cx.type_value(wcx, self.view.text_str(b.decl_type), None, 0).and_then(|v| v.receiver())
+                    cx.type_value(wcx, self.view.text_str(b.decl_type), None, u32::MAX, 0).and_then(|v| v.receiver())
                 }
                 None => self.deref_target(wcx, cur),
             };
@@ -1406,7 +1413,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             if cx.lookup_type(wcx, self.view.text_str(b.name)) != TypeRes::Node(t) {
                 continue;
             }
-            let target = cx.type_value(wcx, self.view.text_str(b.decl_type), Some(t), 0)?.receiver()?;
+            let target = cx.type_value(wcx, self.view.text_str(b.decl_type), Some(t), u32::MAX, 0)?.receiver()?;
             if found.is_some_and(|x| x != target) {
                 return None;
             }
@@ -2117,6 +2124,18 @@ impl<'e, 'v> FileCx<'e, 'v> {
         if !same.is_empty() {
             // prefer top-level definitions, then the first declared; overloads by the arguments
             let mut pick = same.iter().copied().find(|n| view.node(*n).parent().is_some_and(|p| kind_of(view, p) == NodeKind::File)).unwrap_or(same[0]);
+            // JS: one declared in the function the code sits in shadows those outside it
+            // ponytail: a block's class counts as the whole function's
+            if self.family == LangFamily::Js && line != u32::MAX {
+                let around = |n: &NodeIdx| {
+                    let p = view.node(*n).parent().filter(|p| kind_of(view, *p) != NodeKind::File)?;
+                    let pn = view.node(p);
+                    (pn.start_line() <= line && line <= pn.end_line()).then_some((pn.start_line(), pn.start_col()))
+                };
+                if let Some(inner) = same.iter().filter(|n| around(n).is_some()).max_by_key(|n| around(n)) {
+                    pick = *inner;
+                }
+            }
             if let Some((a, r)) = args.filter(|_| same.len() > 1 && matches!(self.family, LangFamily::Jvm | LangFamily::Js)) {
                 let set = self.sibling_overloads(pick);
                 if let Some(m) = self.pick_overload(wcx, &set, a, r) {
@@ -2202,19 +2221,31 @@ impl<'e, 'v> FileCx<'e, 'v> {
         conf: u8,
         args: Option<(&CallArgs<'v>, &RefRec)>,
     ) -> Outcome {
-        for f in path {
+        for (i, f) in path.iter().enumerate() {
             t = self.cpp_unalias(wcx, t);
-            match self.field_type(wcx, t, f) {
-                Some(ft) => t = ft,
+            if let Some(ft) = self.field_type(wcx, t, f) {
+                t = ft;
+                continue;
+            }
+            // Rust `worker: Arc<Worker>`: the value behind the smart pointer, though the pointer's
+            // own methods (`clone`) stay the pointer's
+            if self.family == LangFamily::Rust {
+                if let Some(v) = self.field_value(wcx, t, f, 0) {
+                    match v.method_receiver(if i + 1 == path.len() { method } else { "" }) {
+                        Some(ft) => t = ft,
+                        None => return Outcome::st(status::NO_CANDIDATE),
+                    }
+                    continue;
+                }
+            }
+            match self.e.direct_member(t, f) {
                 // `Outer.Inner.m()` / `Mod::Klass.m`: a nested type rather than a field
-                None => match self.e.direct_member(t, f) {
-                    Some(inner) if self.holds_members(self.view.node(inner).kind()) => t = inner,
-                    // `NotificationCenter.default.postNotification(..)`: a member of an outside type
-                    // the project only extends, its type unknown
-                    // ponytail: guessed to be that type (`.default`, `.shared`); a wrong guess finds no method
-                    _ if self.is_swift_extension(t) && self.swift_declaration(t).is_none() => {}
-                    _ => return Outcome::st(status::NO_CANDIDATE),
-                },
+                Some(inner) if self.holds_members(self.view.node(inner).kind()) => t = inner,
+                // `NotificationCenter.default.postNotification(..)`: a member of an outside type
+                // the project only extends, its type unknown
+                // ponytail: guessed to be that type (`.default`, `.shared`); a wrong guess finds no method
+                _ if self.is_swift_extension(t) && self.swift_declaration(t).is_none() => {}
+                _ => return Outcome::st(status::NO_CANDIDATE),
             }
         }
         t = self.cpp_unalias(wcx, t);
@@ -3248,7 +3279,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
             Shape::This { kw, fields, method } if self.family == LangFamily::Js && kw != "this" => self.call_member(wcx, r, kw, &fields, method, args),
             Shape::This { kw, fields, method } => self.call_this(wcx, r, kw, &fields, method, args),
             Shape::Super { method } => self.call_super(wcx, r, method, args),
-            Shape::New { class, method } => match self.lookup_type(wcx, class) {
+            Shape::New { class, method } => match self.lookup_type_at(wcx, class, r.line) {
                 TypeRes::Node(t) => self.member_call(wcx, t, &[], method, 90, args.map(|a| (a, r))),
                 TypeRes::External => Outcome::st(status::EXTERNAL),
                 _ => match self.es5_constructor(wcx, class).filter(|_| self.family == LangFamily::Js) {

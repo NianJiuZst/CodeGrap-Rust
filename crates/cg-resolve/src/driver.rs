@@ -195,15 +195,13 @@ pub fn resolve_all(e: &mut Engine<'_>) -> ResolveOutput {
     let mut outcomes = vec![Outcome::PENDING; n_refs];
 
     resolve_into(e, &files, Round::One, &mut outcomes);
-    let pairs = outcomes
-        .iter()
-        .enumerate()
-        .filter_map(|(id, o)| {
-            let r = view.reference(id as u32);
-            (o.status == status::RESOLVED && matches!(RefKind::from_wire(r.kind), Some(RefKind::Edge(EdgeKind::Extends | EdgeKind::Implements))))
-                .then_some((r.from, NodeIdx(o.target)))
-        })
-        .collect::<Vec<_>>();
+    let mut pairs = Vec::new();
+    for (id, o) in outcomes.iter().enumerate() {
+        let r = view.reference(id as u32);
+        if o.status == status::RESOLVED && matches!(RefKind::from_wire(r.kind), Some(RefKind::Edge(EdgeKind::Extends | EdgeKind::Implements))) {
+            pairs.push((r.from, NodeIdx(o.target), (r.line, r.col)));
+        }
+    }
     e.set_hierarchy(pairs.into_iter());
     resolve_into(e, &files, Round::Two, &mut outcomes);
 

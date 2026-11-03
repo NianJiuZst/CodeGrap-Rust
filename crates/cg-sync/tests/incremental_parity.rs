@@ -128,6 +128,38 @@ const EDITS: &[(&str, &str, &str)] = &[
     ("fwd/express.js", "exports.Router = createApplication;", "exports.Router = Router;"),
 ];
 
+/// Shadowing a sync must follow: each edit changes which declaration a call or `new` reaches.
+const SHADOW_FILES: &[(&str, &str)] = &[
+    ("Cargo.toml", "[package]\nname = \"shadow\"\n"),
+    (
+        "src/main.rs",
+        "mod a_tr;\nmod z_imp;\npub trait Action { fn run(&self) -> u8; }\npub struct Worker;\npub struct Owner { worker: std::sync::Arc<Worker> }\nimpl Owner { pub fn go(&self) -> u8 { self.worker.run() } }\npub fn direct(w: &Worker) -> u8 { w.run() }\n",
+    ),
+    ("src/a_tr.rs", "use crate::{Action, Worker};\nimpl Action for Worker { fn run(&self) -> u8 { 1 } }\n"),
+    ("src/z_imp.rs", "use crate::Worker;\nimpl Worker { pub fn run(&self) -> u8 { 2 } }\n"),
+    ("py/base.py", "class Left:\n    def run(self):\n        pass\n\nclass Right:\n    def run(self):\n        pass\n\nclass Derived(Right, Left):\n    pass\n"),
+    ("py/use.py", "from .base import Derived\n\ndef caller():\n    Derived().run()\n"),
+    ("js/app.ts", "class Factory {\n  run() {}\n}\nexport function nested() {\n  class Factory {\n    run() {}\n  }\n  return new Factory().run();\n}\n"),
+];
+
+const SHADOW_EDITS: &[(&str, &str, &str)] = &[
+    // an inherent `Worker::run` shadows the trait's
+    ("src/z_imp.rs", "pub fn run(&self)", "pub fn act(&self)"),
+    ("src/z_imp.rs", "pub fn act(&self)", "pub fn run(&self)"),
+    // the same method, at the same place, now inherent
+    ("src/a_tr.rs", "impl Action for Worker", "impl /*       */Worker"),
+    ("src/a_tr.rs", "impl /*       */Worker", "impl Action for Worker"),
+    // a field behind `Arc` and a plain one
+    ("src/main.rs", "worker: std::sync::Arc<Worker>", "worker: Worker"),
+    ("src/main.rs", "worker: Worker", "worker: std::sync::Arc<Worker>"),
+    // Python's method resolution order follows the bases as written
+    ("py/base.py", "class Derived(Right, Left):", "class Derived(Left, Right):"),
+    ("py/base.py", "class Derived(Left, Right):", "class Derived(Right, Left):"),
+    // a function's own class shadows the file's
+    ("js/app.ts", "  class Factory {\n    run() {}\n  }\n", ""),
+    ("js/app.ts", "export function nested() {\n", "export function nested() {\n  class Factory {\n    run() {}\n  }\n"),
+];
+
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -195,8 +227,12 @@ fn first_diff(a: &[String], b: &[String]) -> String {
 }
 
 fn setup() -> tempfile::TempDir {
+    setup_with(FILES)
+}
+
+fn setup_with(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    for (i, (f, c)) in FILES.iter().enumerate() {
+    for (i, (f, c)) in files.iter().enumerate() {
         write(dir.path(), f, c, i as u64);
     }
     index_project(dir.path(), &opts()).unwrap();
@@ -229,9 +265,18 @@ fn fixture_draws_every_ported_link() {
 
 #[test]
 fn targeted_edits_match_full_rebuild() {
-    let dir = setup();
+    edits_match_full_rebuild(FILES, EDITS);
+}
+
+#[test]
+fn shadowing_edits_match_full_rebuild() {
+    edits_match_full_rebuild(SHADOW_FILES, SHADOW_EDITS);
+}
+
+fn edits_match_full_rebuild(files: &[(&str, &str)], edits: &[(&str, &str, &str)]) {
+    let dir = setup_with(files);
     let root = dir.path();
-    for (step, (f, from, to)) in EDITS.iter().enumerate() {
+    for (step, (f, from, to)) in edits.iter().enumerate() {
         let cur = fs::read_to_string(root.join(f)).unwrap();
         if !cur.contains(from) {
             continue;

@@ -131,6 +131,7 @@ impl<'a> Cx<'a> {
                                 | BindKind::Mutation
                                 | BindKind::CommonJsObject
                                 | BindKind::AssignedThisCall
+                                | BindKind::TraitImpl
                         )
                 }) {
                     return Some((b.decl_type.clone(), b.init_ctor.clone()));

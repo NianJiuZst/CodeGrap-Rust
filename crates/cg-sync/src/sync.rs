@@ -303,7 +303,8 @@ fn resolver_fact_sig(view: &View, f: FileId) -> ResolverFactSig {
                 || b.kind == BindKind::ReturnType as u8
                 || b.kind == BindKind::Fixture as u8
                 || b.kind == BindKind::TypeAlias as u8
-                || b.kind == BindKind::FactoryMixin as u8)
+                || b.kind == BindKind::FactoryMixin as u8
+                || b.kind == BindKind::TraitImpl as u8)
                 && b.node.is_some())
                 || b.kind == BindKind::Deref as u8
                 || b.kind == BindKind::Mutation as u8
@@ -391,7 +392,8 @@ fn is_hierarchy_kind(kind: u8) -> bool {
 /// that share kind and name, so that inserting a line above a class does not look like a change
 /// of the class hierarchy (which would widen the re-resolution to every reference in the
 /// project), while a renamed class, a moved class or a changed parent still does.
-fn hierarchy_keys(view: &View, pairs: impl Iterator<Item = (NodeIdx, NodeIdx)>) -> BTreeSet<(String, String)> {
+/// Each supertype with its rank among the subtype's: reordering a class's bases changes lookup.
+fn hierarchy_keys(view: &View, pairs: impl Iterator<Item = (NodeIdx, NodeIdx, (u32, u32))>) -> BTreeSet<(String, usize, String)> {
     let mut ordinals: FxHashMap<u32, FxHashMap<u32, u32>> = FxHashMap::default();
     let mut key = |n: NodeIdx| -> String {
         let node = view.node(n);
@@ -410,7 +412,15 @@ fn hierarchy_keys(view: &View, pairs: impl Iterator<Item = (NodeIdx, NodeIdx)>) 
         let dead = if view.is_alive(n) { "" } else { "!dead" };
         format!("{}#{}@{}~{}{dead}", view.file(file).path(), node.kind(), node.qname(), ord.get(&n.0).copied().unwrap_or(0))
     };
-    pairs.map(|(a, b)| (key(a), key(b))).collect()
+    let mut written: Vec<(String, (u32, u32), String)> = pairs.map(|(a, b, pos)| (key(a), pos, key(b))).collect();
+    written.sort();
+    let mut out = BTreeSet::new();
+    let mut rank = 0;
+    for (i, (a, _, b)) in written.iter().enumerate() {
+        rank = if i > 0 && written[i - 1].0 == *a { rank + 1 } else { 0 };
+        out.insert((a.clone(), rank, b.clone()));
+    }
+    out
 }
 
 pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOptions) -> Result<SyncReport> {
@@ -837,7 +847,7 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
         }
     }
     // hierarchy from all resolved extends / implements refs
-    let mut pairs: Vec<(NodeIdx, NodeIdx)> = Vec::new();
+    let mut pairs: Vec<(NodeIdx, NodeIdx, (u32, u32))> = Vec::new();
     for &f in &all_files {
         let range = view1.ref_range(f);
         for (i, r) in view1.refs_of_file(f).iter().enumerate() {
@@ -850,7 +860,7 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
                 None => (r.status, retarget.get(&id).copied().unwrap_or(r.target.0)),
             };
             if st == status::RESOLVED {
-                pairs.push((r.from, NodeIdx(tg)));
+                pairs.push((r.from, NodeIdx(tg), (r.line, r.col)));
             }
         }
     }
@@ -858,7 +868,7 @@ pub fn sync_locked(store: &Store, guard: &WriteGuard, root: &Path, opts: &SyncOp
         let mut v = Vec::new();
         for r in base.p.refs.iter() {
             if is_hierarchy_kind(r.kind) && r.status == status::RESOLVED {
-                v.push((r.from, r.target));
+                v.push((r.from, r.target, (r.line, r.col)));
             }
         }
         hierarchy_keys(&base_view, v.into_iter())
