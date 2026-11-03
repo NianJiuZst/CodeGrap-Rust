@@ -3475,11 +3475,29 @@ impl<'e, 'v> FileCx<'e, 'v> {
         twin.map_or(o, |n| Outcome::found(n, o.by, o.conf))
     }
 
+    /// JS `const $ = django.jQuery; $(el)`, `Router = express.Router; new Router()`: a call of a
+    /// name a `var` / `let` / `const` declares runs what that declaration's node holds.
+    fn js_declared_value(&self, r: &RefRec, name: &str) -> Option<NodeIdx> {
+        if self.family != LangFamily::Js || !name.chars().all(|c| c == '$' || c == '_' || c.is_alphanumeric()) {
+            return None;
+        }
+        let b = self.lookup_binding(name, self.scope_at(r.line, r.col), r.line, false).filter(|b| b.kind == BindKind::Local as u8)?;
+        let view = self.view;
+        view.by_name(name).find(|&n| {
+            view.hot(n).file == self.file && view.node(n).start_line() == b.line && matches!(kind_of(view, n), NodeKind::Variable | NodeKind::Constant)
+        })
+    }
+
     /// Resolve one reference. `name` is the reference's text.
     pub fn resolve_ref(&self, wcx: &mut WorkerCx<'e, 'v>, r: &RefRec) -> Outcome {
         let name = self.view.text_str(r.name);
         let Some(kind) = RefKind::from_wire(r.kind) else { return Outcome::st(status::NO_CANDIDATE) };
         let o = self.resolve_kind(wcx, r, name, kind);
+        if o.status == status::LOCAL_BINDING && matches!(kind, RefKind::Edge(EdgeKind::Calls | EdgeKind::Instantiates)) {
+            if let Some(n) = self.js_declared_value(r, name) {
+                return Outcome::found(n, by::LEXICAL, 90);
+            }
+        }
         // an extension no project declaration answers extends a dependency's type
         if o.status == status::RESOLVED && self.is_swift_extension(NodeIdx(o.target)) {
             return Outcome::st(status::EXTERNAL);

@@ -573,6 +573,25 @@ fn commonjs_require_member_binds_the_export() {
     assert!(has(&edges, "lib/application.js::setup -calls-> lib/utils.js::compileETag"), "{edges:#?}");
 }
 
+#[test]
+fn javascript_calls_through_declared_variables_link_the_variable() {
+    let (_d, view) = project(&[
+        ("admin.js", "\"use strict\";\n{\n    const $ = django.jQuery;\n    function init() {\n        $(document);\n    }\n}\n"),
+        ("express.js", "exports.Router = function Router() {};\n"),
+        ("router.js", "var express = require('./express')\n  , Router = express.Router;\nfunction make() {\n  return new Router();\n}\n"),
+        (
+            "bench.ts",
+            "function compileFn(x: number) {\n  return (v: number) => v === x;\n}\nconst compiledFn = compileFn(1);\nexport function run() {\n  return compiledFn(2);\n}\nexport function apply(compiledFn: (v: number) => boolean) {\n  return compiledFn(3);\n}\nexport function local() {\n  const g = compileFn(4);\n  return g(5);\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    for e in ["admin.js::init -calls-> admin.js::$", "router.js::make -instantiates-> router.js::Router", "bench.ts::run -calls-> bench.ts::compiledFn"] {
+        assert!(has(&edges, e), "{e}: {edges:#?}");
+    }
+    // a parameter shadows the module's constant; a function-local variable has no node
+    assert!(!edges.iter().any(|e| e.starts_with("bench.ts::apply -calls-> ") || e.starts_with("bench.ts::local -calls-> bench.ts::g")), "{edges:#?}");
+}
+
 fn edges_of(view: &View) -> Vec<String> {
     let mut edges = dump::dump_edges(view);
     edges.dedup();
