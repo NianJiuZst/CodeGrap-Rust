@@ -370,12 +370,448 @@ fn synthesised_edges_for_dynamic_dispatch() {
     let has = |needle: &str| edges.iter().any(|e| e == needle);
     assert!(has("ui/App.tsx::App -calls-> ui/Child.tsx::Child"), "jsx-render: {edges:#?}");
     assert!(synth_meta(&v, "ui/App.tsx::App", "ui/Child.tsx::Child").unwrap().contains("jsx-render"));
+    // like the other synthesised edges, a render sits on the rendering component's first line
+    let render_lines: Vec<_> = v
+        .files()
+        .flat_map(|f| v.nodes_in_file(f))
+        .flat_map(|n| v.out_edges(cg_core::NodeIdx(n)))
+        .filter(|e| e.kind == cg_core::EdgeKind::Calls && cg_store::dump::node_label(&v, e.dst) == "ui/Child.tsx::Child")
+        .map(|e| e.line)
+        .collect();
+    assert_eq!(render_lines, [Some(2)]);
     assert!(has("ui/Comp.jsx::Comp::handle -calls-> ui/Comp.jsx::Comp::render"), "react-render: {edges:#?}");
     assert!(has("bus/bus.ts::fire -calls-> bus/bus.ts::onTick"), "event-emitter: {edges:#?}");
     assert!(synth_meta(&v, "bus/bus.ts::fire", "bus/bus.ts::onTick").unwrap().contains("\"event\":\"tick\""));
     assert!(has("j/Shape.java::j::Shape::area -calls-> j/Circle.java::j::Circle::area"), "interface-impl: {edges:#?}");
     assert!(has("g/g.go::En -implements-> g/g.go::Greeter"), "go-implements: {edges:#?}");
     assert!(has("g/g.go::Greeter::Greet -calls-> g/g.go::En::Greet"), "go interface-impl: {edges:#?}");
+}
+
+#[test]
+fn names_on_continuation_lines_of_multi_line_imports() {
+    let (_d, view) = project(&[
+        ("pkg/core.py", "class Engine:\n    pass\n\ndef make():\n    pass\n"),
+        ("app.py", "from pkg.core import (\n    Engine,\n    make,\n)\n"),
+        ("lib.ts", "export function a() {}\nexport class B {}\n"),
+        ("main.ts", "import {\n  a,\n  B,\n} from \"./lib\";\n"),
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod util;\npub mod server;\n"),
+        ("src/util.rs", "pub fn helper() {}\npub struct Thing;\n"),
+        ("src/server.rs", "use crate::util::{\n    helper,\n    Thing,\n};\n"),
+    ]);
+    let edges = edges_of(&view);
+    for e in [
+        "app.py -imports-> pkg/core.py::Engine",
+        "app.py -imports-> pkg/core.py::make",
+        "main.ts -imports-> lib.ts::a",
+        "main.ts -imports-> lib.ts::B",
+        "src/server.rs -imports-> src/util.rs::helper",
+        "src/server.rs -imports-> src/util.rs::Thing",
+    ] {
+        assert!(has(&edges, e), "{e}");
+    }
+}
+
+#[test]
+fn kotlin_call_takes_the_method_beside_a_same_named_property() {
+    let (_d, view) = project(&[(
+        "src/com/x/Client.kt",
+        "package com.x\nclass Factory\nclass Client {\n    val socketFactory: Factory = Factory()\n    fun socketFactory(): Factory = socketFactory\n    var method: String = \"GET\"\n    fun method(m: String, body: String?): Client = this\n    fun put(body: String): Client = method(\"PUT\", body)\n}\nclass User {\n    fun run(c: Client) {\n        c.socketFactory()\n    }\n}\n",
+    )]);
+    let mut calls = Vec::new();
+    for f in view.files() {
+        for n in view.nodes_in_file(f) {
+            let n = cg_core::NodeIdx(n);
+            for e in view.out_edges(n).filter(|e| e.kind == cg_core::EdgeKind::Calls) {
+                calls.push(format!("{} -> {}", view.node(n).name(), dump::node_key(&view, e.dst)));
+            }
+        }
+    }
+    assert!(calls.iter().any(|c| c.starts_with("run -> ") && c.contains("#method@com.x::Client::socketFactory")), "{calls:#?}");
+    assert!(calls.iter().any(|c| c.starts_with("put -> ") && c.contains("#method@com.x::Client::method")), "{calls:#?}");
+    assert!(!calls.iter().any(|c| c.contains("#field@") || c.contains("#property@")), "{calls:#?}");
+}
+
+#[test]
+fn kotlin_extension_function_is_a_member_of_its_receiver_and_subtypes() {
+    let (_d, view) = project(&[
+        ("src/com/x/Lockable.kt", "package com.x\ninterface Lockable\ninline fun Lockable.awaitNanos(nanos: Long) {}\n"),
+        (
+            "src/com/x/TaskRunner.kt",
+            "package com.x\nclass TaskRunner : Lockable {\n    fun direct(l: Lockable) {\n        l.awaitNanos(6L)\n    }\n    fun subtype(r: TaskRunner) {\n        r.awaitNanos(5L)\n    }\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    for from in ["direct", "subtype"] {
+        assert!(
+            has(&edges, &format!("src/com/x/TaskRunner.kt::com.x::TaskRunner::{from} -calls-> src/com/x/Lockable.kt::Lockable::awaitNanos")),
+            "{from}: {edges:#?}"
+        );
+    }
+}
+
+#[test]
+fn rust_use_through_crate_self_or_super_imports_no_module_file() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod util;\npub mod net;\n"),
+        ("src/util.rs", "pub struct Thing;\n"),
+        ("src/net/mod.rs", "pub mod tcp;\npub struct Addr;\n"),
+        ("src/net/tcp.rs", "use crate::util::Thing;\nuse super::Addr;\nuse self::inner::Deep;\nmod inner {\n    pub struct Deep;\n}\n"),
+        ("tests/it.rs", "use demo::util::Thing;\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/net/tcp.rs -imports-> src/util.rs::Thing"), "{edges:#?}");
+    assert!(has(&edges, "src/net/tcp.rs -imports-> src/net/mod.rs::Addr"), "{edges:#?}");
+    // the bare `crate` / `super` / `self` root names no file the module depends on
+    assert!(!edges.iter().any(|e| e.starts_with("src/net/tcp.rs -imports-> ") && !e.contains("::")), "{edges:#?}");
+    // a path through the crate's name, from another crate of the package, still does
+    assert!(has(&edges, "tests/it.rs -imports-> src/lib.rs"), "{edges:#?}");
+}
+
+#[test]
+fn rust_path_member_receiver_is_the_type_the_path_names() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod other;\npub mod user;\npub enum Kind {\n    A,\n}\n"),
+        (
+            "src/user.rs",
+            "use crate::Kind;\npub fn local() {\n    let _k = Kind::A;\n}\npub fn dependency() {\n    let _k = mio::Kind::A;\n}\npub fn module() {\n    let _k = crate::other::Kind::A;\n}\n",
+        ),
+        ("src/other.rs", "pub enum Kind {\n    A,\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/user.rs::local -references-> src/lib.rs::Kind"), "{edges:#?}");
+    assert!(!edges.iter().any(|e| e.starts_with("src/user.rs::dependency -references-> ")), "{edges:#?}");
+    assert!(has(&edges, "src/user.rs::module -references-> src/other.rs::Kind"), "{edges:#?}");
+}
+
+#[test]
+fn typescript_new_makes_the_value_beside_a_same_named_interface() {
+    let (_d, view) = project(&[
+        (
+            "src/schemas.ts",
+            "function ctor(name: string): any {\n  return null;\n}\nexport interface ZodUnknown {\n  kind: string;\n}\nexport const ZodUnknown: any = ctor(\"ZodUnknown\");\nexport function local(): ZodUnknown {\n  return new ZodUnknown();\n}\n",
+        ),
+        ("src/use.ts", "import { ZodUnknown } from \"./schemas\";\nexport function make(): ZodUnknown {\n  return new ZodUnknown();\n}\n"),
+    ]);
+    // the interface and the const share a label: tell them apart by kind
+    let mut made = Vec::new();
+    for f in view.files() {
+        for n in view.nodes_in_file(f) {
+            let n = cg_core::NodeIdx(n);
+            for e in view.out_edges(n).filter(|e| e.kind == cg_core::EdgeKind::Instantiates) {
+                made.push(format!("{} -> {}", view.node(n).name(), dump::node_key(&view, e.dst)));
+            }
+        }
+    }
+    for from in ["local", "make"] {
+        assert!(made.iter().any(|m| m.starts_with(&format!("{from} -> ")) && m.contains("@ZodUnknown:")), "{made:#?}");
+    }
+    assert!(!made.iter().any(|m| m.contains("#interface@")), "{made:#?}");
+}
+
+#[test]
+fn typescript_import_of_a_type_and_value_twin_names_its_first_declaration() {
+    let (_d, view) = project(&[
+        (
+            "src/schemas.ts",
+            "function ctor(): any {\n  return null;\n}\nexport interface TypeFirst {\n  kind: string;\n}\nexport const TypeFirst: any = ctor();\nexport const ValueFirst: any = ctor();\nexport type ValueFirst = { kind: string };\n",
+        ),
+        ("src/index.ts", "export { TypeFirst, ValueFirst } from \"./schemas\";\n"),
+        ("src/use.ts", "import { TypeFirst, ValueFirst } from \"./schemas\";\nexport function make() {\n  return [new TypeFirst(), new ValueFirst()];\n}\n"),
+    ]);
+    let mut edges = Vec::new();
+    for f in view.files() {
+        for n in view.nodes_in_file(f) {
+            let n = cg_core::NodeIdx(n);
+            for e in view.out_edges(n).filter(|e| matches!(e.kind, cg_core::EdgeKind::Imports | cg_core::EdgeKind::Instantiates)) {
+                edges.push(format!("{} -{:?}-> {}", dump::node_label(&view, n), e.kind, dump::node_key(&view, e.dst)));
+            }
+        }
+    }
+    let to = |from: &str, kind: &str, name: &str| {
+        edges.iter().filter(|e| e.starts_with(&format!("{from} -{kind}-> ")) && e.contains(&format!("@{name}:"))).collect::<Vec<_>>()
+    };
+    // `import` and `export .. from` name the declaration that comes first, as upstream does
+    for from in ["src/use.ts", "src/index.ts"] {
+        let (t, v) = (to(from, "Imports", "TypeFirst"), to(from, "Imports", "ValueFirst"));
+        assert!(t.len() == 1 && t[0].contains("#interface@"), "{edges:#?}");
+        assert!(v.len() == 1 && v[0].contains("#constant@"), "{edges:#?}");
+    }
+    // `new` still makes the value
+    for name in ["TypeFirst", "ValueFirst"] {
+        let made = to("src/use.ts::make", "Instantiates", name);
+        assert!(made.len() == 1 && made[0].contains("#constant@"), "{edges:#?}");
+    }
+}
+
+#[test]
+fn typescript_type_parameters_name_no_declaration() {
+    let (_d, view) = project(&[
+        ("src/output.ts", "export class Output {\n  run() {}\n}\nexport interface T {\n  kind: string;\n}\n"),
+        (
+            "src/schema.ts",
+            "export class Schema<Output> {\n  parse(data: unknown): Output {\n    return data as Output;\n  }\n}\nexport function make<T>(value: T): T {\n  return value;\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(!edges.iter().any(|e| e.starts_with("src/schema.ts") && e.contains("-> src/output.ts")), "{edges:#?}");
+}
+
+/// `from -kind-> path:line#kind@qname` for every edge of the given kinds out of `from`.
+fn keyed_edges(view: &View, kinds: &[cg_core::EdgeKind]) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in view.files() {
+        for n in view.nodes_in_file(f) {
+            let n = cg_core::NodeIdx(n);
+            for e in view.out_edges(n).filter(|e| kinds.contains(&e.kind)) {
+                out.push(format!("{} -{:?}-> {}", dump::node_label(view, n), e.kind, dump::node_key(view, e.dst)));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn typescript_receiver_calls_name_the_first_overload() {
+    let (_d, view) = project(&[(
+        "src/doc.ts",
+        "type ModeWriter = (doc: Doc) => void;\nexport class Doc {\n  write(fn: ModeWriter): void;\n  write(line: string): void;\n  write(arg: any) {}\n  f(s: string): void;\n  f(n: number, m?: number): void;\n  f(a: any, b?: any): void {}\n  run(n: number) {\n    this.f('x');\n    this.f(n, 2);\n  }\n}\nexport function emit(doc: Doc) {\n  doc.write(`a`);\n  doc.write('b');\n}\n",
+    )]);
+    let edges = keyed_edges(&view, &[cg_core::EdgeKind::Calls]);
+    // through a typed receiver, the method's first declaration stands for its overloads, as upstream links it
+    let writes: Vec<_> = edges.iter().filter(|e| e.starts_with("src/doc.ts::emit -Calls-> ")).collect();
+    assert!(writes.len() == 2 && writes.iter().all(|w| w.contains("src/doc.ts:3:")), "{edges:#?}");
+    // `this.f(..)` keeps the overload its arguments fit
+    for line in [6, 7] {
+        assert!(edges.iter().any(|e| e.starts_with("src/doc.ts::Doc::run -Calls-> ") && e.contains(&format!("src/doc.ts:{line}:"))), "{edges:#?}");
+    }
+}
+
+#[test]
+fn typescript_new_of_a_bare_interface_links_nothing() {
+    let (_d, view) = project(&[
+        ("src/types.ts", "export interface File {\n  name: string;\n}\nexport type Blob = { size: number };\n"),
+        ("src/use.test.ts", "export function make() {\n  return [new File([], \"a.txt\"), new Blob()];\n}\n"),
+    ]);
+    let edges = keyed_edges(&view, &[cg_core::EdgeKind::Instantiates, cg_core::EdgeKind::Calls]);
+    // the DOM's `File`, not the project's interface: an interface makes no value
+    assert!(!edges.iter().any(|e| e.starts_with("src/use.test.ts::make ")), "{edges:#?}");
+}
+
+#[test]
+fn commonjs_member_call_reaches_the_variable_a_module_exports() {
+    let (_d, view) = project(&[
+        (
+            "lib/express.js",
+            "var bodyParser = require('body-parser');\nvar Router = require('router');\nexports = module.exports = createApplication;\nfunction createApplication() {\n  return {};\n}\nexports.Router = Router;\nexports.json = bodyParser.json;\n",
+        ),
+        ("test/app.js", "var express = require('../lib/express');\nfunction make() {\n  var app = express();\n  express.json();\n  return express.Router();\n}\n"),
+        // the package root forwards the whole module
+        ("index.js", "module.exports = require('./lib/express');\n"),
+        ("test/root.js", "var express = require('..');\nfunction viaRoot() {\n  return express.Router();\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "test/app.js::make -calls-> lib/express.js::createApplication"), "{edges:#?}");
+    assert!(has(&edges, "test/app.js::make -calls-> lib/express.js::Router"), "{edges:#?}");
+    assert!(has(&edges, "test/root.js::viaRoot -calls-> lib/express.js::Router"), "{edges:#?}");
+    // `exports.json = bodyParser.json` is a dependency's function, not the `bodyParser` variable
+    assert!(!has(&edges, "test/app.js::make -calls-> lib/express.js::bodyParser"), "{edges:#?}");
+}
+
+#[test]
+fn javascript_window_global_members_answer_unbound_receivers() {
+    let (_d, view) = project(&[
+        (
+            "static/filter.js",
+            "'use strict';\n{\n  window.SelectFilter = {\n    init: function (id) {\n      SelectFilter.refresh(id);\n    },\n    refresh: function (id) {}\n  };\n}\n",
+        ),
+        ("static/inlines.js", "function update(row) {\n  SelectFilter.init(row);\n}\nfunction shadowed(SelectFilter) {\n  SelectFilter.init(1);\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "static/inlines.js::update -calls-> static/filter.js::window.SelectFilter::init"), "{edges:#?}");
+    assert!(has(&edges, "static/filter.js::window.SelectFilter::init -calls-> static/filter.js::window.SelectFilter::refresh"), "{edges:#?}");
+    // a parameter of that name is not the global
+    assert!(!edges.iter().any(|e| e.starts_with("static/inlines.js::shadowed -calls-> ")), "{edges:#?}");
+}
+
+#[test]
+fn javascript_default_import_names_the_module_file() {
+    let (_d, view) = project(&[
+        ("src/anon.ts", "export default function () {\n  return 1;\n}\n"),
+        ("src/named.ts", "export default function named() {\n  return 2;\n}\n"),
+        ("src/use.ts", "import anon from \"./anon\";\nimport named from \"./named\";\nexport function run() {\n  return anon() + named();\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    // the statement and the bound name both link the file, as upstream does
+    let user = view.files().find(|&f| view.file(f).path() == "src/use.ts").unwrap();
+    let mut sites: Vec<_> = view
+        .out_edges(view.file(user).rec.node_start)
+        .filter(|e| e.kind == cg_core::EdgeKind::Imports)
+        .map(|e| format!("{:?}:{:?} {}", e.line, e.col, dump::node_label(&view, e.dst)))
+        .collect();
+    sites.sort();
+    assert_eq!(sites, ["Some(1):Some(0) src/anon.ts", "Some(1):Some(7) src/anon.ts", "Some(2):Some(0) src/named.ts", "Some(2):Some(7) src/named.ts"]);
+    // calls still reach the function
+    assert!(has(&edges, "src/use.ts::run -calls-> src/named.ts::named"), "{edges:#?}");
+}
+
+#[test]
+fn rust_tuple_destructuring_types_each_element() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod chan;\npub mod user;\n"),
+        (
+            "src/chan.rs",
+            "pub struct Sender;\nimpl Sender {\n    pub fn send(&self) {}\n}\npub struct Receiver;\nimpl Receiver {\n    pub fn recv(&self) {}\n}\npub struct Other;\nimpl Other {\n    pub fn send(&self) {}\n    pub fn recv(&self) {}\n}\npub fn channel() -> (Sender, Receiver) {\n    (Sender, Receiver)\n}\npub fn try_channel() -> Result<(Sender, Receiver), ()> {\n    Ok((Sender, Receiver))\n}\n",
+        ),
+        (
+            "src/user.rs",
+            "use crate::chan;\npub fn plain() {\n    let (tx, rx) = chan::channel();\n    tx.send();\n    rx.recv();\n}\npub fn tried() -> Result<(), ()> {\n    let (_, mut rx) = chan::try_channel()?;\n    rx.recv();\n    Ok(())\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    for e in [
+        "src/user.rs::plain -calls-> src/chan.rs::Sender::send",
+        "src/user.rs::plain -calls-> src/chan.rs::Receiver::recv",
+        "src/user.rs::tried -calls-> src/chan.rs::Receiver::recv",
+    ] {
+        assert!(has(&edges, e), "{e}: {edges:#?}");
+    }
+    assert!(!edges.iter().any(|e| e.contains("-calls-> src/chan.rs::Other::")), "{edges:#?}");
+}
+
+#[test]
+fn rust_type_parameters_name_no_same_named_struct() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+        ("src/lib.rs", "pub mod cell;\nmod spot;\n"),
+        (
+            "src/cell.rs",
+            "pub struct Real;\npub struct Cell<T> {\n    value: T,\n}\nimpl<T> Cell<T> {\n    pub fn new(value: T) -> Option<Box<T>> {\n        None\n    }\n    pub fn map<U>(self, f: U, r: Real) -> U {\n        f\n    }\n}\npub fn free<T>(t: T) {}\n",
+        ),
+        // Tokio's only `T` is local to a test fn in another file (`bucket_computation_spot_check::T`)
+        ("src/spot.rs", "#[cfg(test)]\nmod tests {\n    #[test]\n    fn spot_check() {\n        struct T;\n        struct U;\n    }\n}\n"),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "src/cell.rs::Cell::map -references-> src/cell.rs::Real"), "{edges:#?}");
+    assert!(!edges.iter().any(|e| e.contains("-references->") && (e.ends_with("::T") || e.ends_with("::U"))), "{edges:#?}");
+}
+
+#[test]
+fn typescript_reexport_lists_import_each_name() {
+    let (_d, view) = project(&[
+        ("core.ts", "export function _lt() {}\nexport function _gte() {}\nexport function _gt() {}\n"),
+        ("checks.ts", "export {\n  _lt as lt,\n  _gte as gte,\n  _gte as minimum,\n} from \"./core\";\nexport { _gt } from \"./core\";\n"),
+    ]);
+    let edges = edges_of(&view);
+    for e in ["checks.ts -imports-> core.ts", "checks.ts -imports-> core.ts::_lt", "checks.ts -imports-> core.ts::_gte", "checks.ts -imports-> core.ts::_gt"] {
+        assert!(has(&edges, e), "{e}: {edges:#?}");
+    }
+}
+
+#[test]
+fn commonjs_require_member_binds_the_export() {
+    let (_d, view) = project(&[
+        ("lib/utils.js", "exports.compileETag = function(val) {\n  return val;\n};\nexports.methods = ['get'];\n"),
+        ("lib/trust.js", "exports.compileTrust = function(val) {\n  return val;\n};\n"),
+        (
+            "lib/application.js",
+            "var compileETag = require('./utils').compileETag;\nvar { compileTrust } = require('./trust');\nfunction setup(val) {\n  compileETag(val);\n  compileTrust(val);\n}\nmodule.exports = setup;\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    // the destructured form already binds the export; the member form must do the same
+    assert!(has(&edges, "lib/application.js::setup -calls-> lib/trust.js::compileTrust"), "{edges:#?}");
+    assert!(has(&edges, "lib/application.js -imports-> lib/utils.js"), "{edges:#?}");
+    assert!(has(&edges, "lib/application.js::setup -calls-> lib/utils.js::compileETag"), "{edges:#?}");
+}
+
+#[test]
+fn javascript_calls_through_declared_variables_link_the_variable() {
+    let (_d, view) = project(&[
+        ("admin.js", "\"use strict\";\n{\n    const $ = django.jQuery;\n    function init() {\n        $(document);\n    }\n}\n"),
+        ("express.js", "exports.Router = function Router() {};\n"),
+        ("router.js", "var express = require('./express')\n  , Router = express.Router;\nfunction make() {\n  return new Router();\n}\n"),
+        (
+            "bench.ts",
+            "function compileFn(x: number) {\n  return (v: number) => v === x;\n}\nconst compiledFn = compileFn(1);\nexport function run() {\n  return compiledFn(2);\n}\nexport function apply(compiledFn: (v: number) => boolean) {\n  return compiledFn(3);\n}\nexport function local() {\n  const g = compileFn(4);\n  return g(5);\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    for e in ["admin.js::init -calls-> admin.js::$", "router.js::make -instantiates-> router.js::Router", "bench.ts::run -calls-> bench.ts::compiledFn"] {
+        assert!(has(&edges, e), "{e}: {edges:#?}");
+    }
+    // a parameter shadows the module's constant; a function-local variable has no node
+    assert!(!edges.iter().any(|e| e.starts_with("bench.ts::apply -calls-> ") || e.starts_with("bench.ts::local -calls-> bench.ts::g")), "{edges:#?}");
+}
+
+#[test]
+fn typescript_new_of_a_parameter_names_no_same_named_class() {
+    let (_d, view) = project(&[
+        ("util.ts", "export abstract class Class {}\nexport class Widget {}\n"),
+        (
+            "api.ts",
+            "import { Widget } from \"./util\";\nexport function make(Class: new (d: object) => object) {\n  return new Class({});\n}\nexport function build() {\n  return new Widget();\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    assert!(has(&edges, "api.ts::build -instantiates-> util.ts::Widget"), "{edges:#?}");
+    // Zod's `_nonoptional(Class: util.SchemaClass<..>)`: the parameter holds the class
+    assert!(!edges.iter().any(|e| e.starts_with("api.ts::make -instantiates-> ")), "{edges:#?}");
+}
+
+#[test]
+fn typescript_namespace_type_goes_through_the_star_exports() {
+    let (_d, view) = project(&[
+        ("core/core.ts", "export type output<T> = T;\nexport interface $ZodType {\n  kind: string;\n}\n"),
+        ("core/index.ts", "export * from \"./core.js\";\n"),
+        ("helpers/errorUtil.ts", "export namespace errorUtil {\n  export type ErrMessage = string | { message?: string };\n}\n"),
+        ("helpers/use.ts", "import { errorUtil } from \"./errorUtil.js\";\nexport function min(message?: errorUtil.ErrMessage): void {}\n"),
+        ("classic/in-out.ts", "import type * as core from \"../core/index.js\";\nexport type output<T> = core.output<T>;\n"),
+        (
+            "classic/schemas.ts",
+            "import * as core from \"../core/index.js\";\nexport function parse(x: unknown): core.output<number> {\n  return x as core.output<number>;\n}\nexport function kind(t: core.$ZodType): string {\n  return t.kind;\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    // Zod's `core.output<this>` beside classic's own `output` alias
+    for e in [
+        "classic/schemas.ts::parse -references-> core/core.ts::output",
+        "classic/in-out.ts::output -references-> core/core.ts::output",
+        // a TS `namespace`'s members are flattened into its file: the path falls back to the last segment
+        "helpers/use.ts::min -references-> helpers/errorUtil.ts::ErrMessage",
+    ] {
+        assert!(has(&edges, e), "{e}: {edges:#?}");
+    }
+    assert!(!edges.iter().any(|e| e.ends_with("-references-> classic/in-out.ts::output")), "{edges:#?}");
+}
+
+#[test]
+fn typescript_variable_and_field_annotations_and_enum_members_name_their_types() {
+    let (_d, view) = project(&[
+        ("core/core.ts", "export type output<T> = T;\n"),
+        ("core/index.ts", "export * from \"./core.js\";\n"),
+        ("classic/in-out.ts", "import type * as core from \"../core/index.js\";\nexport type output<T> = core.output<T>;\n"),
+        (
+            "classic/parse.ts",
+            "import * as core from \"../core/index.js\";\nconst make = (): any => null;\nexport const parse: (x: unknown) => core.output<number> = make();\nexport class Box {\n  value?: core.output<string>;\n}\n",
+        ),
+        (
+            "v3/types.ts",
+            "export enum Kind {\n  ZodLiteral = \"ZodLiteral\",\n}\nexport class ZodLiteral {}\nexport interface ZodLiteralDef {\n  typeName: Kind.ZodLiteral;\n}\n",
+        ),
+    ]);
+    let edges = edges_of(&view);
+    // Zod's `export const decode: (.., _ctx?: core.ParseContext<..>) => ..`
+    assert!(has(&edges, "classic/parse.ts::parse -references-> core/core.ts::output"), "{edges:#?}");
+    let field = edges.iter().any(|e| e.starts_with("classic/parse.ts::Box") && e.ends_with("-references-> core/core.ts::output"));
+    assert!(field, "{edges:#?}");
+    assert!(!edges.iter().any(|e| e.ends_with("-references-> classic/in-out.ts::output")), "{edges:#?}");
+    // v3's `typeName: ZodFirstPartyTypeKind.ZodLiteral` beside `class ZodLiteral`
+    assert!(has(&edges, "v3/types.ts::ZodLiteralDef::typeName -references-> v3/types.ts::Kind::ZodLiteral"), "{edges:#?}");
+    assert!(!edges.iter().any(|e| e.ends_with("-references-> v3/types.ts::ZodLiteral")), "{edges:#?}");
 }
 
 fn edges_of(view: &View) -> Vec<String> {

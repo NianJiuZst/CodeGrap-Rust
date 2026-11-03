@@ -109,6 +109,7 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
             let generics = generics_of(cx, n);
             cx.generics.push(generics);
             let sc = cx.push_scope(ScopeKind::Class, scope, n);
+            bind_type_params(cx, sc);
             if n.kind() == "impl_item" {
                 deref_impl(cx, n, scope);
             }
@@ -176,6 +177,10 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
             }
             walk_children(cx, n, scope);
         }
+        "scoped_identifier" => {
+            scoped_receiver(cx, n);
+            walk_children(cx, n, scope);
+        }
         "for_expression" => {
             if let Some(p) = n.child_by_field_name("pattern") {
                 bind_pattern(cx, p, scope, BindKind::Local);
@@ -190,6 +195,20 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
         }
         _ => walk_children(cx, n, scope),
     }
+}
+
+/// `mio::Interest::AIO`: the kernel names the receiver of a path's member by its last segment
+/// (`Interest`); the path as written keeps a dependency's type apart from a local one.
+fn scoped_receiver(cx: &mut Cx, n: Node) {
+    let (Some(path), Some(member)) = (n.child_by_field_name("path"), n.child_by_field_name("name")) else { return };
+    if path.kind() != "scoped_identifier" || !cx.text(member).starts_with(|c: char| c.is_ascii_uppercase()) {
+        return;
+    }
+    let Some(recv) = path.child_by_field_name("name") else { return };
+    let pos = cx.start(recv);
+    let recv = cx.text(recv).to_owned();
+    let name = cx.text(path).to_owned();
+    cx.facts.call_names.push(CallNameFact { line: (pos >> 32) as u32, col: pos as u32, tail: recv.clone(), kernel_name: recv, name });
 }
 
 /// Bounds that add nothing a call goes through.
@@ -391,6 +410,19 @@ fn let_decl(cx: &mut Cx, n: Node, scope: u32) {
     if target.kind() == "identifier" {
         let nm = cx.text(target).to_owned();
         cx.add_binding(scope, &nm, BindKind::Local, &ty, &init, line);
+    } else if target.kind() == "tuple_pattern" && init.ends_with([')', '?']) && !kids(target).any(|c| c.kind() == "remaining_field_pattern") {
+        // `let (tx, rx) = mpsc::channel()`: element i holds the call's `.i`
+        let elems: Vec<Node> = kids(target).filter(|c| (c.is_named() || c.kind() == "_") && !c.kind().ends_with("comment")).collect();
+        for (i, e) in elems.into_iter().enumerate() {
+            // `mut rx`: `mutable_specifier` first, then the pattern
+            let id = if e.kind() == "mut_pattern" { e.named_child(1).unwrap_or(e) } else { e };
+            if id.kind() == "identifier" {
+                let nm = cx.text(id).to_owned();
+                cx.add_binding(scope, &nm, BindKind::Local, "", &format!("{init}.{i}"), line);
+            } else {
+                bind_pattern(cx, e, scope, BindKind::Local);
+            }
+        }
     } else {
         bind_pattern(cx, p, scope, BindKind::Local);
     }
@@ -457,11 +489,20 @@ fn function_body(cx: &mut Cx, n: Node, scope: u32) {
         }
     }
     let sc = cx.push_scope(ScopeKind::Function, scope, n);
+    bind_type_params(cx, sc);
     if let Some(p) = n.child_by_field_name("parameters") {
         params(cx, p, sc);
     }
     if let Some(body) = n.child_by_field_name("body") {
         walk(cx, body, sc);
+    }
+}
+
+/// The type parameters of the item whose scope `sc` is (the innermost `cx.generics`).
+fn bind_type_params(cx: &mut Cx, sc: u32) {
+    let names: Vec<String> = cx.generics.last().map(|g| g.iter().map(|(n, _)| n.clone()).collect()).unwrap_or_default();
+    for n in names {
+        cx.add_binding(sc, &n, BindKind::TypeParam, "", "", 0);
     }
 }
 

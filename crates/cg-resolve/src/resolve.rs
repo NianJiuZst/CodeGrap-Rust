@@ -183,6 +183,25 @@ fn pointer_method(method: &str) -> bool {
     )
 }
 
+/// `A<B, C>, D` -> [`A<B, C>`, `D`]: the items of a written type list, nested lists whole.
+fn type_list(s: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start) = (Vec::new(), 0u32, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out.retain(|t| !t.is_empty());
+    out
+}
+
 /// Paths here contain no source arguments except bounded constructor paths.
 /// Find the final complete call, allowing earlier calls in its receiver.
 fn split_call(value: &str) -> Option<(&str, &str)> {
@@ -476,6 +495,7 @@ impl<'e, 'v> FileCx<'e, 'v> {
                             || b.kind == BindKind::CommonJsObject as u8
                             || b.kind == BindKind::AssignedThisCall as u8
                             || b.kind == BindKind::MacroNamespace as u8
+                            || b.kind == BindKind::TypeParam as u8
                         {
                             continue;
                         }
@@ -490,6 +510,18 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
             s = self.scope_parent(s)?;
         }
+    }
+
+    /// A type parameter `name` of an item enclosing `scope` (Rust `fn new<T>(value: T)`).
+    fn type_param(&self, name: &str, scope: u32) -> bool {
+        let mut s = Some(scope);
+        while let Some(c) = s {
+            if self.bindings.get(&(c, name)).is_some_and(|l| l.iter().any(|b| b.kind == BindKind::TypeParam as u8)) {
+                return true;
+            }
+            s = self.scope_parent(c);
+        }
+        false
     }
 
     fn visible_import(&self, name: &str, scope: u32) -> Option<u32> {
@@ -899,6 +931,9 @@ impl<'e, 'v> FileCx<'e, 'v> {
             return Some(value);
         }
         if self.family == LangFamily::Rust {
+            if let Some((call, index)) = init.rsplit_once('.').and_then(|(c, i)| Some((c, i.parse::<usize>().ok()?))).filter(|(c, _)| c.ends_with([')', '?'])) {
+                return self.tuple_element(wcx, call, index, scope, line, depth + 1);
+            }
             if let Some((callee, args)) = split_call(init) {
                 if let Some(owner) = callee.strip_suffix("::new") {
                     if self.std_wrapper(wcx, owner) == Some(StdWrapper::Pointer) {
@@ -919,6 +954,62 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         self.type_value(wcx, init, None, depth + 1)
+    }
+
+    /// `let (tx, rx) = mpsc::channel()`: element `index` of the tuple a Rust function returns,
+    /// through the `Result` or `Option` a `?` opens.
+    fn tuple_element(&self, wcx: &mut WorkerCx<'e, 'v>, call: &str, index: usize, scope: u32, line: u32, depth: u8) -> Option<ValueType> {
+        if depth >= 16 {
+            return None;
+        }
+        let (call, tried) = match call.strip_suffix('?') {
+            Some(c) => (c, true),
+            None => (call, false),
+        };
+        let (callee, _) = split_call(call)?;
+        let f = self.rust_callee(wcx, callee, scope, line)?;
+        let node = self.view.node(f);
+        let cx = wcx.file_cx(self.e, node.file());
+        let mut ty = match self.e.return_types.get(&f) {
+            Some(b) => self.view.text_str(b.decl_type),
+            None => node.return_type()?,
+        }
+        .trim();
+        if tried {
+            let open = ty.find('<')?;
+            if !matches!(cx.std_wrapper(wcx, ty[..open].trim()), Some(StdWrapper::Result | StdWrapper::Option)) {
+                return None;
+            }
+            ty = *type_list(ty[open + 1..].strip_suffix('>')?).first()?;
+        }
+        let elems = type_list(ty.strip_prefix('(')?.strip_suffix(')')?);
+        cx.type_value(wcx, elems.get(index)?, None, depth + 1)
+    }
+
+    /// The function a Rust call path names: `helper`, `mpsc::channel`, `Pair::new`.
+    fn rust_callee(&self, wcx: &mut WorkerCx<'e, 'v>, callee: &str, scope: u32, line: u32) -> Option<NodeIdx> {
+        // a method's tuple (`stream.into_split()`) stays untyped: its receiver is not modelled here
+        if callee.contains('.') {
+            return None;
+        }
+        let Some((head, rest)) = callee.split_once("::") else {
+            return match self.resolve_name(wcx, callee, Accept::Callable, scope, line, None, true) {
+                NameRes::Found(n, ..) => Some(n),
+                _ => None,
+            };
+        };
+        if let Some(Bound::Node(n)) = self.rust_path_bound(callee) {
+            return Some(n);
+        }
+        let start = match self.resolve_name(wcx, head, Accept::Any, scope, line, None, false) {
+            NameRes::Found(n, ..) => Bound::Node(n),
+            NameRes::Module(m) => Bound::Module(m),
+            _ => return None,
+        };
+        match self.walk_path(start, &rest.split("::").collect::<Vec<_>>())? {
+            Bound::Node(n) if kind_of(self.view, n).is_callable() => Some(n),
+            _ => None,
+        }
     }
 
     /// A pytest fixture's value (upstream `pythonFixtureReturnType`): in a test file or a
@@ -1544,6 +1635,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
             return None;
         }
         let cands = self.e.member_overloads(t, name);
+        // Kotlin `val socketFactory` beside `fun socketFactory()`, a Java field beside its method:
+        // a call names the one method, whichever member is declared first
+        if cands.len() == 1 && self.family == LangFamily::Jvm {
+            return cands.first().copied();
+        }
         self.pick_overload(wcx, &cands, args, r)
     }
 
@@ -2490,6 +2586,15 @@ impl<'e, 'v> FileCx<'e, 'v> {
         if is_builtin(self.family, root) {
             return Outcome::st(status::BUILTIN);
         }
+        // JS `window.SelectFilter = { init: .. }` in one script, `SelectFilter.init()` in another
+        if self.family == LangFamily::Js && path.is_empty() {
+            let mut globals = view.by_qname(&format!("window.{root}"));
+            if let (Some(g), None) = (globals.next(), globals.next()) {
+                if let Some(m) = self.e.direct_member(g, method) {
+                    return Outcome::found(m, by::GLOBAL, 80);
+                }
+            }
+        }
         if matches!(self.family, LangFamily::C | LangFamily::CSharp | LangFamily::Php | LangFamily::Ruby) {
             if let Some(n) = self.qualified_callable(r.from, root, path, method, false) {
                 return Outcome::found(self.cpp_function_overload(n, args), by::QUALIFIED, 90);
@@ -3133,7 +3238,13 @@ impl<'e, 'v> FileCx<'e, 'v> {
         match parse_shape(name) {
             Shape::Bare(n) if self.swift_extended_builtin(n, r) => Outcome::st(status::BUILTIN),
             Shape::Bare(n) => self.call_bare(wcx, r, n, Accept::Callable, args),
-            Shape::Member { root, path, method } => self.call_member(wcx, r, root, &path, method, args),
+            Shape::Member { root, path, method } => {
+                let o = self.js_first_overload(self.call_member(wcx, r, root, &path, method, args));
+                if o.status == status::RESOLVED || !path.is_empty() {
+                    return o;
+                }
+                self.js_required_export(r, root, method).map_or(o, |n| Outcome::found(n, by::IMPORT, 90))
+            }
             Shape::This { kw, fields, method } if self.family == LangFamily::Js && kw != "this" => self.call_member(wcx, r, kw, &fields, method, args),
             Shape::This { kw, fields, method } => self.call_this(wcx, r, kw, &fields, method, args),
             Shape::Super { method } => self.call_super(wcx, r, method, args),
@@ -3145,11 +3256,11 @@ impl<'e, 'v> FileCx<'e, 'v> {
                     None => Outcome::st(status::NO_CANDIDATE),
                 },
             },
-            Shape::CallResult { inner, method } => self.call_result(wcx, r, inner, method, args),
+            Shape::CallResult { inner, method } => self.js_first_overload(self.call_result(wcx, r, inner, method, args)),
             Shape::ValueResult { inner, method } => {
                 let value = self.expression_value(wcx, inner, self.scope_at(r.line, r.col), r.line, 0);
                 match value.and_then(|v| v.method_receiver(method)) {
-                    Some(t) => self.member_call(wcx, t, &[], method, 85, args.map(|a| (a, r))),
+                    Some(t) => self.js_first_overload(self.member_call(wcx, t, &[], method, 85, args.map(|a| (a, r)))),
                     None => Outcome::st(status::NO_CANDIDATE),
                 }
             }
@@ -3176,6 +3287,8 @@ impl<'e, 'v> FileCx<'e, 'v> {
                 }
                 TypeRes::Unknown => NameRes::NotFound,
             }
+        } else if self.type_param(name, scope) {
+            NameRes::Local
         } else if let Some(n) = self.cpp_nested_type(r.from, name) {
             NameRes::Found(n, by::RECEIVER, 95)
         } else {
@@ -3278,9 +3391,14 @@ impl<'e, 'v> FileCx<'e, 'v> {
     }
 
     fn resolve_import_ref(&self, name: &str, r: &RefRec) -> Outcome {
-        let Some(idxs) = self.imports_by_line.get(&r.line) else { return Outcome::st(status::NO_CANDIDATE) };
+        let Some(idxs) = self.imports_by_line.get(&r.line) else { return self.continued_import_ref(name, r) };
         let view = self.view;
         let tgt = |i: u32| self.e.imp_targets[self.file.idx()].get(i as usize).copied().unwrap_or(ImportTarget::External);
+        // Rust `crate`, `self`, `super` (alone in `use super::Addr`, or a path's root) name this
+        // crate's own modules, which the path's bound names already reach: no dependency
+        if self.family == LangFamily::Rust && matches!(name, "crate" | "self" | "super") {
+            return Outcome::st(status::BUILTIN);
+        }
         // 1. the module specifier itself (C facts keep `<..>` around angle includes and Ruby
         // facts prefix `require_relative` specs with `./`; the kernel's reference names carry
         // neither, and Ruby also emits the `.rb` path form)
@@ -3309,16 +3427,8 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
         }
         // 2. a name bound by the import
-        for &i in idxs {
-            let imp = &self.imports[i as usize];
-            let local = view.text_str(imp.local);
-            let spec = view.text_str(imp.spec);
-            let imported = view.text_str(imp.imported);
-            let full_rs = format!("{spec}::{imported}");
-            let full_dot = format!("{spec}.{imported}");
-            if (!local.is_empty() && local == name) || full_rs == name || full_dot == name {
-                return self.bound_outcome(self.e.bind_import(self.file, i as usize));
-            }
+        if let Some(o) = self.import_bound_name(name, idxs) {
+            return o;
         }
         // 3. Rust: the root crate / module segment of a `use` path
         if self.family == LangFamily::Rust {
@@ -3342,11 +3452,145 @@ impl<'e, 'v> FileCx<'e, 'v> {
         Outcome::st(status::NO_CANDIDATE)
     }
 
+    fn import_bound_name(&self, name: &str, idxs: &[u32]) -> Option<Outcome> {
+        let view = self.view;
+        idxs.iter().find_map(|&i| {
+            let imp = &self.imports[i as usize];
+            let local = view.text_str(imp.local);
+            let spec = view.text_str(imp.spec);
+            let imported = view.text_str(imp.imported);
+            // a JS re-export (`export { a as b } from 'm'`) binds no local: the reference names `a`
+            let reexport = local.is_empty() && self.family == LangFamily::Js && imported == name;
+            let bound = (!local.is_empty() && local == name) || reexport || format!("{spec}::{imported}") == name || format!("{spec}.{imported}") == name;
+            if !bound {
+                return None;
+            }
+            // JS `import x from "./m"` names the module, as upstream does; calls of `x` still
+            // reach its default export
+            if self.family == LangFamily::Js && imp.kind == ImportKind::Default as u8 && imported == "default" {
+                if let Some(ImportTarget::File(tf)) = self.e.imp_targets[self.file.idx()].get(i as usize) {
+                    return Some(Outcome::found(self.file_node(*tf), by::IMPORT, 95));
+                }
+            }
+            Some(self.js_first_twin(self.bound_outcome(self.e.bind_import(self.file, i as usize))))
+        })
+    }
+
+    /// TS `doc.write(..)` on a typed receiver: the method's first declaration stands for its
+    /// overload signatures, as upstream links it (`this.write(..)` keeps the overload that fits).
+    fn js_first_overload(&self, o: Outcome) -> Outcome {
+        // overload signatures are TS; plain JS's repeated method is a redefinition, the last wins
+        if !matches!(self.lang, Lang::TypeScript | Lang::Tsx) || o.status != status::RESOLVED || kind_of(self.view, NodeIdx(o.target)) != NodeKind::Method {
+            return o;
+        }
+        let view = self.view;
+        let m = view.node(NodeIdx(o.target));
+        view.by_name(m.name())
+            .filter(|&n| view.node(n).parent() == m.parent() && kind_of(view, n) == NodeKind::Method)
+            .min_by_key(|&n| (view.node(n).start_line(), view.node(n).start_col()))
+            .map_or(o, |n| Outcome::found(n, o.by, o.conf))
+    }
+
+    /// CommonJS `var express = require('./express'); express.Router()`: the variable the module
+    /// exports under that name (`exports.Router = Router`).
+    fn js_required_export(&self, r: &RefRec, root: &str, method: &str) -> Option<NodeIdx> {
+        if self.family != LangFamily::Js {
+            return None;
+        }
+        let i = self.visible_import(root, self.scope_at(r.line, r.col))?;
+        if self.imports[i as usize].kind != ImportKind::Require as u8 {
+            return None;
+        }
+        let Some(ImportTarget::File(tf)) = self.e.imp_targets[self.file.idx()].get(i as usize).copied() else { return None };
+        let view = self.view;
+        let variable = |n: NodeIdx| matches!(kind_of(view, n), NodeKind::Variable | NodeKind::Constant);
+        if let Some(Bound::Node(n)) = self.e.lookup_export(tf, method, 0) {
+            return variable(n).then_some(n);
+        }
+        // `var Router = require('router'); exports.Router = Router` forwards a dependency: the
+        // variable holding it is what the project can link. The file may sit behind a package
+        // root's `module.exports = require('./lib/express')`.
+        let mut files = vec![tf];
+        let mut i = 0;
+        while i < files.len() && files.len() < 8 {
+            for &s in &self.e.stars[files[i].idx()] {
+                if !files.contains(&s) {
+                    files.push(s);
+                }
+            }
+            i += 1;
+        }
+        files.into_iter().find_map(|f| {
+            let spec_of = |name: &str| view.imports_of(f).iter().find(|i| view.text_str(i.local) == name).map(|i| view.text_str(i.spec));
+            let forwarded = view.exports_of(f).iter().any(|e| view.text_str(e.name) == method && spec_of(method) == Some(view.text_str(e.from_spec)));
+            self.e.lookup_top_level(f, method).filter(|&n| forwarded && variable(n))
+        })
+    }
+
+    /// JS `interface X` and `const X` in one file: importing `X` names whichever comes first
+    /// (as upstream does); `new X()` and calls still take the value.
+    fn js_first_twin(&self, o: Outcome) -> Outcome {
+        if self.family != LangFamily::Js || o.status != status::RESOLVED {
+            return o;
+        }
+        let view = self.view;
+        let t = view.node(NodeIdx(o.target));
+        let is_type = |n| matches!(kind_of(view, n), NodeKind::Interface | NodeKind::TypeAlias | NodeKind::Class | NodeKind::Enum);
+        let is_value = |n| matches!(kind_of(view, n), NodeKind::Variable | NodeKind::Constant | NodeKind::Function);
+        let twins: Vec<_> = view.by_name(t.name()).filter(|&n| view.hot(n).file == t.file() && view.node(n).parent() == t.parent()).collect();
+        if !(twins.iter().any(|&n| is_type(n)) && twins.iter().any(|&n| is_value(n))) {
+            return o;
+        }
+        twins.into_iter().min_by_key(|&n| (view.node(n).start_line(), view.node(n).start_col())).map_or(o, |n| Outcome::found(n, o.by, o.conf))
+    }
+
+    /// A name on a continuation line of a multi-line import (`from m import (\n    a,\n)`,
+    /// `import {\n  a,\n} from "m"`, `use m::{\n    a,\n}`): the facts carry the statement's first
+    /// line, the nearest import line above the reference.
+    fn continued_import_ref(&self, name: &str, r: &RefRec) -> Outcome {
+        let start = self.imports.iter().map(|i| i.line).filter(|&l| l < r.line).max();
+        start.and_then(|l| self.import_bound_name(name, &self.imports_by_line[&l])).unwrap_or_else(|| Outcome::st(status::NO_CANDIDATE))
+    }
+
+    /// TypeScript `interface ZodUnknown` beside `const ZodUnknown`: `new ZodUnknown()` makes the
+    /// value; the type only describes it.
+    fn js_value_twin(&self, o: Outcome) -> Outcome {
+        let (view, target) = (self.view, NodeIdx(o.target));
+        if self.family != LangFamily::Js || o.status != status::RESOLVED || !matches!(kind_of(view, target), NodeKind::Interface | NodeKind::TypeAlias) {
+            return o;
+        }
+        let ty = view.node(target);
+        let twin = view.by_name(ty.name()).find(|&n| {
+            view.hot(n).file == ty.file()
+                && view.node(n).parent() == ty.parent()
+                && matches!(kind_of(view, n), NodeKind::Variable | NodeKind::Constant | NodeKind::Function | NodeKind::Class)
+        });
+        twin.map_or(o, |n| Outcome::found(n, o.by, o.conf))
+    }
+
+    /// JS `const $ = django.jQuery; $(el)`, `Router = express.Router; new Router()`: a call of a
+    /// name a `var` / `let` / `const` declares runs what that declaration's node holds.
+    fn js_declared_value(&self, r: &RefRec, name: &str) -> Option<NodeIdx> {
+        if self.family != LangFamily::Js || !name.chars().all(|c| c == '$' || c == '_' || c.is_alphanumeric()) {
+            return None;
+        }
+        let b = self.lookup_binding(name, self.scope_at(r.line, r.col), r.line, false).filter(|b| b.kind == BindKind::Local as u8)?;
+        let view = self.view;
+        view.by_name(name).find(|&n| {
+            view.hot(n).file == self.file && view.node(n).start_line() == b.line && matches!(kind_of(view, n), NodeKind::Variable | NodeKind::Constant)
+        })
+    }
+
     /// Resolve one reference. `name` is the reference's text.
     pub fn resolve_ref(&self, wcx: &mut WorkerCx<'e, 'v>, r: &RefRec) -> Outcome {
         let name = self.view.text_str(r.name);
         let Some(kind) = RefKind::from_wire(r.kind) else { return Outcome::st(status::NO_CANDIDATE) };
         let o = self.resolve_kind(wcx, r, name, kind);
+        if o.status == status::LOCAL_BINDING && matches!(kind, RefKind::Edge(EdgeKind::Calls | EdgeKind::Instantiates)) {
+            if let Some(n) = self.js_declared_value(r, name) {
+                return Outcome::found(n, by::LEXICAL, 90);
+            }
+        }
         // an extension no project declaration answers extends a dependency's type
         if o.status == status::RESOLVED && self.is_swift_extension(NodeIdx(o.target)) {
             return Outcome::st(status::EXTERNAL);
@@ -3377,17 +3621,35 @@ impl<'e, 'v> FileCx<'e, 'v> {
             }
             RefKind::Edge(EdgeKind::Extends | EdgeKind::Implements | EdgeKind::TypeOf | EdgeKind::Returns) => self.resolve_type_ref(wcx, r, name, Accept::Type),
             RefKind::Edge(EdgeKind::Instantiates) if self.swift_extended_builtin(name, r) => Outcome::st(status::BUILTIN),
+            // JS `new Class(..)` where `Class` is a parameter or a local: the value it holds, never a
+            // same-named class elsewhere (type lookup does not see lexical bindings)
+            RefKind::Edge(EdgeKind::Instantiates)
+                if self.family == LangFamily::Js
+                    && self
+                        .lookup_binding(name, self.scope_at(r.line, r.col), r.line, false)
+                        .is_some_and(|b| b.kind == BindKind::Param as u8 || b.kind == BindKind::Local as u8) =>
+            {
+                self.resolve_type_ref(wcx, r, name, Accept::Callable)
+            }
             RefKind::Edge(EdgeKind::Instantiates) => {
                 let o = self.resolve_type_ref(wcx, r, name, Accept::Type);
                 if o.status == status::NO_CANDIDATE {
                     self.resolve_type_ref(wcx, r, name, Accept::Callable)
                 } else {
-                    o
+                    let o = self.js_value_twin(o);
+                    // `new File([], name)` with only `interface File` in reach: a global's value (the
+                    // DOM's), since an interface makes none
+                    let bare_type = o.status == status::RESOLVED && matches!(kind_of(self.view, NodeIdx(o.target)), NodeKind::Interface | NodeKind::TypeAlias);
+                    if self.family == LangFamily::Js && bare_type {
+                        Outcome::st(status::NO_CANDIDATE)
+                    } else {
+                        o
+                    }
                 }
             }
             RefKind::Edge(EdgeKind::References) => {
                 let o = self.resolve_type_ref(wcx, r, name, Accept::Type);
-                if matches!(o.status, status::NO_CANDIDATE) {
+                let o = if matches!(o.status, status::NO_CANDIDATE) {
                     let any = self.resolve_type_ref(wcx, r, name, Accept::Any);
                     if self.stray_csharp_member(any, r) {
                         o
@@ -3396,6 +3658,18 @@ impl<'e, 'v> FileCx<'e, 'v> {
                     }
                 } else {
                     o
+                };
+                // `errorUtil.ErrMessage`: the kernel flattens a TS `namespace`'s members into its file,
+                // where no path walk enters; the last segment, as the kernel names it
+                match name.rsplit_once('.') {
+                    Some((path, tail)) if o.status == status::NO_CANDIDATE && self.family == LangFamily::Js => match self.lookup_type(wcx, path) {
+                        // `typeName: ZodFirstPartyTypeKind.ZodLiteral` names the enum's member, not `class ZodLiteral`
+                        TypeRes::Node(e) if kind_of(self.view, e) == NodeKind::Enum => {
+                            self.e.direct_member(e, tail).map_or(o, |m| Outcome::found(m, by::QUALIFIED, 90))
+                        }
+                        _ => self.resolve_kind(wcx, r, tail, kind),
+                    },
+                    _ => o,
                 }
             }
             RefKind::FunctionRef => self.resolve_call_name(wcx, r, name),

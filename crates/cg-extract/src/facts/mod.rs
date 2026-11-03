@@ -154,6 +154,9 @@ pub enum BindKind {
     /// C++ `#define BEGIN namespace fmt {`: `name` is a namespace opened only by a macro, which
     /// no node of the index stands for. Metadata only; not a lexical binding.
     MacroNamespace = 15,
+    /// A Rust type parameter of the fn, impl or trait whose scope holds it. Only a type
+    /// reference sees it: `T` in `fn new(value: T)` names no `struct T` elsewhere.
+    TypeParam = 16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

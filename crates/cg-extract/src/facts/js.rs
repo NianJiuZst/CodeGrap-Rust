@@ -112,6 +112,10 @@ fn walk(cx: &mut Cx, n: Node, scope: u32) {
             }
             walk_children(cx, n, scope);
         }
+        "nested_type_identifier" => {
+            namespace_type(cx, n);
+            walk_children(cx, n, scope);
+        }
         _ => walk_children(cx, n, scope),
     }
 }
@@ -378,6 +382,7 @@ fn export_stmt(cx: &mut Cx, n: Node) {
         });
     }
     let is_default = kids(n).any(|c| c.kind() == "default");
+    let stmt_type_only = kids(n).any(|c| c.kind() == "type");
     let mut had_clause = false;
     for ch in kids(n) {
         match ch.kind() {
@@ -389,6 +394,20 @@ fn export_stmt(cx: &mut Cx, n: Node) {
                     }
                     let name = sp.child_by_field_name("name").map(|c| unquote(cx.text(c)).to_owned()).unwrap_or_default();
                     let alias = sp.child_by_field_name("alias").map(|c| unquote(cx.text(c)).to_owned());
+                    if let Some(spec) = &source {
+                        // `export { a as b } from 'x'` imports `a` without binding it here (no local)
+                        let line = cx.line(n);
+                        let type_only = stmt_type_only || kids(sp).any(|c| c.kind() == "type");
+                        cx.add_import(ImportFact {
+                            local: String::new(),
+                            imported: name.clone(),
+                            spec: spec.clone(),
+                            kind: ImportKind::Named,
+                            type_only,
+                            scope: 0,
+                            line,
+                        });
+                    }
                     cx.facts.exports.push(ExportFact {
                         name: alias.unwrap_or_else(|| name.clone()),
                         node_row: NONE,
@@ -639,6 +658,7 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
         }
     }
     let sc = cx.push_scope(ScopeKind::Function, scope, n);
+    type_params(cx, n, sc);
     return_annotation(cx, n, sc);
     let line = cx.line(n);
     if let Some(p) = n.child_by_field_name("parameter") {
@@ -670,6 +690,15 @@ fn function(cx: &mut Cx, n: Node, scope: u32) {
         } else {
             walk(cx, ch, sc);
         }
+    }
+}
+
+/// `class Schema<Output>`, `function f<T>()`: `Output` and `T` inside name no declaration.
+fn type_params(cx: &mut Cx, n: Node, sc: u32) {
+    let Some(params) = n.child_by_field_name("type_parameters") else { return };
+    for name in kids(params).filter_map(|p| p.child_by_field_name("name")) {
+        let name = cx.text(name).to_owned();
+        cx.add_binding(sc, &name, BindKind::TypeParam, "", "", 0);
     }
 }
 
@@ -768,6 +797,7 @@ fn factory_mixin(cx: &mut Cx, n: Node, scope: u32) {
 
 fn class(cx: &mut Cx, n: Node, scope: u32) {
     let sc = cx.push_scope(ScopeKind::Class, scope, n);
+    type_params(cx, n, sc);
     let Some(body) = n.child_by_field_name("body") else {
         walk_children(cx, n, scope);
         return;
@@ -783,8 +813,10 @@ fn class(cx: &mut Cx, n: Node, scope: u32) {
                     let line = cx.line(m);
                     cx.add_binding(sc, &nm, BindKind::Field, if ty.is_empty() { &vt } else { &ty }, &init, line);
                 }
-                if let Some(v) = m.child_by_field_name("value") {
-                    walk(cx, v, sc);
+                for c in ["type", "value"] {
+                    if let Some(v) = m.child_by_field_name(c) {
+                        walk(cx, v, sc);
+                    }
                 }
             }
             "method_definition" => {
@@ -828,6 +860,26 @@ fn require_target(cx: &Cx, v: Node) -> Option<String> {
     Some(unquote(cx.text(first)).to_owned())
 }
 
+/// `core.output<T>`: the kernel names the type by its last segment (`output`); the path as
+/// written keeps the namespace's type apart from a same-named one beside the reference.
+fn namespace_type(cx: &mut Cx, n: Node) {
+    let Some(name) = n.child_by_field_name("name") else { return };
+    let pos = cx.start(name);
+    let tail = cx.text(name).to_owned();
+    let path: String = cx.text(n).chars().filter(|c| !c.is_whitespace()).collect();
+    cx.facts.call_names.push(CallNameFact { line: (pos >> 32) as u32, col: pos as u32, kernel_name: tail.clone(), tail, name: path });
+}
+
+/// `require('./utils').compileETag`: the module and the member it reads.
+fn require_member(cx: &Cx, v: Node) -> Option<(String, String)> {
+    if v.kind() != "member_expression" {
+        return None;
+    }
+    let spec = require_target(cx, v.child_by_field_name("object")?)?;
+    let prop = v.child_by_field_name("property").filter(|p| p.kind() == "property_identifier")?;
+    Some((spec, cx.text(prop).to_owned()))
+}
+
 fn var_decl(cx: &mut Cx, n: Node, scope: u32) {
     for d in kids(n) {
         if d.kind() != "variable_declarator" {
@@ -835,6 +887,9 @@ fn var_decl(cx: &mut Cx, n: Node, scope: u32) {
         }
         let Some(name) = d.child_by_field_name("name") else { continue };
         let ty = d.child_by_field_name("type").map(|t| ts_type_name(cx, t)).unwrap_or_default();
+        if let Some(t) = d.child_by_field_name("type") {
+            walk(cx, t, scope); // `core.ParseContext` inside the annotation
+        }
         let value = d.child_by_field_name("value");
         if let Some(v) = value {
             // `var app = exports = module.exports = {}` ties subsequent
@@ -875,6 +930,12 @@ fn var_decl(cx: &mut Cx, n: Node, scope: u32) {
                     }
                     _ => {}
                 }
+                continue;
+            }
+            // `var compileETag = require('./utils').compileETag`, like `const { compileETag } = require('./utils')`
+            if let Some((spec, imported)) = require_member(cx, v).filter(|_| name.kind() == "identifier") {
+                let local = cx.text(name).to_owned();
+                cx.add_import(ImportFact { local, imported, spec, kind: ImportKind::Require, type_only: false, scope, line: cx.line(d) });
                 continue;
             }
             let is_fn = matches!(v.kind(), "arrow_function" | "function_expression" | "function" | "generator_function");
