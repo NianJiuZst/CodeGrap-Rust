@@ -274,6 +274,68 @@ fn kotlin_members_and_imports() {
 }
 
 #[test]
+fn rust_pointer_roots_use_the_final_field_method() {
+    let (_d, view) = project(&[
+        ("Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        ("src/lib.rs", "pub mod worker;\npub mod owner;\n"),
+        (
+            "src/worker.rs",
+            r#"pub struct Worker;
+impl Worker {
+    pub fn execute(&self) -> u8 { 7 }
+    pub fn clone(&self) -> u8 { 99 }
+}
+pub struct Noise;
+impl Noise { pub fn execute(&self) -> u8 { 0 } }
+"#,
+        ),
+        (
+            "src/owner.rs",
+            r#"use crate::worker::Worker;
+use std::rc::Rc;
+use std::sync::Arc;
+pub struct Owner {
+    plain: Worker,
+    child: Child,
+}
+pub struct Child { plain: Worker }
+impl Child { pub fn clone(&self) -> u8 { 88 } }
+impl Owner {
+    pub fn plain(&self) -> u8 { self.plain.execute() }
+    pub fn child(&self) -> u8 { self.child.plain.execute() }
+    pub fn plain_clone(&self) -> u8 { self.plain.clone() }
+    pub fn child_plain_clone(&self) -> u8 { self.child.plain.clone() }
+}
+pub fn local_plain(w: Child) -> u8 { w.plain.clone() }
+pub fn local_arc(w: Arc<Child>) -> u8 { w.plain.clone() }
+pub fn local_rc(w: Rc<Child>) -> u8 { w.plain.clone() }
+pub fn local_box(w: Box<Child>) -> u8 { w.plain.clone() }
+pub fn local_nested(w: Arc<Box<Child>>) -> u8 { w.plain.clone() }
+pub fn direct_plain(w: Child) -> u8 { w.clone() }
+pub fn direct_arc(w: Arc<Child>) { w.clone(); }
+pub fn direct_rc(w: Rc<Child>) { w.clone(); }
+"#,
+        ),
+    ]);
+    let edges = dump::dump_edges(&view);
+    for name in ["plain", "child"] {
+        let calls: Vec<_> = edges.iter().filter(|e| e.starts_with(&format!("src/owner.rs::Owner::{name} -calls-> "))).map(String::as_str).collect();
+        assert_eq!(calls, [format!("src/owner.rs::Owner::{name} -calls-> src/worker.rs::Worker::execute")], "{edges:#?}");
+    }
+    for name in ["plain_clone", "child_plain_clone"] {
+        assert!(has(&edges, &format!("src/owner.rs::Owner::{name} -calls-> src/worker.rs::Worker::clone")), "{edges:#?}");
+    }
+    for name in ["local_plain", "local_arc", "local_rc", "local_box", "local_nested"] {
+        let calls: Vec<_> = edges.iter().filter(|e| e.starts_with(&format!("src/owner.rs::{name} -calls-> "))).map(String::as_str).collect();
+        assert_eq!(calls, [format!("src/owner.rs::{name} -calls-> src/worker.rs::Worker::clone")], "{edges:#?}");
+    }
+    assert!(has(&edges, "src/owner.rs::direct_plain -calls-> src/owner.rs::Child::clone"), "{edges:#?}");
+    for name in ["direct_arc", "direct_rc"] {
+        assert!(!edges.iter().any(|e| e.starts_with(&format!("src/owner.rs::{name} -calls-> "))), "{edges:#?}");
+    }
+}
+
+#[test]
 fn debug_ts_unresolved() {
     let (_d, view) = project(&[
         ("src/service.ts", "export class Service { run(): void {} }\nexport function helper() {}\n"),
